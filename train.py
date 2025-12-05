@@ -1,5 +1,7 @@
 import argparse
 import os
+import sys
+from datetime import datetime
 from typing import List
 
 import torch
@@ -7,6 +9,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+# ensure local sam3 package is importable
+sys.path.append(os.path.join(os.path.dirname(__file__), "sam3"))
 
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
@@ -38,6 +43,7 @@ def build_dataloaders(
     obj_name: str = None,
     aug_rate: float = 0.0,
     batch_size: int = 2,
+    balance: bool = False,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -47,6 +53,21 @@ def build_dataloaders(
         obj_name=obj_name,
         aug_rate=aug_rate,
     )
+
+    sampler = None
+    if balance:
+        labels = [int(is_anomaly) for _, _, _, is_anomaly, _ in ds]
+        class_counts = torch.tensor(
+            [(1 - torch.tensor(labels)).sum(), torch.tensor(labels).sum()],
+            dtype=torch.float,
+        )
+        class_counts = torch.clamp(class_counts, min=1.0)
+        weight = 1.0 / class_counts
+        samples_weight = torch.tensor([weight[l] for l in labels])
+        sampler = torch.utils.data.WeightedRandomSampler(
+            samples_weight, num_samples=len(samples_weight), replacement=True
+        )
+
     def collate_fn(batch):
         imgs, masks, prompt_lists, is_anomaly, class_names = zip(*batch)
         imgs = torch.stack(imgs, dim=0)
@@ -55,7 +76,12 @@ def build_dataloaders(
         return imgs, masks, list(prompt_lists), is_anomaly_t, list(class_names)
 
     return DataLoader(
-        ds, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn
+        ds,
+        batch_size=batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=4,
+        collate_fn=collate_fn,
     )
 
 
@@ -69,7 +95,6 @@ def load_sam3_checkpoint(model: torch.nn.Module, ckpt_path: str):
     else:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-    # Strip detector.* prefix (matches sam3/model_builder._load_checkpoint)
     mapped = {}
     for k, v in state.items():
         if k.startswith("detector."):
@@ -106,7 +131,6 @@ def main(args: argparse.Namespace):
             device=device,
         )
 
-    # Optional: load pretrained SAM3 checkpoint
     if args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
         load_sam3_checkpoint(model, args.sam3_ckpt)
 
@@ -118,13 +142,17 @@ def main(args: argparse.Namespace):
         obj_name=args.obj_name,
         aug_rate=args.aug_rate,
         batch_size=args.batch_size,
+        balance=args.balance,
     )
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=args.log_dir)
+    run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_dir = os.path.join(args.save_dir, run_name)
+    log_dir = os.path.join(args.log_dir, run_name)
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"[INFO] run_name={run_name}, log_dir={log_dir}, save_dir={save_dir}")
 
-    # Parameter groups: prompt+LoRA vs decoder/seg head
     prompt_and_lora: List[torch.nn.Parameter] = []
     other_params: List[torch.nn.Parameter] = []
     for n, p in model.named_parameters():
@@ -159,23 +187,25 @@ def main(args: argparse.Namespace):
             if pred_masks is None:
                 raise RuntimeError("Segmentation head did not return pred_masks.")
 
-            # pred_masks shapes: (bs, num_queries, h, w) when dac duplicates queries to 2x.
             if pred_masks.dim() == 5:
-                # take last decoder layer
                 pred_masks = pred_masks[-1]
             if pred_masks.dim() == 4:
-                # reduce queries by max
                 pred_masks = pred_masks.max(dim=1, keepdim=True).values
-            # upsample to GT mask size
             if pred_masks.shape[-2:] != masks.shape[-2:]:
                 pred_masks = torch.nn.functional.interpolate(
                     pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
                 )
+            pred_masks = pred_masks.clamp(min=-20.0, max=20.0)
             pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=0.0, neginf=0.0)
             masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
+            masks = (masks > 0.5).float()
 
             loss_focal = focal_loss(pred_masks, masks)
-            loss_dice = dice_loss(pred_masks, masks)
+            valid = masks.flatten(1).sum(dim=1) > 0
+            if valid.any():
+                loss_dice = dice_loss(pred_masks[valid], masks[valid])
+            else:
+                loss_dice = torch.tensor(0.0, device=device)
             loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice
 
             if not torch.isfinite(loss):
@@ -200,15 +230,15 @@ def main(args: argparse.Namespace):
             running_loss += loss.item()
             running_steps += 1
 
-        # epoch-wise avg loss for best selection
         if running_steps > 0:
             avg_loss = running_loss / running_steps
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                ckpt_path = os.path.join(args.save_dir, "sam3_peft_best.pth")
+                ckpt_path = os.path.join(save_dir, "sam3_peft_best.pth")
                 torch.save(model.state_dict(), ckpt_path)
                 print(f"[INFO] Epoch {epoch+1}: new best avg_loss {avg_loss:.4f}, saved to {ckpt_path}")
 
+    writer.flush()
     writer.close()
 
 
@@ -223,8 +253,8 @@ if __name__ == "__main__":
     parser.add_argument("--bpe_path", type=str, default=None, help="Path to BPE vocab (defaults to sam3/assets/bpe_simple_vocab_16e6.txt.gz).")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr_prompt", type=float, default=1e-3)
-    parser.add_argument("--lr_main", type=float, default=1e-4)
+    parser.add_argument("--lr_prompt", type=float, default=5e-4)
+    parser.add_argument("--lr_main", type=float, default=5e-5)
     parser.add_argument("--loss_alpha", type=float, default=5.0, help="Weight for focal loss.")
     parser.add_argument("--loss_beta", type=float, default=1.0, help="Weight for dice loss.")
     parser.add_argument("--disable_lora", action="store_true")
@@ -233,9 +263,10 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard log directory.")
-    parser.add_argument("--save_dir", type=str, default="./ckpt", help="Directory to save checkpoints.")
+    parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard base log directory.")
+    parser.add_argument("--save_dir", type=str, default="./ckpt", help="Base directory to save checkpoints.")
     parser.add_argument("--sam3_ckpt", type=str, default=None, help="Path to pretrained SAM3 checkpoint to load.")
     parser.add_argument("--use_official", action="store_true", help="Use official builder + checkpoint before PEFT.")
+    parser.add_argument("--balance", action="store_true", help="Enable anomaly/non-anomaly weighted sampler.")
     args = parser.parse_args()
     main(args)
