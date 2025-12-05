@@ -15,6 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "sam3"))
 
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
+from sam3.visualization_utils import draw_masks_to_frame
 
 
 def build_loader(root: str, meta_path: str, mode: str, batch_size: int):
@@ -63,32 +64,34 @@ def load_model(args, device):
     return model.to(device)
 
 
+def get_color_map(palette, prompt: str):
+    import hashlib
+    h = hashlib.sha1(prompt.encode("utf-8")).hexdigest()
+    idx = int(h[:8], 16) % len(palette)
+    return palette[idx]
+
+
 @torch.no_grad()
 def run_inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     loader = build_loader(args.data_root, args.meta_path or os.path.join(args.data_root, "meta.json"), args.mode, args.batch_size)
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
-    to_pil = transforms.ToPILImage()
-    colors = [
-        (255, 0, 0),
-        (0, 255, 0),
-        (0, 0, 255),
-        (255, 255, 0),
-        (255, 0, 255),
-        (0, 255, 255),
-        (255, 128, 0),
-        (128, 0, 255),
-    ]
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
 
-    # parse custom prompt if provided (comma-separated words)
     custom_prompt: List[str] = []
     if args.prompt:
         custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
+
+    to_pil = transforms.ToPILImage()
+    palette = [
+        (255, 99, 71),
+        (65, 105, 225),
+        (60, 179, 113),
+        (218, 165, 32),
+        (199, 21, 133),
+        (70, 130, 180),
+    ]
+    font = ImageFont.load_default()
 
     idx = 0
     total_imgs = 0
@@ -99,9 +102,9 @@ def run_inference(args):
     pbar = tqdm(loader, desc="Inference", leave=True)
     for images, masks, prompt_lists, class_names in pbar:
         images = images.to(device)
-        # override dataset prompts with a custom prompt if given
         if custom_prompt:
             prompt_lists = [custom_prompt for _ in prompt_lists]
+
         start = time.time()
         out = model(images, prompt_lists)
         infer_time = time.time() - start
@@ -116,13 +119,11 @@ def run_inference(args):
         if pred_masks.dim() == 4:
             pred_masks = pred_masks.max(dim=1, keepdim=True).values
         pred_masks = torch.sigmoid(pred_masks)
-        # upsample to original mask size
         if pred_masks.shape[-2:] != masks.shape[-2:]:
             pred_masks = torch.nn.functional.interpolate(
                 pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
             )
 
-        # simple dice metric per image (only if GT has positives)
         gt = (masks > 0.5).float().to(device)
         valid = gt.flatten(1).sum(dim=1) > 0
         if valid.any():
@@ -137,34 +138,64 @@ def run_inference(args):
 
         for b in range(pred_masks.shape[0]):
             cls_name = class_names[b]
-            prompt_text = "_".join(prompt_lists[b]) if prompt_lists else "prompt"
+            prompts_b = prompt_lists[b] if prompt_lists else []
+            prompts_b = prompts_b if isinstance(prompts_b, list) else [prompts_b]
+            prompt_text = "_".join(prompts_b) if prompts_b else "prompt"
             sample_dir = os.path.join(args.output_dir, cls_name)
             os.makedirs(sample_dir, exist_ok=True)
 
-            # overlay mask on image
             img_pil = to_pil(images[b].cpu())
             mask_np = pred_masks[b].squeeze().cpu().numpy()
-            img_np = np.array(img_pil).astype(np.float32) / 255.0
             if mask_np.ndim == 2:
-                mask_np = np.clip(mask_np, 0, 1)
+                masks_stack = (mask_np > 0.5)[None, ...]
+                prompts_for_color = prompts_b if prompts_b else ["prompt"]
             else:
-                mask_np = np.clip(mask_np[0], 0, 1)
-            color = np.array(colors[b % len(colors)]) / 255.0
-            alpha = 0.5
-            overlay_np = img_np * (1 - alpha * mask_np[..., None]) + color * (alpha * mask_np[..., None])
-            overlay_np = np.clip(overlay_np * 255.0, 0, 255).astype(np.uint8)
-            overlay_pil = Image.fromarray(overlay_np)
+                masks_stack = mask_np > 0.5
+                prompts_for_color = prompts_b if prompts_b else [f"c{i}" for i in range(mask_np.shape[0])]
 
-            # draw prompt text bottom-left
+            colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
+            frame = np.array(img_pil.convert("RGB"), dtype=np.uint8)
+            frame = draw_masks_to_frame(frame, masks_stack.astype(bool), colors)
+            overlay_pil = Image.fromarray(frame)
+
+            # legend bottom-left with prompt text
             draw = ImageDraw.Draw(overlay_pil)
-            text = prompt_text
-            text_w, text_h = draw.textbbox((0, 0), text, font=font)[2:]
-            draw.rectangle([0, overlay_pil.height - text_h - 4, text_w + 4, overlay_pil.height], fill=(0, 0, 0))
-            draw.text((2, overlay_pil.height - text_h - 2), text, fill=(255, 255, 255), font=font)
+            row_h = 12
+            box_w = 10
+            pad = 4
+            legend_items = []
+            max_w = 0
+            for p in prompts_for_color:
+                text = p
+                bbox = font.getbbox(text)
+                w = bbox[2] - bbox[0]
+                max_w = max(max_w, w)
+                legend_items.append((text, w))
+            legend_h = row_h * len(prompts_for_color) + pad * 2
+            legend_w = box_w + 4 + max_w + pad * 2
+            legend_x = 5
+            legend_y = overlay_pil.height - legend_h - 5
+            draw.rectangle(
+                [legend_x, legend_y, legend_x + legend_w, legend_y + legend_h],
+                fill=(0, 0, 0),
+            )
+            for i, (text, _) in enumerate(legend_items):
+                color = get_color_map(palette, prompts_for_color[i])
+                y = legend_y + pad + i * row_h
+                draw.rectangle(
+                    [legend_x + pad, y, legend_x + pad + box_w, y + box_w],
+                    fill=color,
+                )
+                draw.text(
+                    (legend_x + pad + box_w + 4, y - 2),
+                    text,
+                    fill=(255, 255, 255),
+                    font=font,
+                )
 
-            overlay_path = os.path.join(sample_dir, f"{cls_name}_{prompt_text}_{idx}.png")
+            filename = f"{cls_name}_{prompt_text}_{idx}.png"
+            overlay_path = os.path.join(sample_dir, filename)
             overlay_pil.save(overlay_path)
-
             idx += 1
 
         speed = total_imgs / total_time if total_time > 0 else 0.0
