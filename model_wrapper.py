@@ -102,7 +102,6 @@ class FineTuneSAM3(nn.Module):
             memory_text=prompt_seq,
             text_attention_mask=prompt_mask,
         )
-        hs = hs.permute(0, 2, 1, 3).contiguous()
 
         seg_out = self.segmentation_head(
             backbone_feats=vis_feats,
@@ -117,6 +116,7 @@ class FineTuneSAM3(nn.Module):
             "pred_masks": seg_out.get("pred_masks"),
             "semantic_seg": seg_out.get("semantic_seg"),
             "presence_logit": seg_out.get("presence_logit"),
+            "iou_predictions": seg_out.get("iou_predictions"),
             "decoder_hs": hs,
             "reference_boxes": reference_boxes,
         }
@@ -267,6 +267,7 @@ class FineTuneSAM3Official(nn.Module):
             "pred_masks": seg_out.get("pred_masks"),
             "semantic_seg": seg_out.get("semantic_seg"),
             "presence_logit": seg_out.get("presence_logit"),
+            "iou_predictions": seg_out.get("iou_predictions"),
             "decoder_hs": hs,
             "reference_boxes": reference_boxes,
         }

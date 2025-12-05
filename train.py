@@ -17,11 +17,14 @@ from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
 
 
-def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
+    """Binary Dice loss with smoothing; robust to empty masks."""
     pred = pred.sigmoid()
-    num = 2 * (pred * target).sum(dim=(1, 2, 3))
-    den = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + eps
-    return 1 - (num / den).mean()
+    pred_flat = pred.flatten(1)
+    target_flat = target.flatten(1)
+    intersection = (pred_flat * target_flat).sum(dim=1)
+    dice_eff = (2 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
+    return 1 - dice_eff.mean()
 
 
 def focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
@@ -189,27 +192,48 @@ def main(args: argparse.Namespace):
 
             if pred_masks.dim() == 5:
                 pred_masks = pred_masks[-1]
-            if pred_masks.dim() == 4:
+            mask_for_iou = pred_masks
+            if pred_masks.dim() == 4 and pred_masks.shape[1] > 1:
                 pred_masks = pred_masks.max(dim=1, keepdim=True).values
             if pred_masks.shape[-2:] != masks.shape[-2:]:
                 pred_masks = torch.nn.functional.interpolate(
                     pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
                 )
+            if mask_for_iou.shape[-2:] != masks.shape[-2:]:
+                mask_for_iou = torch.nn.functional.interpolate(
+                    mask_for_iou, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                )
             pred_masks = pred_masks.clamp(min=-20.0, max=20.0)
             pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=0.0, neginf=0.0)
+            mask_for_iou = torch.nan_to_num(mask_for_iou, nan=0.0, posinf=0.0, neginf=0.0)
             masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
             masks = (masks > 0.5).float()
 
             loss_focal = focal_loss(pred_masks, masks)
-            valid = masks.flatten(1).sum(dim=1) > 0
-            if valid.any():
-                loss_dice = dice_loss(pred_masks[valid], masks[valid])
-            else:
-                loss_dice = torch.tensor(0.0, device=device)
-            loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice
+            loss_dice = dice_loss(pred_masks, masks)
+            loss_iou = torch.tensor(0.0, device=device)
+            iou_pred = out.get("iou_predictions", None)
+            if iou_pred is not None:
+                if iou_pred.dim() == 3:
+                    iou_pred = iou_pred[-1]
+                if mask_for_iou.dim() == 3:
+                    mask_for_iou = mask_for_iou.unsqueeze(1)
+                mask_prob = torch.sigmoid(mask_for_iou)
+                prob_flat = mask_prob.flatten(2)
+                target_flat = masks.unsqueeze(1).flatten(2)
+                intersection = (prob_flat * target_flat).sum(dim=-1)
+                union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection
+                # Avoid degenerate all-zero cases: union==0 -> IoU=0
+                true_iou = torch.where(
+                    union > 0, intersection / (union + 1e-6), torch.zeros_like(union)
+                )
+                if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
+                    iou_pred = iou_pred.expand(true_iou.shape[0], true_iou.shape[1])
+                loss_iou = F.mse_loss(iou_pred, true_iou)
+            loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
 
             if not torch.isfinite(loss):
-                print(f"[WARN] Skip batch with non-finite loss (loss={loss.item()}, focal={loss_focal.item()}, dice={loss_dice.item()})")
+                print(f"[WARN] Skip batch with non-finite loss (loss={loss.item()}, focal={loss_focal.item()}, dice={loss_dice.item()}, iou={loss_iou.item()})")
                 continue
 
             optimizer.zero_grad()
@@ -226,6 +250,7 @@ def main(args: argparse.Namespace):
             writer.add_scalar("loss/total", loss.item(), global_step)
             writer.add_scalar("loss/focal", loss_focal.item(), global_step)
             writer.add_scalar("loss/dice", loss_dice.item(), global_step)
+            writer.add_scalar("loss/iou", loss_iou.item(), global_step)
 
             running_loss += loss.item()
             running_steps += 1
@@ -257,6 +282,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr_main", type=float, default=5e-5)
     parser.add_argument("--loss_alpha", type=float, default=5.0, help="Weight for focal loss.")
     parser.add_argument("--loss_beta", type=float, default=1.0, help="Weight for dice loss.")
+    parser.add_argument("--loss_gamma", type=float, default=1.0, help="Weight for IoU regression loss.")
     parser.add_argument("--disable_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=float, default=None)
