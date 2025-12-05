@@ -225,6 +225,8 @@ def _create_segmentation_head(compile_mode=None):
         act_ckpt=True,
         cross_attend_prompt=cross_attend_prompt,
         pixel_decoder=pixel_decoder,
+        iou_head=True,
+        iou_use_sigmoid=True,
     )
     return segmentation_head
 
