@@ -12,9 +12,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from sam3.train.matcher import BinaryHungarianMatcher
 from sam3.train.loss.loss_fns import sigmoid_focal_loss as sam_sigmoid_focal_loss
 from sam3.train.loss.loss_fns import dice_loss as sam_dice_loss
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
@@ -90,156 +91,6 @@ def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B, device):
             continue
         indices.append((src_idx[mask].to(device), tgt_idx[mask].to(device)))
     return indices
-
-
-def dice_simple(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
-    """
-    Compute dice on (N, H, W) tensors. Pred is logits.
-    """
-    pred = pred.sigmoid()
-    pred_flat = pred.view(pred.shape[0], -1)
-    target_flat = target.view(target.shape[0], -1)
-    intersection = (pred_flat * target_flat).sum(dim=1)
-    denom = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
-    dice = (2 * intersection + smooth) / (denom + smooth)
-    return 1 - dice.mean()
-
-
-def compute_losses_autocast(
-    pred_masks: torch.Tensor,
-    masks: torch.Tensor,
-    out: dict,
-    loss_mask_size: tuple,
-    max_bg_queries: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute focal/dice/iou losses under autocast context.
-    Returns (loss_focal, loss_dice, loss_iou).
-    """
-    if pred_masks is None:
-        raise RuntimeError("Segmentation head did not return pred_masks.")
-
-    if pred_masks.dim() == 5:
-        pred_masks = pred_masks[-1]
-    mask_for_iou = pred_masks
-    if pred_masks.shape[-2:] != masks.shape[-2:]:
-        pred_masks = torch.nn.functional.interpolate(
-            pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
-        )
-    if mask_for_iou.shape[-2:] != masks.shape[-2:]:
-        mask_for_iou = torch.nn.functional.interpolate(
-            mask_for_iou, size=masks.shape[-2:], mode="bilinear", align_corners=False
-        )
-    pred_masks = pred_masks.clamp(min=-20.0, max=20.0)
-    pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=0.0, neginf=0.0)
-    mask_for_iou = torch.nan_to_num(mask_for_iou, nan=0.0, posinf=0.0, neginf=0.0)
-    masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
-    masks = (masks > 0.5).float()
-
-    # Downsample for loss to cut memory footprint (ensure channel dim)
-    if pred_masks.dim() == 3:
-        pred_loss_masks = pred_masks.unsqueeze(1)
-    else:
-        pred_loss_masks = pred_masks
-    pred_loss_masks = torch.nn.functional.interpolate(
-        pred_loss_masks, size=loss_mask_size, mode="bilinear", align_corners=False
-    )
-
-    if masks.dim() == 3:
-        masks_for_loss = masks.unsqueeze(1)
-    elif masks.dim() == 4:
-        masks_for_loss = masks
-    else:
-        raise ValueError(f"Unexpected mask shape {masks.shape}")
-    gt_loss_masks = torch.nn.functional.interpolate(
-        masks_for_loss, size=loss_mask_size, mode="nearest"
-    )
-    if gt_loss_masks.shape[1] > 1:
-        gt_loss_masks = gt_loss_masks.max(dim=1).values
-    else:
-        gt_loss_masks = gt_loss_masks.squeeze(1)
-
-    if pred_loss_masks.dim() == 3:
-        pred_loss_masks = pred_loss_masks.unsqueeze(1)  # (B,1,H,W)
-    B, Q, H, W = pred_loss_masks.shape
-
-    gt_masks = gt_loss_masks  # (B,H,W)
-
-    pred_prob = torch.sigmoid(pred_loss_masks)  # (B,Q,H,W)
-    gt_flat = gt_masks.view(B, 1, -1)
-    pred_flat = pred_prob.view(B, Q, -1)
-    intersection = (pred_flat * gt_flat).sum(-1)
-    union = pred_flat.sum(-1) + gt_flat.sum(-1) - intersection + 1e-6
-    ious = intersection / union
-    best_q = ious.argmax(dim=1)
-    batch_idx = torch.arange(B, device=device)
-    pred_matched = pred_loss_masks[batch_idx, best_q]  # (B,H,W) or (B,1,H,W)
-    tgt_matched = gt_masks  # (B,H,W) or (B,1,H,W)
-    if pred_matched.dim() == 4 and pred_matched.shape[1] == 1:
-        pred_matched = pred_matched.squeeze(1)
-    if tgt_matched.dim() == 4 and tgt_matched.shape[1] == 1:
-        tgt_matched = tgt_matched.squeeze(1)
-
-    has_fg = (gt_masks.view(B, -1).sum(-1) > 0).float()
-    num_boxes = has_fg.sum().clamp(min=1.0)
-    loss_focal = sam_sigmoid_focal_loss(
-        pred_matched, tgt_matched, num_boxes, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
-    )
-    loss_dice = dice_simple(pred_matched, tgt_matched)
-
-    # 背景约束：未被选中的query 压成 0
-    all_q = torch.arange(Q, device=device)
-    loss_focal_bg = torch.tensor(0.0, device=device)
-    loss_dice_bg = torch.tensor(0.0, device=device)
-    for b in range(B):
-        unmatched_q = all_q[all_q != best_q[b]]
-        if unmatched_q.numel() > max_bg_queries:
-            unmatched_q = unmatched_q[:max_bg_queries]
-        if unmatched_q.numel() == 0:
-            continue
-        preds_bg = pred_loss_masks[b, unmatched_q]  # (n_bg,H,W)
-        if preds_bg.dim() == 4 and preds_bg.shape[1] == 1:
-            preds_bg = preds_bg.squeeze(1)
-        zeros = torch.zeros_like(preds_bg)
-        nb = torch.tensor(float(unmatched_q.numel()), device=device).clamp(min=1.0)
-        loss_focal_bg += sam_sigmoid_focal_loss(
-            preds_bg, zeros, nb, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
-        )
-        loss_dice_bg += dice_simple(preds_bg, zeros)
-    loss_focal = loss_focal + 0.5 * loss_focal_bg
-    loss_dice = loss_dice + 0.5 * loss_dice_bg
-
-    loss_iou = torch.tensor(0.0, device=device)
-    iou_pred = out.get("iou_predictions", None)
-    if iou_pred is not None:
-        if iou_pred.dim() == 3:
-            iou_pred = iou_pred[-1]
-        with torch.no_grad():
-            if mask_for_iou.dim() == 3:
-                mask_for_iou = mask_for_iou.unsqueeze(1)
-            mask_for_iou_down = torch.nn.functional.interpolate(
-                mask_for_iou, size=loss_mask_size, mode="bilinear", align_corners=False
-            )
-            gt_masks_full = masks
-            if gt_masks_full.dim() == 3:
-                gt_masks_full = gt_masks_full.unsqueeze(1)
-            gt_masks_down = torch.nn.functional.interpolate(
-                gt_masks_full, size=loss_mask_size, mode="nearest"
-            )
-            mask_prob = torch.sigmoid(mask_for_iou_down)
-            prob_flat = mask_prob.flatten(2)
-            target_flat = gt_masks_down.flatten(2)
-            intersection = (prob_flat * target_flat).sum(dim=-1)
-            union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection
-            true_iou = torch.where(
-                union > 0, intersection / (union + 1e-6), torch.zeros_like(union)
-            )
-        if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
-            iou_pred = iou_pred.expand(true_iou.shape[0], true_iou.shape[1])
-        loss_iou = F.mse_loss(iou_pred, true_iou)
-
-    return loss_focal, loss_dice, loss_iou
 
 
 def focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
@@ -421,9 +272,10 @@ def main(args: argparse.Namespace):
         ],
         weight_decay=1e-4,
     )
-    # 新增：AMP �?GradScaler（只�?CUDA 下启用）
+    # 新增：AMP 的 GradScaler（只在 CUDA 下启用）
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
+    matcher = BinaryHungarianMatcher(cost_class=1.0, cost_bbox=1.0, cost_giou=1.0)
 
     model.train()
     best_loss = float("inf")
@@ -435,138 +287,134 @@ def main(args: argparse.Namespace):
             images, masks, prompt_lists, is_anomaly, class_names = batch
             images = images.to(device)
             masks = masks.to(device)
-            loss_mask_size = (128, 128)  # downsample resolution for loss/IoU to save memory
-            max_bg_queries = 4  # cap background queries per image to avoid OOM
 
-            # ===== AMP autocast: forward + loss 计算都放在半精度上下�?=====
-            with autocast("cuda", enabled=False):
+            # ===== AMP autocast: forward + loss 计算都放在半精度上下文 =====
+            with autocast(enabled=(device.type == "cuda")):
                 out = model(images, prompt_lists)
                 pred_masks = out["pred_masks"]
-                if pred_masks is not None:
-                    pred_masks = pred_masks.float()
-            if pred_masks is None:
-                raise RuntimeError("Segmentation head did not return pred_masks.")
+                if pred_masks is None:
+                    raise RuntimeError("Segmentation head did not return pred_masks.")
 
-            if pred_masks.dim() == 5:
-                pred_masks = pred_masks[-1]
-            mask_for_iou = pred_masks
-            if pred_masks.shape[-2:] != masks.shape[-2:]:
-                pred_masks = torch.nn.functional.interpolate(
-                    pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                )
-            if mask_for_iou.shape[-2:] != masks.shape[-2:]:
-                mask_for_iou = torch.nn.functional.interpolate(
-                    mask_for_iou, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                )
-            pred_masks = pred_masks.clamp(min=-20.0, max=20.0)
-            pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=0.0, neginf=0.0)
-            mask_for_iou = torch.nan_to_num(mask_for_iou, nan=0.0, posinf=0.0, neginf=0.0)
-            masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
-            masks = (masks > 0.5).float()
-
-                        # Downsample for loss to cut memory footprint (ensure channel dim)
-            if pred_masks.dim() == 3:
-                pred_loss_masks = pred_masks.unsqueeze(1)
-            else:
-                pred_loss_masks = pred_masks
-            pred_loss_masks = torch.nn.functional.interpolate(
-                pred_loss_masks, size=loss_mask_size, mode="bilinear", align_corners=False
-            )
-
-            if masks.dim() == 3:
-                masks_for_loss = masks.unsqueeze(1)
-            elif masks.dim() == 4:
-                masks_for_loss = masks
-            else:
-                raise ValueError(f"Unexpected mask shape {masks.shape}")
-            gt_loss_masks = torch.nn.functional.interpolate(
-                masks_for_loss, size=loss_mask_size, mode="nearest"
-            )
-            if gt_loss_masks.shape[1] > 1:
-                gt_loss_masks = gt_loss_masks.max(dim=1).values
-            else:
-                gt_loss_masks = gt_loss_masks.squeeze(1)
-
-            if pred_loss_masks.dim() == 3:
-                pred_loss_masks = pred_loss_masks.unsqueeze(1)  # (B,1,H,W)
-            B, Q, H, W = pred_loss_masks.shape
-
-            gt_masks = gt_loss_masks  # (B,H,W)
-
-            pred_prob = torch.sigmoid(pred_loss_masks)  # (B,Q,H,W)
-            gt_flat = gt_masks.view(B, 1, -1)
-            pred_flat = pred_prob.view(B, Q, -1)
-            intersection = (pred_flat * gt_flat).sum(-1)
-            union = pred_flat.sum(-1) + gt_flat.sum(-1) - intersection + 1e-6
-            ious = intersection / union
-            best_q = ious.argmax(dim=1)
-            batch_idx = torch.arange(B, device=device)
-            pred_matched = pred_loss_masks[batch_idx, best_q]  # (B,H,W) or (B,1,H,W)
-            tgt_matched = gt_masks  # (B,H,W) or (B,1,H,W)
-            if pred_matched.dim() == 4 and pred_matched.shape[1] == 1:
-                pred_matched = pred_matched.squeeze(1)
-            if tgt_matched.dim() == 4 and tgt_matched.shape[1] == 1:
-                tgt_matched = tgt_matched.squeeze(1)
-
-            has_fg = (gt_masks.view(B, -1).sum(-1) > 0).float()
-            num_boxes = has_fg.sum().clamp(min=1.0)
-            loss_focal = sam_sigmoid_focal_loss(
-                pred_matched, tgt_matched, num_boxes, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
-            )
-            loss_dice = dice_simple(pred_matched, tgt_matched)
-
-            # 背景约束：未被选中�?query 压成 0
-            all_q = torch.arange(Q, device=device)
-            loss_focal_bg = torch.tensor(0.0, device=device)
-            loss_dice_bg = torch.tensor(0.0, device=device)
-            for b in range(B):
-                unmatched_q = all_q[all_q != best_q[b]]
-                if unmatched_q.numel() > max_bg_queries:
-                    unmatched_q = unmatched_q[:max_bg_queries]
-                if unmatched_q.numel() == 0:
-                    continue
-                preds_bg = pred_loss_masks[b, unmatched_q]  # (n_bg,H,W)
-                if preds_bg.dim() == 4 and preds_bg.shape[1] == 1:
-                    preds_bg = preds_bg.squeeze(1)
-                zeros = torch.zeros_like(preds_bg)
-                nb = torch.tensor(float(unmatched_q.numel()), device=device).clamp(min=1.0)
-                loss_focal_bg += sam_sigmoid_focal_loss(
-                    preds_bg, zeros, nb, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
-                )
-                loss_dice_bg += dice_simple(preds_bg, zeros)
-            loss_focal = loss_focal + 0.5 * loss_focal_bg
-            loss_dice = loss_dice + 0.5 * loss_dice_bg
-
-            loss_iou = torch.tensor(0.0, device=device)
-            iou_pred = out.get("iou_predictions", None)
-            if iou_pred is not None:
-                if iou_pred.dim() == 3:
-                    iou_pred = iou_pred[-1]
-                with torch.no_grad():
-                    if mask_for_iou.dim() == 3:
-                        mask_for_iou = mask_for_iou.unsqueeze(1)
-                    mask_for_iou_down = torch.nn.functional.interpolate(
-                        mask_for_iou, size=loss_mask_size, mode="bilinear", align_corners=False
+                if pred_masks.dim() == 5:
+                    pred_masks = pred_masks[-1]
+                mask_for_iou = pred_masks
+                if pred_masks.shape[-2:] != masks.shape[-2:]:
+                    pred_masks = torch.nn.functional.interpolate(
+                        pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
                     )
-                    gt_masks = masks
-                    if gt_masks.dim() == 3:
-                        gt_masks = gt_masks.unsqueeze(1)
-                    gt_masks_down = torch.nn.functional.interpolate(
-                        gt_masks, size=loss_mask_size, mode="nearest"
+                if mask_for_iou.shape[-2:] != masks.shape[-2:]:
+                    mask_for_iou = torch.nn.functional.interpolate(
+                        mask_for_iou, size=masks.shape[-2:], mode="bilinear", align_corners=False
                     )
-                    mask_prob = torch.sigmoid(mask_for_iou_down)
-                    prob_flat = mask_prob.flatten(2)
-                    target_flat = gt_masks_down.flatten(2)
-                    intersection = (prob_flat * target_flat).sum(dim=-1)
-                    union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection
-                    true_iou = torch.where(
-                        union > 0, intersection / (union + 1e-6), torch.zeros_like(union)
-                    )
-                if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
-                    iou_pred = iou_pred.expand(true_iou.shape[0], true_iou.shape[1])
-                loss_iou = F.mse_loss(iou_pred, true_iou)
+                pred_masks = pred_masks.clamp(min=-20.0, max=20.0)
+                pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=0.0, neginf=0.0)
+                mask_for_iou = torch.nan_to_num(mask_for_iou, nan=0.0, posinf=0.0, neginf=0.0)
+                masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
+                masks = (masks > 0.5).float()
 
-            loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
+                # Build targets and run official matcher
+                targets = build_batched_targets_from_binary_masks(masks)
+                pred_logits = out.get("presence_logit", None)
+                if pred_logits is None:
+                    pred_logits = torch.zeros((pred_masks.shape[0], pred_masks.shape[1], 1), device=device)
+                else:
+                    if pred_logits.dim() == 4:
+                        pred_logits = pred_logits[-1]
+                    if pred_logits.dim() == 1:
+                        pred_logits = pred_logits.unsqueeze(-1)
+                    if pred_logits.dim() == 2:
+                        pred_logits = pred_logits.unsqueeze(-1)
+                    if pred_logits.shape[1] != pred_masks.shape[1]:
+                        pred_logits = pred_logits.unsqueeze(1).expand(-1, pred_masks.shape[1], -1)
+                pred_boxes = out.get("reference_boxes", None)
+                if pred_boxes is None:
+                    pred_boxes = torch.zeros((pred_masks.shape[0], pred_masks.shape[1], 4), device=device)
+                else:
+                    if pred_boxes.dim() == 4:
+                        pred_boxes = pred_boxes[-1]
+
+                matcher_outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
+                batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, targets)
+                out["indices"] = (
+                    convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device)
+                    if tgt_idx is not None
+                    else []
+                )
+
+                if tgt_idx is None or tgt_idx.numel() == 0:
+                    loss_focal = torch.tensor(0.0, device=device)
+                    loss_dice = torch.tensor(0.0, device=device)
+                else:
+                    tgt_masks = targets["segments"]
+                    pred_matched = pred_masks[batch_idx, src_idx]
+                    if pred_matched.shape[-2:] != tgt_masks.shape[-2:]:
+                        pred_matched = torch.nn.functional.interpolate(
+                            pred_matched.unsqueeze(1),
+                            size=tgt_masks.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(1)
+                    tgt_matched = tgt_masks[tgt_idx]
+                    num_boxes = targets["num_boxes"].sum().float().clamp(min=1.0)
+                    loss_focal = sam_sigmoid_focal_loss(
+                        pred_matched, tgt_matched, num_boxes, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
+                    )
+                    loss_dice = sam_dice_loss(
+                        pred_matched, tgt_matched, num_boxes, loss_on_multimask=False, reduce=True
+                    )
+                    # Background loss for unmatched queries (encourage background on negatives)
+                    all_q = torch.arange(pred_masks.shape[1], device=device)
+                    loss_focal_bg = torch.tensor(0.0, device=device)
+                    loss_dice_bg = torch.tensor(0.0, device=device)
+                    for b in range(pred_masks.shape[0]):
+                        mask_b = batch_idx == b
+                        matched_q = src_idx[mask_b] if mask_b.any() else torch.zeros(0, device=device, dtype=torch.long)
+                        unmatched_q = all_q if matched_q.numel() == 0 else all_q[~torch.isin(all_q, matched_q)]
+                        if unmatched_q.numel() == 0:
+                            continue
+                        preds_bg = pred_masks[b, unmatched_q]
+                        zeros = torch.zeros_like(preds_bg)
+                        nb = torch.tensor(float(unmatched_q.numel()), device=device).clamp(min=1.0)
+                        loss_focal_bg += sam_sigmoid_focal_loss(
+                            preds_bg, zeros, nb, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
+                        )
+                        loss_dice_bg += sam_dice_loss(
+                            preds_bg, zeros, nb, loss_on_multimask=False, reduce=True
+                        )
+                    loss_focal = loss_focal + 0.5 * loss_focal_bg
+                    loss_dice = loss_dice + 0.5 * loss_dice_bg
+
+                loss_iou = torch.tensor(0.0, device=device)
+                iou_pred = out.get("iou_predictions", None)
+                if iou_pred is not None:
+                    if iou_pred.dim() == 3:
+                        iou_pred = iou_pred[-1]
+                    with torch.no_grad():
+                        if mask_for_iou.dim() == 3:
+                            mask_for_iou = mask_for_iou.unsqueeze(1)
+                        target_size = (256, 256)
+                        mask_for_iou_down = torch.nn.functional.interpolate(
+                            mask_for_iou, size=target_size, mode="bilinear", align_corners=False
+                        )
+                        gt_masks = masks
+                        if gt_masks.dim() == 3:
+                            gt_masks = gt_masks.unsqueeze(1)
+                        gt_masks_down = torch.nn.functional.interpolate(
+                            gt_masks, size=target_size, mode="nearest"
+                        )
+                        mask_prob = torch.sigmoid(mask_for_iou_down)
+                        prob_flat = mask_prob.flatten(2)
+                        target_flat = gt_masks_down.flatten(2)
+                        intersection = (prob_flat * target_flat).sum(dim=-1)
+                        union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection
+                        true_iou = torch.where(
+                            union > 0, intersection / (union + 1e-6), torch.zeros_like(union)
+                        )
+                    if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
+                        iou_pred = iou_pred.expand(true_iou.shape[0], true_iou.shape[1])
+                    loss_iou = F.mse_loss(iou_pred, true_iou)
+
+                loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
             # ===== AMP autocast 结束 =====
 
             if not torch.isfinite(loss):
@@ -574,7 +422,7 @@ def main(args: argparse.Namespace):
                 continue
 
             optimizer.zero_grad()
-            # 使用 GradScaler �?backward + step
+            # 使用 GradScaler 做 backward + step
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -636,4 +484,3 @@ if __name__ == "__main__":
     parser.add_argument("--balance", action="store_true", help="Enable anomaly/non-anomaly weighted sampler.")
     args = parser.parse_args()
     main(args)
-
