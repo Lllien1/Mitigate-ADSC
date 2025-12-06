@@ -469,10 +469,24 @@ def main(args: argparse.Namespace):
                 # reference boxes as before (no change)
                 pred_boxes = out.get("reference_boxes", None)
                 if pred_boxes is None:
+                    # fallback，全 0 框
                     pred_boxes = torch.zeros((pred_masks.shape[0], pred_masks.shape[1], 4), device=device)
                 else:
                     if pred_boxes.dim() == 4:
-                        pred_boxes = pred_boxes[-1]
+                        # 原始 shape: [L, Q, B, 4]（从你打印 [400,2,4] 反推出 L=6）
+                        pred_boxes = pred_boxes[-1]  # [Q, B, 4] 或 [B, Q, 4]
+                    # 统一成 [B, Q, 4]
+                    if pred_boxes.shape[0] == pred_masks.shape[1] and pred_boxes.shape[1] == pred_masks.shape[0]:
+                        # 当前是 [Q, B, 4]，需要转成 [B, Q, 4]
+                        pred_boxes = pred_boxes.permute(1, 0, 2).contiguous()
+                    elif pred_boxes.shape[0] == pred_masks.shape[0] and pred_boxes.shape[1] == pred_masks.shape[1]:
+                        # 已经是 [B, Q, 4]，不用动
+                        pass
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected pred_boxes shape {pred_boxes.shape} "
+                            f"for pred_masks {pred_masks.shape}"
+                        )
 
                 matcher_outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
                 batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, targets)
@@ -481,6 +495,80 @@ def main(args: argparse.Namespace):
                     if tgt_idx is not None
                     else []
                 )
+
+                # ====== DEBUG BLOCK ======
+                if step < 20:  # only print early steps to avoid very verbose logs
+                    # 1) targets summary
+                    print("DBG targets num_boxes:", targets["num_boxes"].tolist())
+                
+                    # 2) matcher raw shapes
+                    print("DBG matcher raw shapes:", 
+                          "batch_idx", None if batch_idx is None else tuple(batch_idx.shape),
+                          "src_idx", None if src_idx is None else tuple(src_idx.shape),
+                          "tgt_idx", None if tgt_idx is None else tuple(tgt_idx.shape))
+                
+                    # 3) matched per image (use convert helper)
+                    indices_tmp = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
+                    print("DBG matched per image:", [int(s.shape[0]) for s, _ in indices_tmp])
+                
+                    # 4) model outputs stats
+                    print("DBG pred_masks shape:", pred_masks.shape, "mean/std:", float(pred_masks.mean().item()), float(pred_masks.std().item()))
+                    print("DBG mask_for_iou shape:", mask_for_iou.shape, "mean/std:", float(mask_for_iou.mean().item()), float(mask_for_iou.std().item()))
+                
+                    # presence logits (normalized earlier)
+                    try:
+                        pl = pred_logits  # we normalized pred_logits earlier in your code
+                        print("DBG pred_logits shape:", pl.shape, "mean/std:", float(pl.mean().item()), float(pl.std().item()))
+                    except Exception as e:
+                        print("DBG pred_logits access error:", e)
+                
+                    # pred_boxes stats
+                    try:
+                        pb = pred_boxes
+                        print("DBG pred_boxes shape:", pb.shape, "min/max:", float(pb.min().item()), float(pb.max().item()))
+                    except Exception as e:
+                        print("DBG pred_boxes access error:", e)
+                
+                    # decoder hidden states if present
+                    dec = out.get("decoder_hs", None)
+                    print("DBG decoder_hs:", None if dec is None else tuple(dec.shape))
+                
+                    # prompt prototype and pooled visual feat for align
+                    try:
+                        prompt_seq, prompt_mask = model.prompt_learner(prompt_lists, device=device)
+                        prompt_proto = prompt_seq[-1].transpose(0,1)  # (B, D)
+                        print("DBG prompt_proto shape/mean/std:", prompt_proto.shape, float(prompt_proto.mean().item()), float(prompt_proto.std().item()))
+                    except Exception as e:
+                        print("DBG prompt_learner error:", e)
+                
+                    if dec is not None:
+                        try:
+                            if isinstance(dec, torch.Tensor):
+                                hs_last = dec[-1] if dec.dim()==4 else dec  # handle (L,B,Q,D) or (B,Q,D)
+                                v_pooled = hs_last.mean(dim=1)
+                                print("DBG v_pooled shape/mean/std:", v_pooled.shape, float(v_pooled.mean().item()), float(v_pooled.std().item()))
+                        except Exception as e:
+                            print("DBG decoder_hs -> v_pooled error:", e)
+                
+                    # 5) quick matched tensors check (if there are matches)
+                    if tgt_idx is not None and tgt_idx.numel() > 0:
+                        try:
+                            pm = pred_masks[batch_idx, src_idx]
+                            tm = targets["segments"][tgt_idx]
+                            print("DBG pred_matched shape:", pm.shape, "tgt_matched shape:", tm.shape)
+                            print("DBG pred_matched mean/std:", float(pm.mean().item()), float(pm.std().item()))
+                            print("DBG tgt_matched mean/std:", float(tm.mean().item()), float(tm.std().item()))
+                            # compute provisional focal/dice for debug (without other normalization)
+                            debug_focal = sam_sigmoid_focal_loss(pm, tm, max(1.0, float(targets["num_boxes"].sum().float())), alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False)
+                            debug_dice = sam_dice_loss(pm, tm, max(1.0, float(targets["num_boxes"].sum().float())), loss_on_multimask=False, reduce=True)
+                            print("DBG provisional focal/dice:", float(debug_focal.item()), float(debug_dice.item()))
+                        except Exception as e:
+                            print("DBG matched tensor error:", e)
+                    else:
+                        print("DBG no matched pairs in this batch")
+                # ====== END DEBUG BLOCK ======
+
+
 
                 if tgt_idx is None or tgt_idx.numel() == 0:
                     loss_focal = torch.tensor(0.0, device=device)
