@@ -649,52 +649,60 @@ def main(args: argparse.Namespace):
                     
                     # -------------------------
                     # 处理 unmatched(background) loss：随机采样并做归一化（按每图采样最多 K 个 negative queries）
-                    NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image)
-                
+                    # parameters (add to parser if you like)
+                    NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image) if hasattr(args, "neg_samples_per_image") else 5
+                    MASK_DOWNSAMPLE = getattr(args, "mask_downsample", 256)  # 可在 parser 增加 --mask_downsample
+                    
                     loss_focal_bg = torch.tensor(0.0, device=device)
                     loss_dice_bg = torch.tensor(0.0, device=device)
                     total_bg_samples = 0.0
-                
-                    # assume variables from matcher: batch_idx, src_idx, tgt_idx (flat arrays)
-                    # Convert flat matcher output to per-image lists
-                    indices = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
                     all_q = torch.arange(pred_masks.shape[1], device=device)
-                
-                    for b in range(images.shape[0]):
-                        src_q, tgt_q = indices[b]  # src_q: matched query idx for image b
+                    
+                    for b in range(pred_masks.shape[0]):
+                        src_q, tgt_q = indices[b]  # indices 从 convert_matcher_output_to_indices 得到
                         if src_q.numel() == 0:
                             unmatched_q = all_q
                         else:
-                            # unmatched = all_q \ matched_q
-                            mask = torch.ones_like(all_q, dtype=torch.bool)
-                            mask[src_q] = False
-                            unmatched_q = all_q[mask]
-                
+                            mask_un = torch.ones_like(all_q, dtype=torch.bool)
+                            mask_un[src_q] = False
+                            unmatched_q = all_q[mask_un]
+                    
                         if unmatched_q.numel() == 0:
                             continue
                         
                         k = min(NEG_SAMPLES_PER_IMAGE, int(unmatched_q.numel()))
                         perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
                         sampled_unmatched_q = unmatched_q[perm]
-                
-                        preds_bg = pred_masks[b, sampled_unmatched_q]  # shape (k, H, W) or (k, h, w) depending
-                        zeros = torch.zeros_like(preds_bg)
-                
+                    
+                        preds_bg = pred_masks[b, sampled_unmatched_q]  # shape (k, H, W)
+                        # Downsample to save memory
+                        if preds_bg.dim() == 3:
+                            preds_bg_ds = F.interpolate(
+                                preds_bg.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                mode="bilinear", align_corners=False
+                            ).squeeze(1)
+                        else:
+                            preds_bg_ds = preds_bg
+                    
+                        zeros = torch.zeros_like(preds_bg_ds)
+                    
                         nb = float(sampled_unmatched_q.numel())
-                        # Use the same focal/dice API as matched but with nb normalization per image
-                        loss_focal_bg += sam_sigmoid_focal_loss(preds_bg, zeros, nb, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False)
-                        loss_dice_bg += sam_dice_loss(preds_bg, zeros, nb, loss_on_multimask=False, reduce=True)
+                        # compute losses on downsampled masks (same API)
+                        loss_focal_bg += sam_sigmoid_focal_loss(
+                            preds_bg_ds, zeros, nb, alpha=0.25, gamma=2.0,
+                            loss_on_multimask=False, triton=False
+                        )
+                        loss_dice_bg += sam_dice_loss(preds_bg_ds, zeros, nb, loss_on_multimask=False, reduce=True)
                         total_bg_samples += nb
-                
-                    # Normalize to per-image average (so scale doesn't blow with #neg samples)
+                    
+                    # normalize
                     if total_bg_samples > 0:
-                        # average to per-image
-                        loss_focal_bg = loss_focal_bg / (total_bg_samples / float(images.shape[0]))
-                        loss_dice_bg = loss_dice_bg / (total_bg_samples / float(images.shape[0]))
-                
-                    # merge with matched losses (keep your prior weighting, e.g., 0.5)
+                        loss_focal_bg = loss_focal_bg / (total_bg_samples / float(pred_masks.shape[0]))
+                        loss_dice_bg = loss_dice_bg / (total_bg_samples / float(pred_masks.shape[0]))
+                    
                     loss_focal = loss_focal + 0.5 * loss_focal_bg
                     loss_dice = loss_dice + 0.5 * loss_dice_bg
+
                         
                 # -------------------------
                 # IoU 计算（downsample + true_iou），并用 Smooth L1 对 matched queries 做回归监督
