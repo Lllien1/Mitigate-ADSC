@@ -58,6 +58,8 @@ class MVTecMetaDataset(Dataset):
         mode: str = "test",
         k_shot: int = 0,
         obj_name: Optional[str] = None,
+        include_test_defects: bool = True, 
+        goods_per_class: Optional[int] = 10,
         aug_rate: float = 0.0,
         prompt_dict: Optional[Dict[str, List[str]]] = None,
         image_transform: Optional[Callable] = None,
@@ -89,16 +91,112 @@ class MVTecMetaDataset(Dataset):
         self.entries: List[SampleEntry] = []
         for cls in cls_names:
             data_list = split_meta[cls]
-            if mode in ("train", "train_all") and k_shot > 0:
-                indices = torch.randint(0, len(data_list), (k_shot,))
-                chosen = [data_list[i] for i in indices]
+            # === REPLACE k-shot SECTION in MVTecMetaDataset.__init__ ===
+            # 新增参数说明（在 __init__ signature）： include_test_defects: bool = False, goods_per_class: int = 50
+            # (如果还没有，请在函数定义处添加对应默认参数)
+            #
+            # 替换原有 k_shot 处理逻辑为 defect-first + goods 补齐（优先取 test 中缺陷，并在无 good 时从 train 找 good）
+            
+            if mode in ("train", "train_all", "test") and k_shot > 0:
+                # data_list: all entries in the 'train' split for this class (since current code chooses split_meta earlier)
+                # But we want optionally to include defects from test -> we'll handle that in a mode-agnostic way:
+                # Build three pools:
+                #   - train_defects: defects from train split (if any)
+                #   - test_defects: defects from test split (meta_info['test']) if available and include_test_defects True
+                #   - goods_pool: goods from test if available else goods from train
+                train_defects = [d for d in data_list if int(d.get("anomaly", 0)) == 1 and d.get("mask_path")]
+                train_goods = [d for d in data_list if int(d.get("anomaly", 0)) == 0]
+            
+                test_defects = []
+                test_goods = []
+                # If meta_info has 'test' we can use it for defect harvesting
+                if include_test_defects:
+                    test_meta = None
+                    # meta_info variable in outer scope holds whole meta; we can read meta_info['test'][cls] if exists
+                    try:
+                        test_meta = meta_info.get("test", {})
+                        cls_test_list = test_meta.get(cls, [])
+                    except Exception:
+                        cls_test_list = []
+                    for d in cls_test_list:
+                        if int(d.get("anomaly", 0)) == 1 and d.get("mask_path"):
+                            test_defects.append(d)
+                        elif int(d.get("anomaly", 0)) == 0:
+                            test_goods.append(d)
+            
+                # Build chosen list:
+                chosen = []
+            
+                # 1) defects selection: prefer test defects (all), then train defects to reach k_shot if necessary.
+                # Per your requirement: "将 test 下 cls 中的所有缺陷都划分进来", so include all test defects.
+                if include_test_defects and len(test_defects) > 0:
+                    chosen_defects = test_defects.copy()
+                else:
+                    chosen_defects = []
+            
+                # If we want at least k_shot defect examples per specie, supplement from train_defects
+                if len(chosen_defects) < k_shot:
+                    needed = k_shot - len(chosen_defects)
+                    # sample from train_defects if available, otherwise sample from train overall
+                    if len(train_defects) >= needed:
+                        chosen_defects.extend(random.sample(train_defects, needed))
+                    else:
+                        chosen_defects.extend(train_defects)
+                        # If still not enough, sample from data_list (possibly goods) as fallback
+                        remaining = k_shot - len(chosen_defects)
+                        if remaining > 0:
+                            pool = [d for d in data_list if d not in chosen_defects]
+                            if len(pool) >= remaining:
+                                chosen_defects.extend(random.sample(pool, remaining))
+                            else:
+                                chosen_defects.extend(pool)
+            
+                # 2) goods selection: we want some goods per class to balance; prefer test goods if exist, else use train_goods
+                n_goods = goods_per_class if goods_per_class is not None else max(k_shot, 50)
+                goods_pool = []
+                if include_test_defects and len(test_goods) > 0:
+                    goods_pool = test_goods
+                else:
+                    goods_pool = train_goods
+            
+                if len(goods_pool) >= n_goods:
+                    chosen_goods = random.sample(goods_pool, n_goods)
+                else:
+                    # If insufficient goods in the chosen pool, fallback to entire train/test union
+                    union_pool = []
+                    if "train" in meta_info and cls in meta_info["train"]:
+                        union_pool.extend([d for d in meta_info["train"][cls] if int(d.get("anomaly",0))==0])
+                    if "test" in meta_info and cls in meta_info["test"]:
+                        union_pool.extend([d for d in meta_info["test"][cls] if int(d.get("anomaly",0))==0])
+
+                    # 去重（按 img_path + mask_path）
+                    seen = set()
+                    unique_union = []
+                    for d in union_pool:
+                        key = (d["img_path"], d.get("mask_path", ""))
+                        if key not in seen:
+                            seen.add(key)
+                            unique_union.append(d)
+                    union_pool = unique_union
+
+                    if len(union_pool) >= n_goods:
+                        chosen_goods = random.sample(union_pool, n_goods)
+                    else:
+                        chosen_goods = union_pool.copy()
+
+                # Merge defects + goods and shuffle
+                chosen = chosen_defects + chosen_goods
+                random.shuffle(chosen)
+                # Optionally save k_shot defect list
                 if save_dir is not None:
                     os.makedirs(save_dir, exist_ok=True)
-                    with open(os.path.join(save_dir, "k_shot.txt"), "a", encoding="utf-8") as f:
-                        for d in chosen:
+                    with open(os.path.join(save_dir, f"k_shot_{cls}.txt"), "a", encoding="utf-8") as f:
+                        for d in chosen_defects:
                             f.write(d["img_path"] + "\n")
             else:
                 chosen = data_list
+            # === END REPLACEMENT ===
+            
             for d in chosen:
                 self.entries.append(
                     SampleEntry(

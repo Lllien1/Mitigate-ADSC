@@ -21,6 +21,13 @@ from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
 
 
+def collate_fn(batch):
+    imgs, masks, prompts, anomalies, classes = zip(*batch)
+    imgs = torch.stack(imgs, dim=0)
+    masks = torch.stack(masks, dim=0)
+    return imgs, masks, list(prompts), list(anomalies), list(classes)
+
+
 def mask_to_box(mask: torch.Tensor):
     """Convert a binary mask (H,W) to cxcywh normalized box; return None if empty."""
     ys, xs = torch.where(mask.bool())
@@ -256,33 +263,43 @@ def build_dataloaders(
 
     sampler = None
     if balance:
-        labels = [int(is_anomaly) for _, _, _, is_anomaly, _ in ds]
-        class_counts = torch.tensor(
-            [(1 - torch.tensor(labels)).sum(), torch.tensor(labels).sum()],
-            dtype=torch.float,
-        )
-        class_counts = torch.clamp(class_counts, min=1.0)
-        weight = 1.0 / class_counts
-        samples_weight = torch.tensor([weight[l] for l in labels])
+        # compute per-sample weights: anomalies have higher weight
+        labels = [int(entry.anomaly) for entry in ds.entries]
+        labels = torch.tensor(labels, dtype=torch.long)
+        anomaly_count = (labels == 1).sum().item()
+        normal_count = (labels == 0).sum().item()
+        if anomaly_count == 0:
+            samples_weight = torch.ones(len(labels), dtype=torch.float)
+        else:
+            w_anom = 1.0 / anomaly_count
+            w_norm = 1.0 / max(normal_count, 1)
+            upsample_factor = 5.0
+            weights = []
+            for l in labels:
+                if l == 1:
+                    weights.append(w_anom * upsample_factor)
+                else:
+                    weights.append(w_norm)
+            samples_weight = torch.tensor(weights, dtype=torch.float)
+
         sampler = torch.utils.data.WeightedRandomSampler(
             samples_weight, num_samples=len(samples_weight), replacement=True
         )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
 
-    def collate_fn(batch):
-        imgs, masks, prompt_lists, is_anomaly, class_names = zip(*batch)
-        imgs = torch.stack(imgs, dim=0)
-        masks = torch.stack(masks, dim=0)
-        is_anomaly_t = torch.tensor(is_anomaly, dtype=torch.bool)
-        return imgs, masks, list(prompt_lists), is_anomaly_t, list(class_names)
-
-    return DataLoader(
+    dataloader = DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=sampler is None,
+        shuffle=shuffle,
         sampler=sampler,
         num_workers=4,
         collate_fn=collate_fn,
     )
+    return dataloader
+
 
 
 def load_sam3_checkpoint(model: torch.nn.Module, ckpt_path: str):
@@ -440,9 +457,7 @@ def main(args: argparse.Namespace):
 
                 # Build targets and run official matcher
                 targets = build_batched_targets_from_binary_masks(masks)
-                num_boxes = targets["num_boxes"]  # 这是你的函数返回的 num_boxes
-                print("DEBUG num_boxes per image:", num_boxes.tolist())
-                writer.add_scalar("stats/num_boxes_avg", float(num_boxes.float().mean()), global_step)
+                
                 # ---------- Normalize presence logits robustly ----------
                 B = pred_masks.shape[0]
                 Q = pred_masks.shape[1]
