@@ -554,6 +554,11 @@ def main(args: argparse.Namespace):
 
                 # ====== DEBUG BLOCK ======
                 if step < 20:  # only print early steps to avoid very verbose logs
+                    print("DBG indices_per_image:")
+                    for b in range(images.shape[0]):
+                        src_q, tgt_q = indices_per_image[b]
+                        print(f"  image {b}: src_q={src_q.cpu().tolist()}, tgt_q={tgt_q.cpu().tolist()}, num_boxes={int(targets['num_boxes'][b].item())}")
+                    
                     # 1) targets summary
                     print("DBG targets num_boxes:", targets["num_boxes"].tolist())
                 
@@ -769,6 +774,10 @@ def main(args: argparse.Namespace):
                 # -------------------------
                 # Presence BCE loss (requires presence_head=True in model_builder)
                 # pred_logits 已被准备成 (B, Q, 1) 形式 earlier; we squeeze trailing dim.
+
+                # -------------------------
+                # Presence BCE loss (requires presence_head=True in model_builder)
+                # pred_logits 已被准备成 (B, Q, 1) 形式 earlier; we squeeze trailing dim.
                 if out.get("presence_logit", None) is not None:
                     presence_logit = out["presence_logit"]
                     # normalize dims to (B,Q)
@@ -780,14 +789,34 @@ def main(args: argparse.Namespace):
                         presence_logit = presence_logit.unsqueeze(1)
                     # build presence target matrix (B, Q)
                     presence_targets = torch.zeros_like(presence_logit, dtype=torch.float32, device=device)
+
+                    # get indices per image using our helper
                     indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
+
+                    # Defensive assignment: filter out-of-range indices and print diagnostics
+                    Q_dim = presence_targets.shape[1]
                     for b in range(images.shape[0]):
                         src_q, _ = indices_per_image[b]
                         if src_q.numel() > 0:
-                            presence_targets[b, src_q] = 1.0
+                            # ensure dtype long and on same device
+                            src_q = src_q.to(device).long()
+
+                            # detect invalid indices
+                            invalid_mask = (src_q < 0) | (src_q >= Q_dim)
+                            if invalid_mask.any():
+                                print(f"[WARN] presence_targets: found {invalid_mask.sum().item()} invalid src indices for image {b}. "
+                                      f"Q={Q_dim}, src_q_invalid={src_q[invalid_mask].cpu().tolist()}")
+
+                                # drop invalid indices before assignment
+                                src_q = src_q[~invalid_mask]
+
+                            if src_q.numel() > 0:
+                                presence_targets[b, src_q] = 1.0
+
                     loss_presence = F.binary_cross_entropy_with_logits(presence_logit, presence_targets)
                 else:
                     loss_presence = torch.tensor(0.0, device=device)
+
 
                 # -------------------------
                 # Contrastive alignment (InfoNCE) between visual pooled vector and prompt prototype
