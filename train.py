@@ -488,13 +488,68 @@ def main(args: argparse.Namespace):
                             f"for pred_masks {pred_masks.shape}"
                         )
 
+                # --- matcher and robust index reconstruction ---
                 matcher_outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
                 batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, targets)
-                out["indices"] = (
-                    convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device)
-                    if tgt_idx is not None
-                    else []
-                )
+
+                # If matcher returns tgt_idx is None (BinaryHungarianMatcher behavior),
+                # we must still convert the flattened batch_idx/src_idx into per-image matched lists.
+                # For MVTec (<=1 GT per image) we can map matched src indices to the unique target index per image.
+                if tgt_idx is None:
+                    # Build per-image lists of matched src indices from batch_idx and src_idx
+                    # batch_idx/src_idx are 1D tensors
+                    if batch_idx is None or src_idx is None:
+                        indices_per_image = [ (torch.zeros((0,), dtype=torch.long, device=device),
+                                               torch.zeros((0,), dtype=torch.long, device=device)) for _ in range(pred_masks.shape[0]) ]
+                    else:
+                        # group src_idx by batch index
+                        B = pred_masks.shape[0]
+                        src_idx = src_idx.to(device)
+                        batch_idx = batch_idx.to(device)
+                        indices_per_image = []
+                        for b in range(B):
+                            mask = (batch_idx == b)
+                            if mask.any():
+                                srcs = src_idx[mask]
+                            else:
+                                srcs = torch.zeros((0,), dtype=torch.long, device=device)
+                            # tgt list unknown; will be reconstructed below if targets exist
+                            indices_per_image.append((srcs, torch.zeros((0,), dtype=torch.long, device=device)))
+
+                    # Now reconstruct global tgt_idx by mapping per-image first target index
+                    num_boxes_list = targets["num_boxes"].tolist()
+                    # cumulative start indices for flattened targets (same convention as matcher)
+                    cum = [0]
+                    for nb in num_boxes_list:
+                        cum.append(cum[-1] + nb)
+                    batch_idx_list = []
+                    src_idx_list = []
+                    tgt_idx_list = []
+                    for b, (srcs, _) in enumerate(indices_per_image):
+                        if srcs.numel() == 0:
+                            continue
+                        if num_boxes_list[b] == 0:
+                            # If there is no GT for that image but matcher matched srcs, skip (rare)
+                            continue
+                        # assign the only GT flattened index for this image (works for MVTec where num_boxes <= 1)
+                        tgt_global = cum[b]
+                        for s in srcs.cpu().tolist():
+                            batch_idx_list.append(b)
+                            src_idx_list.append(int(s))
+                            tgt_idx_list.append(int(tgt_global))
+                    if len(tgt_idx_list) > 0:
+                        batch_idx = torch.tensor(batch_idx_list, dtype=torch.long, device=device)
+                        src_idx = torch.tensor(src_idx_list, dtype=torch.long, device=device)
+                        tgt_idx = torch.tensor(tgt_idx_list, dtype=torch.long, device=device)
+                    else:
+                        # Keep tgt_idx as None if we couldn't reconstruct any (then no matched pairs effectively)
+                        tgt_idx = None
+
+                # Now produce per-image indices for downstream use
+                out["indices"] = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device)
+                # --- end matcher robust handling ---
+
+                
 
                 # ====== DEBUG BLOCK ======
                 if step < 20:  # only print early steps to avoid very verbose logs
@@ -643,64 +698,64 @@ def main(args: argparse.Namespace):
                         
                 # -------------------------
                 # IoU 计算（downsample + true_iou），并用 Smooth L1 对 matched queries 做回归监督
-                loss_iou = torch.tensor(0.0, device=device)
-                iou_pred = out.get("iou_predictions", None)
-                if iou_pred is not None:
-                    if iou_pred.dim() == 3:
-                        iou_pred = iou_pred[-1]
-                    # compute true IoU per (B, Q) as you already do
-                    with torch.no_grad():
-                        if mask_for_iou.dim() == 3:
-                            mask_for_iou = mask_for_iou.unsqueeze(1)  # (B, 1 or Q, H, W) handled
-                        target_size = (256, 256)
-                        mask_for_iou_down = torch.nn.functional.interpolate(
-                            mask_for_iou, size=target_size, mode="bilinear", align_corners=False
-                        )
-                        gt_masks = masks
-                        if gt_masks.dim() == 3:
-                            gt_masks = gt_masks.unsqueeze(1)
-                        gt_masks_down = torch.nn.functional.interpolate(gt_masks, size=target_size, mode="nearest")
-                        mask_prob = torch.sigmoid(mask_for_iou_down)
-                        prob_flat = mask_prob.flatten(2)      # (B, Q, N)
-                        target_flat = gt_masks_down.flatten(2)  # (B, 1, N)
-                        intersection = (prob_flat * target_flat).sum(dim=-1)  # (B, Q)
-                        union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection  # (B, Q)
-                        true_iou = torch.where(union > 0, intersection / (union + 1e-6), torch.zeros_like(union))
-                    # handle shape mismatch: if iou_pred has single value per query or shape (B,1)
-                    if iou_pred.dim() == 3:
-                        # unexpected extra dim: squeeze last dim if it exists
-                        iou_pred = iou_pred.squeeze(-1)
-                    if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
-                        # expand per-query
-                        iou_pred = iou_pred.expand(-1, true_iou.shape[1]).contiguous()
+                # loss_iou = torch.tensor(0.0, device=device)
+                # iou_pred = out.get("iou_predictions", None)
+                # if iou_pred is not None:
+                #     if iou_pred.dim() == 3:
+                #         iou_pred = iou_pred[-1]
+                #     # compute true IoU per (B, Q) as you already do
+                #     with torch.no_grad():
+                #         if mask_for_iou.dim() == 3:
+                #             mask_for_iou = mask_for_iou.unsqueeze(1)  # (B, 1 or Q, H, W) handled
+                #         target_size = (256, 256)
+                #         mask_for_iou_down = torch.nn.functional.interpolate(
+                #             mask_for_iou, size=target_size, mode="bilinear", align_corners=False
+                #         )
+                #         gt_masks = masks
+                #         if gt_masks.dim() == 3:
+                #             gt_masks = gt_masks.unsqueeze(1)
+                #         gt_masks_down = torch.nn.functional.interpolate(gt_masks, size=target_size, mode="nearest")
+                #         mask_prob = torch.sigmoid(mask_for_iou_down)
+                #         prob_flat = mask_prob.flatten(2)      # (B, Q, N)
+                #         target_flat = gt_masks_down.flatten(2)  # (B, 1, N)
+                #         intersection = (prob_flat * target_flat).sum(dim=-1)  # (B, Q)
+                #         union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection  # (B, Q)
+                #         true_iou = torch.where(union > 0, intersection / (union + 1e-6), torch.zeros_like(union))
+                #     # handle shape mismatch: if iou_pred has single value per query or shape (B,1)
+                #     if iou_pred.dim() == 3:
+                #         # unexpected extra dim: squeeze last dim if it exists
+                #         iou_pred = iou_pred.squeeze(-1)
+                #     if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
+                #         # expand per-query
+                #         iou_pred = iou_pred.expand(-1, true_iou.shape[1]).contiguous()
 
-                    # Now compute matched vectors and SmoothL1 over matched pairs
-                    # matcher returned batch_idx, src_idx, tgt_idx (flat tensors)
-                    if tgt_idx is not None and tgt_idx.numel() > 0:
-                        # Ensure batch_idx, src_idx, tgt_idx are tensors on correct device
-                        # They were created by matcher above; typically on CPU or device - keep consistent
-                        batch_idx = batch_idx.to(device)
-                        src_idx = src_idx.to(device)
-                        tgt_idx = tgt_idx.to(device)
+                #     # Now compute matched vectors and SmoothL1 over matched pairs
+                #     # matcher returned batch_idx, src_idx, tgt_idx (flat tensors)
+                #     if tgt_idx is not None and tgt_idx.numel() > 0:
+                #         # Ensure batch_idx, src_idx, tgt_idx are tensors on correct device
+                #         # They were created by matcher above; typically on CPU or device - keep consistent
+                #         batch_idx = batch_idx.to(device)
+                #         src_idx = src_idx.to(device)
+                #         tgt_idx = tgt_idx.to(device)
 
-                        # iou_pred_matched: pick per-pair predicted iou
-                        # If iou_pred is (B, Q), indexing with (batch_idx, src_idx) yields (num_matches,)
-                        iou_pred_matched = iou_pred[batch_idx, src_idx]
-                        true_iou_matched = true_iou[batch_idx, tgt_idx]
+                #         # iou_pred_matched: pick per-pair predicted iou
+                #         # If iou_pred is (B, Q), indexing with (batch_idx, src_idx) yields (num_matches,)
+                #         iou_pred_matched = iou_pred[batch_idx, src_idx]
+                #         true_iou_matched = true_iou[batch_idx, tgt_idx]
 
-                        # make sure they are floats on correct device
-                        iou_pred_matched = iou_pred_matched.to(device)
-                        true_iou_matched = true_iou_matched.to(device)
+                #         # make sure they are floats on correct device
+                #         iou_pred_matched = iou_pred_matched.to(device)
+                #         true_iou_matched = true_iou_matched.to(device)
 
-                        # Smooth L1 loss (robust to outliers)
-                        if iou_pred_matched.numel() > 0:
-                            loss_iou = F.smooth_l1_loss(iou_pred_matched, true_iou_matched, reduction="mean")
-                        else:
-                            loss_iou = torch.tensor(0.0, device=device)
-                    else:
-                        loss_iou = torch.tensor(0.0, device=device)
-                else:
-                    loss_iou = torch.tensor(0.0, device=device)
+                #         # Smooth L1 loss (robust to outliers)
+                #         if iou_pred_matched.numel() > 0:
+                #             loss_iou = F.smooth_l1_loss(iou_pred_matched, true_iou_matched, reduction="mean")
+                #         else:
+                #             loss_iou = torch.tensor(0.0, device=device)
+                #     else:
+                #         loss_iou = torch.tensor(0.0, device=device)
+                # else:
+                #     loss_iou = torch.tensor(0.0, device=device)
 
                 # -------------------------
                 # Presence BCE loss (requires presence_head=True in model_builder)
