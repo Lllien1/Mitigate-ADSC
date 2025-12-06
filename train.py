@@ -77,7 +77,23 @@ def build_batched_targets_from_binary_masks(masks: torch.Tensor):
 
 
 def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B, device):
-    """Convert flat matcher output to list of (src,tgt) per batch."""
+    """
+    Convert flat matcher output to list of (src, tgt) per batch.
+
+    This version is robust to src_idx/tgt_idx being None (matcher returning no matches).
+    Always returns a list of length B; each element is a pair of 1D LongTensors on `device`.
+    """
+    # If no matcher output or no matches at all, return empty lists per image
+    if batch_idx is None or src_idx is None or tgt_idx is None:
+        empty_pair = (torch.zeros((0,), dtype=torch.long, device=device),
+                      torch.zeros((0,), dtype=torch.long, device=device))
+        return [empty_pair for _ in range(B)]
+
+    # Ensure tensors are on the right device and are 1D
+    batch_idx = batch_idx.to(device)
+    src_idx = src_idx.to(device)
+    tgt_idx = tgt_idx.to(device)
+
     indices = []
     for b in range(B):
         mask = (batch_idx == b)
@@ -89,8 +105,10 @@ def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B, device):
                 )
             )
             continue
+        # index with mask returns 1D tensors of matches for that image
         indices.append((src_idx[mask].to(device), tgt_idx[mask].to(device)))
     return indices
+
 
 
 def focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
@@ -422,6 +440,9 @@ def main(args: argparse.Namespace):
 
                 # Build targets and run official matcher
                 targets = build_batched_targets_from_binary_masks(masks)
+                num_boxes = targets["num_boxes"]  # 这是你的函数返回的 num_boxes
+                print("DEBUG num_boxes per image:", num_boxes.tolist())
+                writer.add_scalar("stats/num_boxes_avg", float(num_boxes.float().mean()), global_step)
                 # ---------- Normalize presence logits robustly ----------
                 B = pred_masks.shape[0]
                 Q = pred_masks.shape[1]
