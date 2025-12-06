@@ -770,27 +770,26 @@ def main(args: argparse.Namespace):
                 #         loss_iou = torch.tensor(0.0, device=device)
                 # else:
                 #     loss_iou = torch.tensor(0.0, device=device)
-
+                
+                loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
                 # Presence BCE loss (requires presence_head=True in model_builder)
                 # pred_logits 已被准备成 (B, Q, 1) 形式 earlier; we squeeze trailing dim.
-
-                # -------------------------
-                # Presence BCE loss (requires presence_head=True in model_builder)
-                # pred_logits 已被准备成 (B, Q, 1) 形式 earlier; we squeeze trailing dim.
-                if out.get("presence_logit", None) is not None:
-                    presence_logit = out["presence_logit"]
-                    # normalize dims to (B,Q)
-                    if presence_logit.dim() == 4:
-                        presence_logit = presence_logit[-1]
+                if pred_logits is not None:
+                    # convert to shape (B, Q) for BCEWithLogits (logits)
+                    # pred_logits currently is (B, Q, 1) according to normalize_presence_logits
+                    presence_logit = pred_logits
                     if presence_logit.dim() == 3 and presence_logit.shape[-1] == 1:
-                        presence_logit = presence_logit.squeeze(-1)
-                    if presence_logit.dim() == 1:
-                        presence_logit = presence_logit.unsqueeze(1)
+                        presence_logit = presence_logit.squeeze(-1)  # (B, Q)
+                    # safety: if still has extra dims, reshape/pad
+                    if presence_logit.dim() != 2:
+                        # try to force into (B,Q)
+                        presence_logit = presence_logit.reshape(B, Q)
+
                     # build presence target matrix (B, Q)
                     presence_targets = torch.zeros_like(presence_logit, dtype=torch.float32, device=device)
 
-                    # get indices per image using our helper
+                    # get indices per image using our helper (already computed into 'indices' local alias)
                     indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
 
                     # Defensive assignment: filter out-of-range indices and print diagnostics
@@ -815,6 +814,7 @@ def main(args: argparse.Namespace):
 
                     loss_presence = F.binary_cross_entropy_with_logits(presence_logit, presence_targets)
                 else:
+                    # fallback (shouldn't happen because we normalized earlier), keep zero
                     loss_presence = torch.tensor(0.0, device=device)
 
 
