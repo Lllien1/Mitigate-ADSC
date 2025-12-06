@@ -103,6 +103,79 @@ def focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, 
         loss = alpha_t * loss
     return loss.mean()
 
+def normalize_presence_logits(pred_logits, B, Q, device):
+    """
+    Normalize various possible shapes of presence_logit into (B, Q, 1).
+    Handles shapes like: (L,B,Q,1), (B,L,Q,1), (B,Q,1), (B,1,1,1), (B,Q), (B,1), (B,)
+    """
+    if pred_logits is None:
+        return torch.zeros((B, Q, 1), device=device, dtype=torch.float32)
+
+    # Move to device
+    pred_logits = pred_logits.to(device)
+
+    # If there is a leading layers dimension (4D),
+    # try common conventions: (B, L, Q, 1) or (L, B, Q, 1)
+    if pred_logits.dim() == 4:
+        # case (B, L, Q, 1)
+        if pred_logits.shape[0] == B and pred_logits.shape[-1] == 1:
+            pred_logits = pred_logits[:, -1, :, :]  # take last layer along dim=1 -> (B,Q,1)
+        # case (L, B, Q, 1)
+        elif pred_logits.shape[1] == B:
+            pred_logits = pred_logits[-1]  # take last layer along dim=0 -> (B,Q,1)
+        else:
+            pred_logits = pred_logits[-1]
+
+    # Now handle other dims ensuring final shape (B,Q,1)
+    if pred_logits.dim() == 3:
+        # common case (B, Q, 1) -> fine
+        if pred_logits.shape[0] == B and pred_logits.shape[1] == Q:
+            return pred_logits
+        # if shape is (B,1,1) expand Q
+        if pred_logits.shape[0] == B and pred_logits.shape[1] == 1:
+            return pred_logits.expand(B, Q, pred_logits.shape[2])
+        # if shape swapped (Q, B, 1)
+        if pred_logits.shape[0] == Q and pred_logits.shape[1] == B:
+            return pred_logits.permute(1, 0, 2)
+        # fallback: reshape if possible
+        try:
+            return pred_logits.reshape(B, Q, pred_logits.shape[-1])
+        except Exception:
+            return pred_logits.unsqueeze(-1).expand(B, Q, -1)
+
+    if pred_logits.dim() == 2:
+        # (B, Q) -> (B,Q,1)
+        if pred_logits.shape[0] == B and pred_logits.shape[1] == Q:
+            return pred_logits.unsqueeze(-1)
+        # (B,1) -> expand to Q
+        if pred_logits.shape[0] == B and pred_logits.shape[1] == 1:
+            return pred_logits.expand(B, Q).unsqueeze(-1)
+        # (Q,B) -> permute then unsqueeze
+        if pred_logits.shape[0] == Q and pred_logits.shape[1] == B:
+            return pred_logits.permute(1, 0).unsqueeze(-1)
+        # fallback
+        try:
+            return pred_logits.view(B, Q, -1)[:,:Q,:]
+        except Exception:
+            return pred_logits.unsqueeze(-1).expand(B, Q, -1)
+
+    if pred_logits.dim() == 1:
+        if pred_logits.shape[0] == B:
+            return pred_logits.unsqueeze(1).expand(B, Q).unsqueeze(-1)
+        if pred_logits.shape[0] == Q:
+            return pred_logits.unsqueeze(0).expand(B, Q).unsqueeze(-1)
+        # final fallback
+        return pred_logits.unsqueeze(0).unsqueeze(1).expand(B, Q).unsqueeze(-1)
+
+    # if anything else, try to reduce dims
+    while pred_logits.dim() > 3:
+        pred_logits = pred_logits[-1]
+    try:
+        return pred_logits.reshape(B, Q, pred_logits.shape[-1])[:, :Q, :]
+    except Exception:
+        return torch.zeros((B, Q, 1), device=device, dtype=torch.float32)
+
+
 def contrastive_loss_from_pooled(v: torch.Tensor, t: torch.Tensor, temp: float = 0.07):
     """
     Symmetric InfoNCE / contrastive loss between v and t (both shape [B, D]).
@@ -349,18 +422,15 @@ def main(args: argparse.Namespace):
 
                 # Build targets and run official matcher
                 targets = build_batched_targets_from_binary_masks(masks)
+                # ---------- Normalize presence logits robustly ----------
+                B = pred_masks.shape[0]
+                Q = pred_masks.shape[1]
                 pred_logits = out.get("presence_logit", None)
-                if pred_logits is None:
-                    pred_logits = torch.zeros((pred_masks.shape[0], pred_masks.shape[1], 1), device=device)
-                else:
-                    if pred_logits.dim() == 4:
-                        pred_logits = pred_logits[-1]
-                    if pred_logits.dim() == 1:
-                        pred_logits = pred_logits.unsqueeze(-1)
-                    if pred_logits.dim() == 2:
-                        pred_logits = pred_logits.unsqueeze(-1)
-                    if pred_logits.shape[1] != pred_masks.shape[1]:
-                        pred_logits = pred_logits.unsqueeze(1).expand(-1, pred_masks.shape[1], -1)
+                pred_logits = normalize_presence_logits(pred_logits, B, Q, device)
+                # ensure float dtype for BCE and matcher
+                pred_logits = pred_logits.float()
+
+                # reference boxes as before (no change)
                 pred_boxes = out.get("reference_boxes", None)
                 if pred_boxes is None:
                     pred_boxes = torch.zeros((pred_masks.shape[0], pred_masks.shape[1], 4), device=device)
