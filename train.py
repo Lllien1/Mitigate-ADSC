@@ -1014,67 +1014,63 @@ def main(args: argparse.Namespace):
 
                         
                 # -------------------------
-                # IoU 计算（downsample + true_iou），并用 Smooth L1 对 matched queries 做回归监督
-                # loss_iou = torch.tensor(0.0, device=device)
-                # iou_pred = out.get("iou_predictions", None)
-                # if iou_pred is not None:
-                #     if iou_pred.dim() == 3:
-                #         iou_pred = iou_pred[-1]
-                #     # compute true IoU per (B, Q) as you already do
-                #     with torch.no_grad():
-                #         if mask_for_iou.dim() == 3:
-                #             mask_for_iou = mask_for_iou.unsqueeze(1)  # (B, 1 or Q, H, W) handled
-                #         target_size = (256, 256)
-                #         mask_for_iou_down = torch.nn.functional.interpolate(
-                #             mask_for_iou, size=target_size, mode="bilinear", align_corners=False
-                #         )
-                #         gt_masks = masks
-                #         if gt_masks.dim() == 3:
-                #             gt_masks = gt_masks.unsqueeze(1)
-                #         gt_masks_down = torch.nn.functional.interpolate(gt_masks, size=target_size, mode="nearest")
-                #         mask_prob = torch.sigmoid(mask_for_iou_down)
-                #         prob_flat = mask_prob.flatten(2)      # (B, Q, N)
-                #         target_flat = gt_masks_down.flatten(2)  # (B, 1, N)
-                #         intersection = (prob_flat * target_flat).sum(dim=-1)  # (B, Q)
-                #         union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection  # (B, Q)
-                #         true_iou = torch.where(union > 0, intersection / (union + 1e-6), torch.zeros_like(union))
-                #     # handle shape mismatch: if iou_pred has single value per query or shape (B,1)
-                #     if iou_pred.dim() == 3:
-                #         # unexpected extra dim: squeeze last dim if it exists
-                #         iou_pred = iou_pred.squeeze(-1)
-                #     if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
-                #         # expand per-query
-                #         iou_pred = iou_pred.expand(-1, true_iou.shape[1]).contiguous()
-
-                #     # Now compute matched vectors and SmoothL1 over matched pairs
-                #     # matcher returned batch_idx, src_idx, tgt_idx (flat tensors)
-                #     if tgt_idx is not None and tgt_idx.numel() > 0:
-                #         # Ensure batch_idx, src_idx, tgt_idx are tensors on correct device
-                #         # They were created by matcher above; typically on CPU or device - keep consistent
-                #         batch_idx = batch_idx.to(device)
-                #         src_idx = src_idx.to(device)
-                #         tgt_idx = tgt_idx.to(device)
-
-                #         # iou_pred_matched: pick per-pair predicted iou
-                #         # If iou_pred is (B, Q), indexing with (batch_idx, src_idx) yields (num_matches,)
-                #         iou_pred_matched = iou_pred[batch_idx, src_idx]
-                #         true_iou_matched = true_iou[batch_idx, tgt_idx]
-
-                #         # make sure they are floats on correct device
-                #         iou_pred_matched = iou_pred_matched.to(device)
-                #         true_iou_matched = true_iou_matched.to(device)
-
-                #         # Smooth L1 loss (robust to outliers)
-                #         if iou_pred_matched.numel() > 0:
-                #             loss_iou = F.smooth_l1_loss(iou_pred_matched, true_iou_matched, reduction="mean")
-                #         else:
-                #             loss_iou = torch.tensor(0.0, device=device)
-                #     else:
-                #         loss_iou = torch.tensor(0.0, device=device)
-                # else:
-                #     loss_iou = torch.tensor(0.0, device=device)
-
+                # IoU 回归监督（在 downsample 后计算 true IoU，并用 SmoothL1 回归到模型预测的 iou）
                 loss_iou = torch.tensor(0.0, device=device)
+                iou_pred = out.get("iou_predictions", None)  # SAM3 的命名可能不同，确认模型输出名
+                
+                # only compute when there are matched pairs
+                if tgt_idx is not None and tgt_idx.numel() > 0:
+                    # 1) prepare predicted iou tensor into (B, Q)
+                    if iou_pred is not None:
+                        # reuse your robust normalizer: returns (B,Q,1) for many cases
+                        iou_pred = normalize_presence_logits(iou_pred, B, Q, device).squeeze(-1)  # (B, Q)
+                    else:
+                        iou_pred = None
+                
+                    # 2) build pred_matched (M, MD, MD) and gt matched masks downsampled to MD
+                    pred_matched_ds = pred_masks_ds[batch_idx, src_idx]  # (M, MD, MD)
+                
+                    # targets["segments"] is flattened (G, H, W). pick tgt_idx and downsample to MD
+                    tgt_masks_flat = targets["segments"][tgt_idx]  # (M, H, W) or (M, 1, H, W)
+                    # ensure (M, H, W)
+                    if tgt_masks_flat.dim() == 4:
+                        # (M, 1, H, W) -> (M, H, W)
+                        tgt_masks_flat = tgt_masks_flat.squeeze(1)
+                    # Downsample with nearest to preserve binary GT
+                    tm_ds = F.interpolate(tgt_masks_flat.unsqueeze(1).float(), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                          mode="nearest").squeeze(1)  # (M, MD, MD)
+                
+                    # 3) compute true IoU per matched pair (use pred sigmoid probability)
+                    pred_prob = torch.sigmoid(pred_matched_ds)  # (M, MD, MD)
+                    pred_flat = pred_prob.flatten(1)            # (M, N)
+                    tgt_flat = tm_ds.flatten(1)                 # (M, N)
+                    inter = (pred_flat * tgt_flat).sum(dim=1)   # (M,)
+                    sum_p = pred_flat.sum(dim=1)
+                    sum_t = tgt_flat.sum(dim=1)
+                    union = sum_p + sum_t - inter + 1e-6
+                    true_iou = inter / union  # (M,)
+                
+                    # 4) if model provides iou_pred, gather matched preds and compute SmoothL1
+                    if iou_pred is not None:
+                        # iou_pred is (B, Q) -> pick matched entries
+                        iou_pred_matched = iou_pred[batch_idx, src_idx]   # (M,)
+                        # ensure same device/dtype
+                        iou_pred_matched = iou_pred_matched.to(true_iou.device).float()
+                        true_iou = true_iou.to(iou_pred_matched.device).float()
+                        if iou_pred_matched.numel() > 0:
+                            loss_iou = F.smooth_l1_loss(iou_pred_matched, true_iou, reduction="mean")
+                        else:
+                            loss_iou = torch.tensor(0.0, device=device)
+                    else:
+                        # If model does not predict IoU, we could optionally add a margin/reg term,
+                        # but for now we keep loss_iou = 0 (no regression head)
+                        loss_iou = torch.tensor(0.0, device=device)
+                else:
+                    loss_iou = torch.tensor(0.0, device=device)
+                # -------------------------
+
+
+                # loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
                 # Presence BCE loss (requires presence_head=True in model_builder)
                 # pred_logits 已被准备成 (B, Q, 1) 形式 earlier; we squeeze trailing dim.
