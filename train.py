@@ -82,6 +82,41 @@ def build_batched_targets_from_binary_masks(masks: torch.Tensor):
         "num_boxes": torch.tensor(num_boxes, dtype=torch.long, device=masks.device),
     }
 
+def build_list_targets_from_binary_masks(masks: torch.Tensor):
+    """
+    返回 list[dict]，便于直接传给 matcher（每张图一个 dict）。
+    每个 dict 的 keys: "boxes" (N,4), "labels" (N,), "segments" (N,H,W)
+    如果一张图没有目标，返回 boxes = zeros((0,4)), labels=zeros((0,)), segments=zeros((0,H,W))
+    """
+    if masks.dim() == 4:
+        masks = masks.max(dim=1).values
+    elif masks.dim() != 3:
+        raise ValueError(f"Expected masks shape (B,H,W) or (B,C,H,W), got {masks.shape}")
+    B, H, W = masks.shape
+    out = []
+    for b in range(B):
+        m = masks[b].bool()
+        if m.sum() == 0:
+            out.append({
+                "boxes": torch.zeros((0,4), dtype=torch.float32, device=masks.device),
+                "labels": torch.zeros((0,), dtype=torch.long, device=masks.device),
+                "segments": torch.zeros((0, H, W), dtype=torch.float32, device=masks.device),
+            })
+            continue
+        box = mask_to_box(m)  # 已经归一化 cxcywh
+        if box is None:
+            out.append({
+                "boxes": torch.zeros((0,4), dtype=torch.float32, device=masks.device),
+                "labels": torch.zeros((0,), dtype=torch.long, device=masks.device),
+                "segments": torch.zeros((0, H, W), dtype=torch.float32, device=masks.device),
+            })
+            continue
+        out.append({
+            "boxes": box.unsqueeze(0),  # (1,4)
+            "labels": torch.tensor([1], dtype=torch.long, device=masks.device),
+            "segments": m.to(torch.float32).unsqueeze(0),  # (1,H,W)
+        })
+    return out
 
 def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B: int, device, targets_num_boxes=None):
     """
@@ -530,9 +565,51 @@ def main(args: argparse.Namespace):
                 masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
                 masks = (masks > 0.5).float()
 
-                # Build targets and run official matcher
-                targets = build_batched_targets_from_binary_masks(masks)
-                
+                # === Build list-based targets (per-image) ===
+                list_targets = build_list_targets_from_binary_masks(masks)  # returns list of dicts, len=B
+
+                # === Flatten list_targets into a single `targets` dict that downstream code expects ===
+                # This creates a flattened set of GTs across batch so that tgt_idx (flattened indices)
+                # can be used to index into targets["segments"]/["boxes"] as before.
+                B_cur, H, W = masks.shape[0], masks.shape[1], masks.shape[2]
+                boxes_list = []
+                labels_list = []
+                segments_list = []
+                targets_num_boxes = []
+                for t in list_targets:
+                    nb = int(t["boxes"].shape[0])
+                    targets_num_boxes.append(nb)
+                    if nb > 0:
+                        boxes_list.append(t["boxes"])
+                        labels_list.append(t["labels"])
+                        segments_list.append(t["segments"])
+                # If no GT at all, create empty tensors with correct device/shape
+                device = masks.device
+                if len(boxes_list) == 0:
+                    targets_flat = {
+                        "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
+                        "labels": torch.zeros((0,), dtype=torch.long, device=device),
+                        "segments": torch.zeros((0, H, W), dtype=torch.float32, device=device),
+                        "num_boxes": torch.tensor(targets_num_boxes, dtype=torch.long, device=device),
+                    }
+                else:
+                    targets_flat = {
+                        "boxes": torch.cat(boxes_list, dim=0),      # (G,4)
+                        "labels": torch.cat(labels_list, dim=0),    # (G,)
+                        "segments": torch.cat(segments_list, dim=0),# (G,H,W)
+                        "num_boxes": torch.tensor(targets_num_boxes, dtype=torch.long, device=device),
+                    }
+
+                # For debugging, print the per-image summary (safe)
+                print("DBG list_targets summary:")
+                for i,t in enumerate(list_targets):
+                    print(f" image {i}: boxes.shape={t['boxes'].shape}, labels.shape={t['labels'].shape}, segments.shape={t['segments'].shape}")
+                print("DBG targets_num_boxes:", targets_num_boxes)
+
+                # Set 'targets' to the flattened dict for downstream compatibility
+                targets = targets_flat
+
+
                 # ---------- Normalize presence logits robustly ----------
                 B = pred_masks.shape[0]
                 Q = pred_masks.shape[1]
@@ -566,6 +643,18 @@ def main(args: argparse.Namespace):
                 # --- matcher and robust index reconstruction ---
                 matcher_outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
                 batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, targets)
+
+                print("DBG matcher raw shapes: batch_idx", None if batch_idx is None else tuple(batch_idx.shape),
+                      "src_idx", None if src_idx is None else tuple(src_idx.shape),
+                      "tgt_idx", None if tgt_idx is None else tuple(tgt_idx.shape))
+
+
+                # prepare targets_num_boxes: number of GT boxes per image
+                targets_num_boxes = [int(t["boxes"].shape[0]) for t in targets]
+
+                # when calling the convert helper, pass targets_num_boxes:
+                indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device, targets_num_boxes=targets_num_boxes)
+                
 
                 # If matcher returns tgt_idx is None (BinaryHungarianMatcher behavior),
                 # we must still convert the flattened batch_idx/src_idx into per-image matched lists.
@@ -629,12 +718,12 @@ def main(args: argparse.Namespace):
                 
 
                 # ====== DEBUG BLOCK ======
-                if step < 20:  # only print early steps to avoid very verbose logs
-                    print("DBG indices_per_image:")
+                if step < 20:
+                    print("DBG final indices (out['indices']):")
                     for b in range(images.shape[0]):
-                        src_q, tgt_q = indices_per_image[b]
+                        src_q, tgt_q = indices[b]  # indices is alias to out["indices"]
                         print(f"  image {b}: src_q={src_q.cpu().tolist()}, tgt_q={tgt_q.cpu().tolist()}, num_boxes={int(targets['num_boxes'][b].item())}")
-                    
+                
                     # 1) targets summary
                     print("DBG targets num_boxes:", targets["num_boxes"].tolist())
                 
