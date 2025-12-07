@@ -1,5 +1,8 @@
 import argparse
 import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import sys
 from datetime import datetime
 from typing import List
@@ -20,6 +23,26 @@ from torch.cuda.amp import autocast, GradScaler
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
 
+def setup_distributed(args):
+    """
+    初始化分布式（在使用 torch.distributed.run 启动时，环境变量会提供 LOCAL_RANK, RANK, WORLD_SIZE）
+    运行前无需手动传 local_rank，torch.distributed.run 会设置。
+    """
+    args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    args.rank = int(os.environ.get("RANK", 0))
+    args.world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if args.world_size > 1:
+        # 使用 NCCL 后端（推荐）
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        args.distributed = True
+    else:
+        args.distributed = False
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def collate_fn(batch):
     imgs, masks, prompts, anomalies, classes = zip(*batch)
@@ -356,6 +379,9 @@ def build_dataloaders(
     aug_rate: float = 0.0,
     batch_size: int = 2,
     balance: bool = False,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -366,9 +392,11 @@ def build_dataloaders(
         aug_rate=aug_rate,
     )
 
+    # NOTE: if balance True we try to do weighted sampling.
     sampler = None
-    if balance:
-        # compute per-sample weights: anomalies have higher weight
+    shuffle = True
+    if balance and not distributed:
+        # existing weighted sampler (only safe in single-process)
         labels = [int(entry.anomaly) for entry in ds.entries]
         labels = torch.tensor(labels, dtype=torch.long)
         anomaly_count = (labels == 1).sum().item()
@@ -392,8 +420,14 @@ def build_dataloaders(
         )
         shuffle = False
     else:
+        # when distributed, prefer DistributedSampler to avoid duplicates
         sampler = None
         shuffle = True
+
+    # If distributed: use DistributedSampler
+    if distributed:
+        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=shuffle)
+        shuffle = False
 
     dataloader = DataLoader(
         ds,
@@ -402,6 +436,7 @@ def build_dataloaders(
         sampler=sampler,
         num_workers=4,
         collate_fn=collate_fn,
+        pin_memory=True,
     )
     return dataloader
 
@@ -430,7 +465,14 @@ def load_sam3_checkpoint(model: torch.nn.Module, ckpt_path: str):
 
 
 def main(args: argparse.Namespace):
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    setup_distributed(args)
+
+    if args.distributed:
+        device = torch.device("cuda", args.local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 用一个方便的标志判断是否为主进程（rank 0）
+    is_main_process = (not args.distributed) or (dist.get_rank() == 0)
 
     # === 新增：从 args 里读出两个超参数 ===
     MASK_DOWNSAMPLE = int(args.mask_downsample)
@@ -458,6 +500,11 @@ def main(args: argparse.Namespace):
             device=device,
         )
 
+    model.to(device)
+
+    if args.distributed:
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
+
     if args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
         load_sam3_checkpoint(model, args.sam3_ckpt)
 
@@ -470,15 +517,22 @@ def main(args: argparse.Namespace):
         aug_rate=args.aug_rate,
         batch_size=args.batch_size,
         balance=args.balance,
+        distributed=args.distributed,
+        rank=(args.rank if args.distributed else 0),
+        world_size=(args.world_size if args.distributed else 1),
     )
+
 
     run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_dir = os.path.join(args.save_dir, run_name)
     log_dir = os.path.join(args.log_dir, run_name)
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=log_dir)
-    print(f"[INFO] run_name={run_name}, log_dir={log_dir}, save_dir={save_dir}")
+    if is_main_process:
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"[INFO] run_name={run_name}, log_dir={log_dir}, save_dir={save_dir}")
+    else:
+        writer = None
 
     # Freeze everything except LoRA/prompt params
     for n, p in model.named_parameters():
@@ -533,7 +587,12 @@ def main(args: argparse.Namespace):
     model.train()
     best_loss = float("inf")
     for epoch in range(args.epochs):
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        if args.distributed:
+            dataloader.sampler.set_epoch(epoch)
+        if is_main_process:
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        else:
+            pbar = dataloader  # 无进度条，仅迭代
         running_loss = 0.0
         running_steps = 0
         for step, batch in enumerate(pbar):
@@ -1085,12 +1144,18 @@ def main(args: argparse.Namespace):
             )
 
             global_step = epoch * len(dataloader) + step
-            writer.add_scalar("loss/total", loss.item(), global_step)
-            writer.add_scalar("loss/focal", loss_focal.item(), global_step)
-            writer.add_scalar("loss/dice", loss_dice.item(), global_step)
-            writer.add_scalar("loss/iou", loss_iou.item(), global_step)
-            writer.add_scalar("loss/presence", loss_presence.item(), global_step)
-            writer.add_scalar("loss/align", align_loss.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/total", loss.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/focal", loss_focal.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/dice", loss_dice.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/iou", loss_iou.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/presence", loss_presence.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/align", align_loss.item(), global_step)
 
             running_loss += loss.item()
             running_steps += 1
@@ -1100,7 +1165,10 @@ def main(args: argparse.Namespace):
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 ckpt_path = os.path.join(save_dir, "sam3_peft_best.pth")
-                torch.save(model.state_dict(), ckpt_path)
+                if is_main_process:
+                    sd = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+                    torch.save({"epoch": epoch, "state_dict": sd, "optimizer": optimizer.state_dict()}, ckpt_path)
+                    print(f"[INFO] Epoch {epoch+1}: new best avg_loss {avg_loss:.4f}, saved to {ckpt_path}")
                 print(f"[INFO] Epoch {epoch+1}: new best avg_loss {avg_loss:.4f}, saved to {ckpt_path}")
 
     writer.flush()
