@@ -604,22 +604,26 @@ def main(args: argparse.Namespace):
                         "num_boxes": torch.tensor(num_boxes_list, dtype=torch.long, device=device),
                     }
 
-                # DEBUG: print summary
-                print("DBG list_targets summary:")
-                for i,t in enumerate(list_targets):
-                    print(f" image {i}: boxes.shape={t['boxes'].shape}, labels.shape={t['labels'].shape}, segments.shape={t['segments'].shape}")
-                print("DBG targets_num_boxes:", num_boxes_list)
+                    # Use targets_flat for downstream code compatibility
+                    targets = targets_flat
 
-                num_boxes_list = targets['num_boxes'].tolist()  # targets 是你 flatten 后的 dict
-                batch_has_gt = [1 if n>0 else 0 for n in num_boxes_list]
-                print("DBG BATCH SAMPLE SUMMARY: batch_size =", images.shape[0], "num_boxes:", num_boxes_list, "has_gt:", batch_has_gt)
-                
-                # 也打印 mask_sums（更直观）
-                mask_sums = [int(t['segments'].sum().item()) if t['segments'].numel() > 0 else 0 for t in list_targets]
-                print("DBG mask_sums per image:", mask_sums)
+                    # DEBUG: print summary (use list_targets for per-image detail)
+                    print("DBG list_targets summary:")
+                    for i, t in enumerate(list_targets):
+                        print(f" image {i}: boxes.shape={t['boxes'].shape}, labels.shape={t['labels'].shape}, segments.shape={t['segments'].shape}")
 
-                # Use targets_flat for downstream code compatibility
-                targets = targets_flat
+                    # Now we can safely get num_boxes_list from targets (flattened dict)
+                    num_boxes_list = targets['num_boxes'].tolist()
+                    print("DBG targets_num_boxes:", num_boxes_list)
+
+                    # Batch-level summary: whether each image has GT in this batch
+                    batch_has_gt = [1 if n > 0 else 0 for n in num_boxes_list]
+                    print("DBG BATCH SAMPLE SUMMARY: batch_size =", images.shape[0], "num_boxes:", num_boxes_list, "has_gt:", batch_has_gt)
+
+                    # Also print mask_sums (per-image) for additional check
+                    mask_sums = [int(t['segments'].sum().item()) if t['segments'].numel() > 0 else 0 for t in list_targets]
+                    print("DBG mask_sums per image:", mask_sums)
+
 
 
 
