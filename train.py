@@ -503,7 +503,10 @@ def main(args: argparse.Namespace):
     model.to(device)
 
     if args.distributed:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+
+    # 无论是否分布式，model_core 指向实际的 underlying module（方便后续直接访问 prompt_learner 等属性）
+    model_core = model.module if hasattr(model, "module") else model
 
     if args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
         load_sam3_checkpoint(model, args.sam3_ckpt)
@@ -607,22 +610,61 @@ def main(args: argparse.Namespace):
                 if pred_masks is None:
                     raise RuntimeError("Segmentation head did not return pred_masks.")
 
+                # If model returns multi-layer masks, take last layer
                 if pred_masks.dim() == 5:
-                    pred_masks = pred_masks[-1]
-                mask_for_iou = pred_masks
-                if pred_masks.shape[-2:] != masks.shape[-2:]:
-                    pred_masks = torch.nn.functional.interpolate(
-                        pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                    )
-                if mask_for_iou.shape[-2:] != masks.shape[-2:]:
-                    mask_for_iou = torch.nn.functional.interpolate(
-                        mask_for_iou, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                    )
-                pred_masks = pred_masks.clamp(min=-20.0, max=20.0)
-                pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=0.0, neginf=0.0)
-                mask_for_iou = torch.nan_to_num(mask_for_iou, nan=0.0, posinf=0.0, neginf=0.0)
+                    pred_masks = pred_masks[-1]  # (B, Q, H0, W0)
+
+                # --- IMPORTANT: avoid working on full-resolution masks ---
+                # Create a downsampled version for IoU / matched / background loss computations.
+                # This prevents keeping huge (B,Q,H0,W0) tensors in memory.
+                B, Q, H0, W0 = pred_masks.shape
+                MD = int(MASK_DOWNSAMPLE)  # from args earlier
+                # reshape to (B*Q,1,H0,W0) to interpolate, then reshape back to (B,Q,MD,MD)
+                pred_masks_ds = F.interpolate(
+                    pred_masks.reshape(B * Q, 1, H0, W0),
+                    size=(MD, MD), mode="bilinear", align_corners=False
+                ).reshape(B, Q, MD, MD)
+
+                # sanitize the downsampled masks (clamp + nan_to_num) - small memory footprint
+                pred_masks_ds = pred_masks_ds.clamp(min=-20.0, max=20.0)
+                pred_masks_ds = torch.nan_to_num(pred_masks_ds, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # --- Ensure masks has shape (B, H, W) before downsampling ---
+                # Dataset may return masks with channel dim (B, C, H, W) (often C==1).
+                # We convert to (B, H, W) by taking max over channel dim (safe for binary masks).
+                if masks.dim() == 4:
+                    # (B, C, H, W) -> (B, H, W)
+                    masks_for_ds = masks.max(dim=1).values
+                elif masks.dim() == 3:
+                    masks_for_ds = masks
+                else:
+                    # Unexpected rank: try to squeeze singleton dims until rank==3
+                    masks_for_ds = masks
+                    while masks_for_ds.dim() > 3:
+                        masks_for_ds = masks_for_ds.squeeze(1)
+
+                # Now masks_for_ds is guaranteed to be (B, H, W)
+                # Downsample to (MD,MD) with nearest (preserve binary labels)
+                masks_ds = F.interpolate(masks_for_ds.unsqueeze(1).float(), size=(MD, MD), mode="nearest").squeeze(1)
+                masks_ds = torch.nan_to_num(masks_ds, nan=0.0, posinf=0.0, neginf=0.0)
+                masks_ds = (masks_ds > 0.5).float()
+
+                # Replace the original masks variable with the collapsed version if you want
+                # so downstream code that expects (B,H,W) works consistently.
+                masks = masks_for_ds.float()
+
+                # Keep original pred_masks (full-res) untouched if you ever need it for display.
+                # But do NOT perform expensive ops on it; do computations on pred_masks_ds.
+                # mask_for_iou used below: use the downsampled version
+                mask_for_iou = pred_masks_ds  # (B, Q, MD, MD)
+
+                # Note: we DO NOT interpolate pred_masks to GT size here to avoid huge memory usage.
+                # When needed, you can upsample pred_masks_ds for visualization only.
+                
+                # Also sanitize the original masks if you later use them (kept minimal):
                 masks = torch.nan_to_num(masks, nan=0.0, posinf=0.0, neginf=0.0)
                 masks = (masks > 0.5).float()
+
 
                 # === Build list-based targets (per-image) ===
                 # --- 1) 保持按图的 targets（便于 debug）
@@ -837,11 +879,22 @@ def main(args: argparse.Namespace):
                 
                     # prompt prototype and pooled visual feat for align
                     try:
-                        prompt_seq, prompt_mask = model.prompt_learner(prompt_lists, device=device)
-                        prompt_proto = prompt_seq[-1].transpose(0,1)  # (B, D)
+                        prompt_seq, prompt_mask = model_core.prompt_learner(prompt_lists, device=device)
+                        # prompt_seq 可有不同 layout：(S,B,D) 或 (B,D) 等，统一成 (B,D)
+                        prompt_last = prompt_seq[-1]
+                        if prompt_last.dim() == 3:  # (S, B, D)
+                            prompt_proto = prompt_last[-1]  # (B, D)
+                        elif prompt_last.dim() == 2:
+                            if prompt_last.shape[0] == images.shape[0]:
+                                prompt_proto = prompt_last  # (B, D)
+                            else:
+                                prompt_proto = prompt_last.transpose(0, 1) if prompt_last.shape[1] == images.shape[0] else prompt_last.reshape(images.shape[0], -1)
+                        else:
+                            prompt_proto = prompt_last.reshape(images.shape[0], -1)[:, : (prompt_last.numel() // images.shape[0])]
                         print("DBG prompt_proto shape/mean/std:", prompt_proto.shape, float(prompt_proto.mean().item()), float(prompt_proto.std().item()))
                     except Exception as e:
                         print("DBG prompt_learner error:", e)
+                        prompt_proto = None
                 
                     if dec is not None:
                         try:
@@ -852,22 +905,38 @@ def main(args: argparse.Namespace):
                         except Exception as e:
                             print("DBG decoder_hs -> v_pooled error:", e)
                 
-                    # 5) quick matched tensors check (if there are matches)
+                    # 5) quick matched tensors check (if there are matches)  -- use downsampled masks for debug/loss check
                     if tgt_idx is not None and tgt_idx.numel() > 0:
                         try:
-                            pm = pred_masks[batch_idx, src_idx]
-                            tm = targets["segments"][tgt_idx]
-                            print("DBG pred_matched shape:", pm.shape, "tgt_matched shape:", tm.shape)
-                            print("DBG pred_matched mean/std:", float(pm.mean().item()), float(pm.std().item()))
-                            print("DBG tgt_matched mean/std:", float(tm.mean().item()), float(tm.std().item()))
-                            # compute provisional focal/dice for debug (without other normalization)
-                            debug_focal = sam_sigmoid_focal_loss(pm, tm, max(1.0, float(targets["num_boxes"].sum().float())), alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False)
-                            debug_dice = sam_dice_loss(pm, tm, max(1.0, float(targets["num_boxes"].sum().float())), loss_on_multimask=False, reduce=True)
-                            print("DBG provisional focal/dice:", float(debug_focal.item()), float(debug_dice.item()))
+                            # pred_masks_ds 已以 (B, Q, MD, MD) 形式存在（我们在前面构建）
+                            pm_ds = pred_masks_ds[batch_idx, src_idx]         # (M, MD, MD)
+                            # targets["segments"] is (G, H, W) -> downsample to MD
+                            tgt_masks = targets["segments"][tgt_idx]          # (M, H, W)
+                            if tgt_masks.dim() == 3:
+                                tm_ds = F.interpolate(tgt_masks.unsqueeze(1).float(), size=(MD, MD), mode="nearest").squeeze(1)
+                            else:
+                                # unexpected shape: try collapse channel
+                                tmp = tgt_masks
+                                while tmp.dim() > 3:
+                                    tmp = tmp.squeeze(1)
+                                tm_ds = F.interpolate(tmp.unsqueeze(1).float(), size=(MD, MD), mode="nearest").squeeze(1)
+                    
+                            print("DBG pred_matched (downsampled) shape:", pm_ds.shape, "tgt_matched (downsampled) shape:", tm_ds.shape)
+                            print("DBG pred_matched mean/std:", float(pm_ds.mean().item()), float(pm_ds.std().item()))
+                            print("DBG tgt_matched mean/std:", float(tm_ds.mean().item()), float(tm_ds.std().item()))
+                    
+                            # compute provisional focal/dice on downsampled tensors for debug
+                            try:
+                                debug_focal = sam_sigmoid_focal_loss(pm_ds, tm_ds, max(1.0, float(targets["num_boxes"].sum().float())), alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False)
+                                debug_dice = sam_dice_loss(pm_ds, tm_ds, max(1.0, float(targets["num_boxes"].sum().float())), loss_on_multimask=False, reduce=True)
+                                print("DBG provisional focal/dice (downsampled):", float(debug_focal.item()), float(debug_dice.item()))
+                            except Exception as e:
+                                print("DBG provisional loss compute error:", e)
                         except Exception as e:
                             print("DBG matched tensor error:", e)
                     else:
                         print("DBG no matched pairs in this batch")
+
                 # ====== END DEBUG BLOCK ======
 
 
@@ -877,7 +946,7 @@ def main(args: argparse.Namespace):
                     loss_dice = torch.tensor(0.0, device=device)
                 else:
                     tgt_masks = targets["segments"]  # (G, H, W)
-                    pred_matched = pred_masks[batch_idx, src_idx]  # (M, H, W)
+                    pred_matched = pred_masks_ds[batch_idx, src_idx]  # (M, MD, MD)
                     tgt_matched = tgt_masks[tgt_idx]              # (M, H, W)
 
                     # --- downsample matched to MASK_DOWNSAMPLE to save memory ----
@@ -918,13 +987,14 @@ def main(args: argparse.Namespace):
                         perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
                         sampled_unmatched_q = unmatched_q[perm]
 
-                        preds_bg = pred_masks[b, sampled_unmatched_q]  # (k, H, W)
+                        preds_bg_ds = pred_masks_ds[b, sampled_unmatched_q]  # already (k, MD, MD)
+                        
                         # Downsample to save memory
-                        if preds_bg.dim() == 3:
-                            preds_bg_ds = F.interpolate(preds_bg.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                        if preds_bg_ds.dim() == 3:
+                            preds_bg_ds = F.interpolate(preds_bg_ds.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
                                                         mode="bilinear", align_corners=False).squeeze(1)
                         else:
-                            preds_bg_ds = preds_bg
+                            preds_bg_ds = preds_bg_ds
 
                         zeros = torch.zeros_like(preds_bg_ds)
 
@@ -1056,7 +1126,7 @@ def main(args: argparse.Namespace):
                 align_loss = torch.tensor(0.0, device=device)
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
                     # get prompt prototype: call prompt_learner (returns sequence-first often)
-                    prompt_seq, prompt_mask = model.prompt_learner(prompt_lists, device=device)
+                    prompt_seq, prompt_mask = model_core.prompt_learner(prompt_lists, device=device)
                     # prompt_seq[-1] might be shape (B, D) or (D, B) or (S, B, D) depending on implementation
                     prompt_last = prompt_seq[-1]
                 
@@ -1136,12 +1206,12 @@ def main(args: argparse.Namespace):
             scaler.step(optimizer)
             scaler.update()
 
-
-            pbar.set_postfix(
-                loss=loss.item(),
-                focal=loss_focal.item(),
-                dice=loss_dice.item(),
-            )
+            if is_main_process:
+                pbar.set_postfix(
+                    loss=loss.item(),
+                    focal=loss_focal.item(),
+                    dice=loss_dice.item(),
+                )
 
             global_step = epoch * len(dataloader) + step
             if is_main_process and writer is not None:
