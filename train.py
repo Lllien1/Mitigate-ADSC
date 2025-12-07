@@ -642,7 +642,7 @@ def main(args: argparse.Namespace):
 
                 # --- matcher and robust index reconstruction ---
                 matcher_outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
-                batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, targets)
+                batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, list_targets)
 
                 print("DBG matcher raw shapes: batch_idx", None if batch_idx is None else tuple(batch_idx.shape),
                       "src_idx", None if src_idx is None else tuple(src_idx.shape),
@@ -650,7 +650,7 @@ def main(args: argparse.Namespace):
 
 
                 # prepare targets_num_boxes: number of GT boxes per image
-                targets_num_boxes = [int(t["boxes"].shape[0]) for t in targets]
+                targets_num_boxes = [int(t["boxes"].shape[0]) for t in list_targets]
 
                 # when calling the convert helper, pass targets_num_boxes:
                 indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device, targets_num_boxes=targets_num_boxes)
@@ -723,7 +723,7 @@ def main(args: argparse.Namespace):
                     for b in range(images.shape[0]):
                         src_q, tgt_q = indices[b]  # indices is alias to out["indices"]
                         print(f"  image {b}: src_q={src_q.cpu().tolist()}, tgt_q={tgt_q.cpu().tolist()}, num_boxes={int(targets['num_boxes'][b].item())}")
-                
+
                     # 1) targets summary
                     print("DBG targets num_boxes:", targets["num_boxes"].tolist())
                 
