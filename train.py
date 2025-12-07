@@ -566,48 +566,51 @@ def main(args: argparse.Namespace):
                 masks = (masks > 0.5).float()
 
                 # === Build list-based targets (per-image) ===
+                # --- 1) 保持按图的 targets（便于 debug）
                 list_targets = build_list_targets_from_binary_masks(masks)  # returns list of dicts, len=B
 
-                # === Flatten list_targets into a single `targets` dict that downstream code expects ===
-                # This creates a flattened set of GTs across batch so that tgt_idx (flattened indices)
-                # can be used to index into targets["segments"]/["boxes"] as before.
-                B_cur, H, W = masks.shape[0], masks.shape[1], masks.shape[2]
+                # --- 2) 将 list_targets 展平成一个 batched dict（matcher 在本仓库实现里要求此格式）
+                B_cur = len(list_targets)
+                device = masks.device
+                H, W = masks.shape[1], masks.shape[2]
+
                 boxes_list = []
                 labels_list = []
                 segments_list = []
-                targets_num_boxes = []
+                num_boxes_list = []
                 for t in list_targets:
                     nb = int(t["boxes"].shape[0])
-                    targets_num_boxes.append(nb)
+                    num_boxes_list.append(nb)
                     if nb > 0:
                         boxes_list.append(t["boxes"])
                         labels_list.append(t["labels"])
                         segments_list.append(t["segments"])
-                # If no GT at all, create empty tensors with correct device/shape
-                device = masks.device
+
                 if len(boxes_list) == 0:
+                    # no GT in batch
                     targets_flat = {
                         "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
                         "labels": torch.zeros((0,), dtype=torch.long, device=device),
                         "segments": torch.zeros((0, H, W), dtype=torch.float32, device=device),
-                        "num_boxes": torch.tensor(targets_num_boxes, dtype=torch.long, device=device),
+                        "num_boxes": torch.tensor(num_boxes_list, dtype=torch.long, device=device),
                     }
                 else:
                     targets_flat = {
                         "boxes": torch.cat(boxes_list, dim=0),      # (G,4)
                         "labels": torch.cat(labels_list, dim=0),    # (G,)
                         "segments": torch.cat(segments_list, dim=0),# (G,H,W)
-                        "num_boxes": torch.tensor(targets_num_boxes, dtype=torch.long, device=device),
+                        "num_boxes": torch.tensor(num_boxes_list, dtype=torch.long, device=device),
                     }
 
-                # For debugging, print the per-image summary (safe)
+                # DEBUG: print summary
                 print("DBG list_targets summary:")
                 for i,t in enumerate(list_targets):
                     print(f" image {i}: boxes.shape={t['boxes'].shape}, labels.shape={t['labels'].shape}, segments.shape={t['segments'].shape}")
-                print("DBG targets_num_boxes:", targets_num_boxes)
+                print("DBG targets_num_boxes:", num_boxes_list)
 
-                # Set 'targets' to the flattened dict for downstream compatibility
+                # Use targets_flat for downstream code compatibility
                 targets = targets_flat
+
 
 
                 # ---------- Normalize presence logits robustly ----------
@@ -642,7 +645,7 @@ def main(args: argparse.Namespace):
 
                 # --- matcher and robust index reconstruction ---
                 matcher_outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
-                batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, list_targets)
+                batch_idx, src_idx, tgt_idx = matcher(matcher_outputs, targets)
 
                 print("DBG matcher raw shapes: batch_idx", None if batch_idx is None else tuple(batch_idx.shape),
                       "src_idx", None if src_idx is None else tuple(src_idx.shape),
