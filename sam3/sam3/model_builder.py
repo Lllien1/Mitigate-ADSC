@@ -42,9 +42,9 @@ from sam3.model.vl_combiner import SAM3VLBackbone
 from sam3.sam.transformer import RoPEAttention
 
 
-# Setup TensorFloat-32 for Ampere GPUs if available
+# 启用 Ampere GPU 的 TensorFloat-32（论文实现细节：加速大矩阵乘，保持数值稳定）
 def _setup_tf32() -> None:
-    """Enable TensorFloat-32 for Ampere GPUs if available."""
+    """若设备为 Ampere 系列 GPU，则打开 TF32 以加速注意力/MLP 计算。"""
     if torch.cuda.is_available():
         device_props = torch.cuda.get_device_properties(0)
         if device_props.major >= 8:
@@ -56,7 +56,7 @@ _setup_tf32()
 
 
 def _create_position_encoding(precompute_resolution=None):
-    """Create position encoding for visual backbone."""
+    """构建视觉主干用的正弦位置编码（论文中的 2D sine PE，支持预计算 1008 分辨率）。"""
     return PositionEmbeddingSine(
         num_pos_feats=256,
         normalize=True,
@@ -67,7 +67,7 @@ def _create_position_encoding(precompute_resolution=None):
 
 
 def _create_vit_backbone(compile_mode=None):
-    """Create ViT backbone for visual feature extraction."""
+    """构建 ViT 视觉主干（论文表 2：ViT-L/14，336 预训练，1008 推理，含 RoPE/ABS）。"""
     return ViT(
         img_size=1008,
         pretrain_img_size=336,
@@ -93,11 +93,12 @@ def _create_vit_backbone(compile_mode=None):
         return_interm_layers=False,
         bias_patch_embed=False,
         compile_mode=compile_mode,
+        
     )
 
 
 def _create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=False):
-    """Create ViT neck for feature pyramid."""
+    """构建 ViT 特征金字塔颈（论文的 Dual ViTDet Neck，输出 4 个尺度供检测/分割）。"""
     return Sam3DualViTDetNeck(
         position_encoding=position_encoding,
         d_model=256,
@@ -108,12 +109,12 @@ def _create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=
 
 
 def _create_vl_backbone(vit_neck, text_encoder):
-    """Create visual-language backbone."""
+    """构建视觉-文本联合主干（SAM3VLBackbone，融合 ViT 金字塔与文本编码）。"""
     return SAM3VLBackbone(visual=vit_neck, text=text_encoder, scalp=1)
 
 
 def _create_transformer_encoder() -> TransformerEncoderFusion:
-    """Create transformer encoder with its layer."""
+    """构建跨模态 Transformer Encoder（论文“Fusion Encoder”，6 层，自注意+跨注意）。"""
     encoder_layer = TransformerEncoderLayer(
         activation="relu",
         d_model=256,
@@ -151,7 +152,7 @@ def _create_transformer_encoder() -> TransformerEncoderFusion:
 
 
 def _create_transformer_decoder() -> TransformerDecoder:
-    """Create transformer decoder with its layer."""
+    """构建检测/分割查询的 Transformer Decoder（论文“Detection Decoder”，6 层，含 box refine 与 presence token）。"""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
         d_model=256,
@@ -188,7 +189,7 @@ def _create_transformer_decoder() -> TransformerDecoder:
 
 
 def _create_dot_product_scoring():
-    """Create dot product scoring module."""
+    """构建点积打分头（论文“Dot-Product Scoring”，将查询与 prompt MLP 投影后做匹配分数）。"""
     prompt_mlp = MLP(
         input_dim=256,
         hidden_dim=2048,
@@ -202,7 +203,7 @@ def _create_dot_product_scoring():
 
 
 def _create_segmentation_head(compile_mode=None):
-    """Create segmentation head with pixel decoder."""
+    """构建分割头（论文“Universal Segmentation Head”：PixelDecoder 上采样 + prompt cross-attention + IoU head）。"""
     pixel_decoder = PixelDecoder(
         num_upsampling_stages=3,
         interpolation_mode="nearest",
@@ -232,10 +233,10 @@ def _create_segmentation_head(compile_mode=None):
 
 
 def _create_geometry_encoder():
-    """Create geometry encoder with all its components."""
-    # Create position encoding for geometry encoder
+    """构建几何编码器（论文“Sequence Geometry Encoder”：把 boxes/points 编码为查询几何 token）。"""
+    # 位置编码：几何序列的正弦 PE
     geo_pos_enc = _create_position_encoding()
-    # Create CX block for fuser
+    # Fuser 模块：用 CXBlock 做几何特征融合
     cx_block = CXBlock(
         dim=256,
         kernel_size=7,
@@ -243,7 +244,7 @@ def _create_geometry_encoder():
         layer_scale_init_value=1.0e-06,
         use_dwconv=True,
     )
-    # Create geometry encoder layer
+    # 单层编码器：自注意 + 交叉注意（支持点/框位置编码）
     geo_layer = TransformerEncoderLayer(
         activation="relu",
         d_model=256,
@@ -296,7 +297,7 @@ def _create_sam3_model(
     inst_interactive_predictor,
     eval_mode,
 ):
-    """Create the SAM3 image model."""
+    """组装 SAM3 图像模型（论文主干：VL Backbone + Fusion Encoder + Detection Decoder + Segmentation Head）。"""
     common_params = {
         "backbone": backbone,
         "transformer": transformer,
@@ -330,8 +331,8 @@ def _create_sam3_model(
 
 
 def _create_tracker_maskmem_backbone():
-    """Create the SAM3 Tracker memory encoder."""
-    # Position encoding for mask memory backbone
+    """构建跟踪器的 Mask Memory 编码器（论文 Tracking 分支，用于历史 mask 编码）。"""
+    # mask memory 的位置编码
     position_encoding = PositionEmbeddingSine(
         num_pos_feats=64,
         normalize=True,
@@ -340,7 +341,7 @@ def _create_tracker_maskmem_backbone():
         precompute_resolution=1008,
     )
 
-    # Mask processing components
+    # mask 预处理与下采样
     mask_downsampler = SimpleMaskDownSampler(
         kernel_size=3, stride=2, padding=1, interpol_size=[1152, 1152]
     )
@@ -366,8 +367,8 @@ def _create_tracker_maskmem_backbone():
 
 
 def _create_tracker_transformer():
-    """Create the SAM3 Tracker transformer components."""
-    # Self attention
+    """构建跟踪器 Transformer（RoPE 自注意 + RoPE 交叉注意，参考论文视频跟踪模块）。"""
+    # 自注意（对当前特征做 RoPE 注意力）
     self_attention = RoPEAttention(
         embedding_dim=256,
         num_heads=1,
@@ -379,7 +380,7 @@ def _create_tracker_transformer():
         use_rope_real=False,
     )
 
-    # Cross attention
+    # 交叉注意（从 mask memory 取 KV）
     cross_attention = RoPEAttention(
         embedding_dim=256,
         num_heads=1,
@@ -434,13 +435,13 @@ def build_tracker(
     apply_temporal_disambiguation: bool, with_backbone: bool = False, compile_mode=None
 ) -> Sam3TrackerPredictor:
     """
-    Build the SAM3 Tracker module for video tracking.
+    构建 SAM3 跟踪模块（论文 Tracking：Mask Memory 编码 + RoPE Transformer）。
 
     Returns:
-        Sam3TrackerPredictor: Wrapped SAM3 Tracker module
+        Sam3TrackerPredictor: 封装后的跟踪预测器
     """
 
-    # Create model components
+    # 构建各子模块
     maskmem_backbone = _create_tracker_maskmem_backbone()
     transformer = _create_tracker_transformer()
     backbone = None
@@ -486,7 +487,7 @@ def build_tracker(
 
 
 def _create_text_encoder(bpe_path: str) -> VETextEncoder:
-    """Create SAM3 text encoder."""
+    """构建文本编码器（论文使用 ViT-Text Encoder，24 层 Transformer，宽度 1024）。"""
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
     return VETextEncoder(
         tokenizer=tokenizer,
@@ -500,22 +501,22 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 def _create_vision_backbone(
     compile_mode=None, enable_inst_interactivity=True
 ) -> Sam3DualViTDetNeck:
-    """Create SAM3 visual backbone with ViT and neck."""
-    # Position encoding
+    """构建视觉主干（ViT-L/14 + Dual ViTDet Neck，支持实例交互）。"""
+    # 位置编码
     position_encoding = _create_position_encoding(precompute_resolution=1008)
-    # ViT backbone
+    # ViT 主干
     vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
         enable_inst_interactivity=enable_inst_interactivity,
     )
-    # Visual neck
+    # 返回视觉颈部（多尺度特征）
     return vit_neck
 
 
 def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrapper:
-    """Create SAM3 transformer encoder and decoder."""
+    """构建 SAM3 的 Transformer（Fusion Encoder + Detection Decoder，可选 presence token）。"""
     encoder: TransformerEncoderFusion = _create_transformer_encoder()
     decoder: TransformerDecoder = _create_transformer_decoder()
 
@@ -523,7 +524,7 @@ def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrap
 
 
 def _load_checkpoint(model, checkpoint_path):
-    """Load model checkpoint from file."""
+    """从文件加载权重（兼容 detector*/tracker* 前缀，对齐论文开源权重格式）。"""
     with g_pathmgr.open(checkpoint_path, "rb") as f:
         ckpt = torch.load(f, map_location="cpu", weights_only=True)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
@@ -567,19 +568,19 @@ def build_sam3_image_model(
     compile=False,
 ):
     """
-    Build SAM3 image model
+    构建 SAM3 图像模型（论文主任务：分割 + 概念理解）。
 
     Args:
-        bpe_path: Path to the BPE tokenizer vocabulary
-        device: Device to load the model on ('cuda' or 'cpu')
-        eval_mode: Whether to set the model to evaluation mode
-        checkpoint_path: Optional path to model checkpoint
-        enable_segmentation: Whether to enable segmentation head
-        enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        compile_mode: To enable compilation, set to "default"
+        bpe_path: BPE 词表路径
+        device: 设备（cuda/cpu）
+        eval_mode: 是否 eval 模式（影响 dropout/BN）
+        checkpoint_path: 权重路径（默认为 HF 下载的 sam3.pt）
+        enable_segmentation: 是否启用分割头
+        enable_inst_interactivity: 是否启用实例交互（SAM1 任务）
+        compile_mode: 若开启 torch.compile，传入 "default"
 
     Returns:
-        A SAM3 image model
+        SAM3 图像模型实例
     """
     if bpe_path is None:
         bpe_path = os.path.join(
