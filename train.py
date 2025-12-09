@@ -487,6 +487,11 @@ def main(args: argparse.Namespace):
             lora_alpha=args.lora_alpha,
             freeze_vision=args.freeze_vision,
             freeze_text=args.freeze_text,
+            # ----- new: for parallel lora -----
+            # enable_parallel_lora=args.enable_parallel_lora,
+            # parallel_lora_rank=args.parallel_lora_rank,
+            # parallel_lora_alpha=args.parallel_lora_alpha,
+            # ----- new: for parallel lora -----
             device=device,
         )
     else:
@@ -1017,7 +1022,7 @@ def main(args: argparse.Namespace):
                 # IoU 回归监督（在 downsample 后计算 true IoU，并用 SmoothL1 回归到模型预测的 iou）
                 loss_iou = torch.tensor(0.0, device=device)
                 iou_pred = out.get("iou_predictions", None)  # SAM3 的命名可能不同，确认模型输出名
-                
+
                 # only compute when there are matched pairs
                 if tgt_idx is not None and tgt_idx.numel() > 0:
                     # 1) prepare predicted iou tensor into (B, Q)
@@ -1026,10 +1031,10 @@ def main(args: argparse.Namespace):
                         iou_pred = normalize_presence_logits(iou_pred, B, Q, device).squeeze(-1)  # (B, Q)
                     else:
                         iou_pred = None
-                
+
                     # 2) build pred_matched (M, MD, MD) and gt matched masks downsampled to MD
                     pred_matched_ds = pred_masks_ds[batch_idx, src_idx]  # (M, MD, MD)
-                
+
                     # targets["segments"] is flattened (G, H, W). pick tgt_idx and downsample to MD
                     tgt_masks_flat = targets["segments"][tgt_idx]  # (M, H, W) or (M, 1, H, W)
                     # ensure (M, H, W)
@@ -1039,7 +1044,7 @@ def main(args: argparse.Namespace):
                     # Downsample with nearest to preserve binary GT
                     tm_ds = F.interpolate(tgt_masks_flat.unsqueeze(1).float(), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
                                           mode="nearest").squeeze(1)  # (M, MD, MD)
-                
+
                     # 3) compute true IoU per matched pair (use pred sigmoid probability)
                     pred_prob = torch.sigmoid(pred_matched_ds)  # (M, MD, MD)
                     pred_flat = pred_prob.flatten(1)            # (M, N)
@@ -1049,7 +1054,7 @@ def main(args: argparse.Namespace):
                     sum_t = tgt_flat.sum(dim=1)
                     union = sum_p + sum_t - inter + 1e-6
                     true_iou = inter / union  # (M,)
-                
+
                     # 4) if model provides iou_pred, gather matched preds and compute SmoothL1
                     if iou_pred is not None:
                         # iou_pred is (B, Q) -> pick matched entries
@@ -1274,5 +1279,9 @@ if __name__ == "__main__":
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
     parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
+    parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
+    parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
+    parser.add_argument("--parallel_lora_alpha", type=float, default=None, help="Alpha scaling for parallel LoRA")
+
     args = parser.parse_args()
     main(args)

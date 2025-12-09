@@ -134,6 +134,10 @@ class FineTuneSAM3Official(nn.Module):
         lora_alpha: Optional[float] = None,
         freeze_vision: bool = True,
         freeze_text: bool = True,
+        # new params for parallel LoRA injection
+        enable_parallel_lora: bool = False,
+        parallel_lora_rank: int = 16,
+        parallel_lora_alpha: Optional[float] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -162,6 +166,7 @@ class FineTuneSAM3Official(nn.Module):
         self.hidden_dim = self.transformer.d_model
         self.num_feature_levels = full_model.num_feature_levels
 
+        # existing replace-LoRA behavior (keeps as-is)
         if enable_lora:
             apply_lora_to_sam(
                 self.backbone.vision_backbone.trunk,
@@ -170,6 +175,23 @@ class FineTuneSAM3Official(nn.Module):
                 alpha=lora_alpha,
             )
 
+        # NEW: dynamically inject parallel LoRA adapters to Attention modules if requested
+        if enable_parallel_lora:
+            # Import here to avoid circular import at module top
+            from sam3.model.vitdet import Attention
+            from model_components import ParallelLoRA
+
+            # Iterate through modules in the trunk and attach adapter where appropriate
+            for module in self.backbone.vision_backbone.trunk.modules():
+                if isinstance(module, Attention):
+                    # create an adapter matching attention proj dims
+                    in_dim = module.proj.in_features
+                    out_dim = module.proj.out_features
+                    module.out_adapter = ParallelLoRA(in_features=in_dim, out_features=out_dim,
+                                                      rank=parallel_lora_rank, alpha=parallel_lora_alpha)
+                    module.enable_parallel_lora = True
+
+        # freeze vision except LoRA weights (existing)
         if freeze_vision:
             for n, p in self.backbone.vision_backbone.trunk.named_parameters():
                 if "lora" in n:

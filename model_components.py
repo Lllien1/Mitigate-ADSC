@@ -6,6 +6,53 @@ import torch.nn as nn
 
 from sam3.model.text_encoder_ve import VETextEncoder
 
+class ParallelLoRA(nn.Module):
+    """
+    Parallel low-rank adapter (side-branch).
+    Computes update = scaling * ((x @ A.T) @ B.T)
+    and returns update (to be added to main output).
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int = 16, alpha: Optional[float] = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.alpha = float(alpha or rank)
+        self.scaling = self.alpha / float(rank)
+
+        # LoRA params: shapes chosen to match (x @ A^T) -> (N, rank), then @ B^T -> (N, out_features)
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+
+        # Init
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (..., in_features)
+        returns: (..., out_features)
+        """
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])  # (N, in_features)
+        lora_mid = x_flat @ self.lora_A.t()  # (N, rank)
+        update = lora_mid @ self.lora_B.t()  # (N, out_features)
+        update = update.view(*orig_shape[:-1], -1)  # (..., out_features)
+        return update * self.scaling
+
+    def fold_into_linear(self, linear: nn.Linear):
+        """
+        Fold the adapter into a given Linear layer in-place:
+          linear.weight.data += scaling * (B @ A)
+        Preconditions:
+          - linear.weight.shape == (out_features, in_features)
+        """
+        assert linear.weight.shape[0] == self.out_features and linear.weight.shape[1] == self.in_features
+        with torch.no_grad():
+            delta = (self.lora_B @ self.lora_A) * self.scaling  # (out, in)
+            linear.weight.data += delta
+
 
 class LoRALinear(nn.Module):
     """Lightweight LoRA adapter around a Linear layer."""
