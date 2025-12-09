@@ -352,7 +352,9 @@ class Attention(nn.Module):
         rope_theta: float = 10000.0,
         rope_pt_size: Optional[Tuple[int, int]] = None,
         rope_interp: bool = False,
+
     ):
+
         """
         Args:
             dim (int): Number of input channels.
@@ -377,7 +379,7 @@ class Attention(nn.Module):
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
-
+        
         # rel_pos embeddings and rope
         self.use_rel_pos = use_rel_pos
         self.input_size = input_size
@@ -499,20 +501,44 @@ class Attention(nn.Module):
             q = q.reshape(B, self.num_heads, H * W, -1)
             k = k.reshape(B, self.num_heads, H * W, -1)
 
+        # ----------------------------
+        # x = F.scaled_dot_product_attention(q, k, v)
+
+        # if ndim == 4:
+        #     x = (
+        #         x.view(B, self.num_heads, H, W, -1)
+        #         .permute(0, 2, 3, 1, 4)
+        #         .reshape(B, H, W, -1)
+        #     )
+        # else:
+        #     x = x.view(B, self.num_heads, L, -1).permute(0, 2, 1, 3).reshape(B, L, -1)
+
+        # x = self.proj(x)
+
+        # return x
+        # ----------------------------
+
         x = F.scaled_dot_product_attention(q, k, v)
 
         if ndim == 4:
-            x = (
+            attn_out = (
                 x.view(B, self.num_heads, H, W, -1)
                 .permute(0, 2, 3, 1, 4)
                 .reshape(B, H, W, -1)
             )
         else:
-            x = x.view(B, self.num_heads, L, -1).permute(0, 2, 1, 3).reshape(B, L, -1)
+            attn_out = x.view(B, self.num_heads, L, -1).permute(0, 2, 1, 3).reshape(B, L, -1)
 
-        x = self.proj(x)
+        # main projection
+        out = self.proj(attn_out)
 
-        return x
+        # if a parallel adapter was attached dynamically, add its update
+        # (we use getattr to be safe if adapter not present)
+        if getattr(self, "enable_parallel_lora", False) and hasattr(self, "out_adapter"):
+            out = out + self.out_adapter(attn_out)
+
+        return out
+
 
 
 class Block(nn.Module):
@@ -575,6 +601,7 @@ class Block(nn.Module):
             rope_pt_size=rope_pt_size,
             rope_interp=rope_interp,
             cls_token=cls_token,
+
         )
         self.ls1 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -770,6 +797,7 @@ class ViT(nn.Module):
                 cls_token=self.retain_cls_token,
                 dropout=dropout,
                 init_values=init_values,
+
             )
 
             if i not in window_block_indexes:
