@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch

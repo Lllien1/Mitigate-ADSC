@@ -5,7 +5,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import sys
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 # ensure local sam3 package is importable before importing sam3.*
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sam3"))
@@ -387,7 +387,7 @@ def build_dataloaders(
     train_from_test: bool = False,
     specie_split_ratio: float = 0.8,
     specie_split_seed: int = 42,
-    splits_save_dir: str = None,
+    splits_save_dir: Optional[str] = None,
 ):
     ds = MVTecMetaDataset(
         root=root,
