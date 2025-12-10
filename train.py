@@ -1296,6 +1296,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
     parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
     parser.add_argument("--parallel_lora_alpha", type=float, default=None, help="Alpha scaling for parallel LoRA")
+    parser.add_argument("--include_test_defects", action="store_true",help="(legacy) include defects from test split when forming dataset")
     parser.add_argument("--train_from_test", action="store_true",help="When set, build training set from MVTec test split defects only, per-specie split")
     parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
     parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
