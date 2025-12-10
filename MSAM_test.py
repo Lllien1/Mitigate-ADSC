@@ -172,28 +172,6 @@ def run_inference(args):
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    custom_prompt: List[str] = []
-    # Replace the prompt construction block with this:
-    if args.prompt:
-        # user provided single override prompt
-        custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
-        prompt_lists = [custom_prompt for _ in prompt_lists]
-    else:
-        # ALWAYS use MVPROMPTS mapping (case-insensitive), falling back to dataset prompts only if mapping misses
-        new_prompt_lists = []
-        for i, cls_name in enumerate(class_names):
-            cls_key = cls_name.lower().strip()
-            mapped = MVPROMPTS.get(cls_key, None)
-            if mapped:
-                new_prompt_lists.append([w.strip() for w in mapped.split(",") if w.strip()])
-            else:
-                # fallback to dataset prompt or a generic
-                if prompt_lists and prompt_lists[i]:
-                    new_prompt_lists.append(prompt_lists[i])
-                else:
-                    new_prompt_lists.append(["anomaly"])
-        prompt_lists = new_prompt_lists
-
 
     to_pil = transforms.ToPILImage()
     palette = [
@@ -220,21 +198,34 @@ def run_inference(args):
     for images, masks, prompt_lists, class_names in pbar:
         images = images.to(device)
         # if user provided a single custom prompt -> override
-        if custom_prompt:
-            prompt_lists = [custom_prompt for _ in prompt_lists]
-        else:
-            # if dataset gave prompts, keep them; otherwise try MVPROMPTS mapping
-            new_prompt_lists = []
-            for i, cls_name in enumerate(class_names):
-                if prompt_lists and prompt_lists[i]:
-                    new_prompt_lists.append(prompt_lists[i])
-                else:
-                    mapped = MVPROMPTS.get(cls_name.lower(), None)
+        custom_prompt: List[str] = []
+        if args.prompt:
+            custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
+
+        pbar = tqdm(loader, desc="Inference", leave=True)
+        for images, masks, prompt_lists, class_names in pbar:
+            images = images.to(device)
+
+            # 如果用户提供了自定义 prompt，则覆盖；否则**优先使用 MVPROMPTS 映射**
+            if custom_prompt:
+                prompt_lists = [custom_prompt for _ in prompt_lists]
+            else:
+                new_prompt_lists = []
+                for i, cls_name in enumerate(class_names):
+                    # 规范化类名为小写以便在 MVPROMPTS 中查找
+                    cls_key = cls_name.lower().strip()
+                    # 优先使用 MVPROMPTS 映射（方案 A 的行为）
+                    mapped = MVPROMPTS.get(cls_key, None)
                     if mapped:
                         new_prompt_lists.append([w.strip() for w in mapped.split(",") if w.strip()])
                     else:
-                        new_prompt_lists.append(["anomaly"])
-            prompt_lists = new_prompt_lists
+                        # 如果 MVPROMPTS 中没有对应项，则回退到 dataset 提供的 prompt（若存在）
+                        if prompt_lists and prompt_lists[i]:
+                            new_prompt_lists.append(prompt_lists[i])
+                        else:
+                            new_prompt_lists.append(["anomaly"])
+                prompt_lists = new_prompt_lists
+
 
         start = time.time()
         out = model(images, prompt_lists)
