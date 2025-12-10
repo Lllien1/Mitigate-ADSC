@@ -382,6 +382,11 @@ def build_dataloaders(
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
+    # new args:
+    include_test_defects: bool = False,
+    train_from_test: bool = False,
+    specie_split_ratio: float = 0.8,
+    specie_split_seed: int = 42,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -390,6 +395,11 @@ def build_dataloaders(
         k_shot=k_shot,
         obj_name=obj_name,
         aug_rate=aug_rate,
+        include_test_defects=include_test_defects,
+        goods_per_class=None,  # if you only want defects, ensure goods not added
+        train_from_test=train_from_test,
+        specie_split_ratio=specie_split_ratio,
+        specie_split_seed=specie_split_seed,
     )
 
     # NOTE: if balance True we try to do weighted sampling.
@@ -528,6 +538,10 @@ def main(args: argparse.Namespace):
         distributed=args.distributed,
         rank=(args.rank if args.distributed else 0),
         world_size=(args.world_size if args.distributed else 1),
+        include_test_defects=args.include_test_defects,
+        train_from_test=args.train_from_test,
+        specie_split_ratio=args.specie_split_ratio,
+        specie_split_seed=args.specie_split_seed,
     )
 
 
@@ -1282,6 +1296,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
     parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
     parser.add_argument("--parallel_lora_alpha", type=float, default=None, help="Alpha scaling for parallel LoRA")
-
+    parser.add_argument("--train_from_test", action="store_true",help="When set, build training set from MVTec test split defects only, per-specie split")
+    parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
+    parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
     args = parser.parse_args()
     main(args)
