@@ -387,7 +387,7 @@ def build_dataloaders(
     train_from_test: bool = False,
     specie_split_ratio: float = 0.8,
     specie_split_seed: int = 42,
-    splits_save_dir: Optional[str] = None,
+    splits_save_dir: str = None,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -397,12 +397,13 @@ def build_dataloaders(
         obj_name=obj_name,
         aug_rate=aug_rate,
         include_test_defects=include_test_defects,
-        goods_per_class=None,  # if you only want defects, ensure goods not added
+        goods_per_class=None,
         train_from_test=train_from_test,
         specie_split_ratio=specie_split_ratio,
         specie_split_seed=specie_split_seed,
-        splits_save_dir=splits_save_dir,
+        save_dir=splits_save_dir,  # pass the run-specific folder as dataset.save_dir
     )
+
 
     # NOTE: if balance True we try to do weighted sampling.
     sampler = None
@@ -528,6 +529,18 @@ def main(args: argparse.Namespace):
     if args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
         load_sam3_checkpoint(model, args.sam3_ckpt)
 
+    # --- create run_name and save/log dirs early so dataset can save splits into same folder ---
+    run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_dir = os.path.join(args.save_dir, run_name)  # this folder will host ckpt and specie_splits_*.json
+    log_dir = os.path.join(args.log_dir, run_name)
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    if is_main_process:
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"[INFO] run_name={run_name}, log_dir={log_dir}, save_dir={save_dir}")
+    else:
+        writer = None
+
     dataloader = build_dataloaders(
         root=args.data_root,
         meta_path=args.meta_path or os.path.join(args.data_root, "meta.json"),
@@ -544,20 +557,10 @@ def main(args: argparse.Namespace):
         train_from_test=args.train_from_test,
         specie_split_ratio=args.specie_split_ratio,
         specie_split_seed=args.specie_split_seed,
-        splits_save_dir=args.splits_save_dir,
+        splits_save_dir=save_dir,   # pass run-specific save_dir to dataset
     )
 
 
-    run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_dir = os.path.join(args.save_dir, run_name)
-    log_dir = os.path.join(args.log_dir, run_name)
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    if is_main_process:
-        writer = SummaryWriter(log_dir=log_dir)
-        print(f"[INFO] run_name={run_name}, log_dir={log_dir}, save_dir={save_dir}")
-    else:
-        writer = None
 
     # Freeze everything except LoRA/prompt params
     for n, p in model.named_parameters():

@@ -28,7 +28,7 @@ def build_loader(
     train_from_test: bool = False,
     specie_split_ratio: float = 0.8,
     specie_split_seed: int = 42,
-    splits_save_dir: Optional[str] = None,
+    save_dir: Optional[str] = None,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -41,7 +41,7 @@ def build_loader(
         train_from_test=train_from_test,
         specie_split_ratio=specie_split_ratio,
         specie_split_seed=specie_split_seed,
-        splits_save_dir=splits_save_dir,
+        save_dir=save_dir,
     )
 
     def collate_fn(batch):
@@ -121,7 +121,6 @@ def run_inference(args):
         specie_split_ratio=args.specie_split_ratio,
         specie_split_seed=args.specie_split_seed,
         save_dir=args.save_dir,
-        splits_save_dir=args.splits_save_dir
     )
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
