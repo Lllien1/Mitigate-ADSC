@@ -148,11 +148,87 @@ def load_model(args, device):
 
     # load fine-tuned checkpoint if provided
     if args.ckpt and os.path.exists(args.ckpt):
-        model.load_state_dict(torch.load(args.ckpt, map_location=device), strict=False)
+        print(f"[INFO] Loading fine-tuned checkpoint {args.ckpt} ...")
+        ckpt = torch.load(args.ckpt, map_location=device)
+
+        # 常见包装：'state_dict' / 'model' / raw state_dict
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt:
+                state = ckpt["state_dict"]
+                print("[INFO] checkpoint contains 'state_dict' -> using it")
+            elif "model" in ckpt:
+                state = ckpt["model"]
+                print("[INFO] checkpoint contains 'model' -> using it")
+            else:
+                state = ckpt
+                print("[INFO] using top-level checkpoint dict as state")
+        else:
+            state = ckpt
+            print("[INFO] checkpoint is not a dict, using directly")
+
+        # 去掉 'module.' 前缀（DDP 保存时常见）
+        def _strip_module_prefix(sd: dict):
+            new = {}
+            for k, v in sd.items():
+                nk = k
+                if k.startswith("module."):
+                    nk = k[len("module."):]
+                new[nk] = v
+            return new
+
+        if isinstance(state, dict):
+            state = _strip_module_prefix(state)
+        else:
+            print("[WARN] state is not a dict; attempting to load directly")
+
+        # 载入并打印 missing/unexpected
+        try:
+            res = model.load_state_dict(state, strict=False)
+            # PyTorch 返回 NamedTuple 或 dict 风格
+            missing = getattr(res, "missing_keys", None) or res.get("missing_keys", None)
+            unexpected = getattr(res, "unexpected_keys", None) or res.get("unexpected_keys", None)
+        except Exception as e:
+            print("[ERROR] model.load_state_dict failed:", e)
+            # 再试一次在不抛出错误的情况下
+            try:
+                model.load_state_dict(state, strict=False)
+            except Exception:
+                pass
+            missing, unexpected = None, None
+
         print(f"[INFO] Loaded fine-tuned weights from {args.ckpt}")
+        if missing is not None:
+            try:
+                print(f"[INFO] missing keys: {len(missing)}")
+                if len(missing) > 0:
+                    print("  sample missing keys:", missing[:50])
+            except Exception:
+                pass
+        if unexpected is not None:
+            try:
+                print(f"[INFO] unexpected keys: {len(unexpected)}")
+                if len(unexpected) > 0:
+                    print("  sample unexpected keys:", unexpected[:50])
+            except Exception:
+                pass
+
+        # 额外检查：prompt_learner / LoRA 状态
+        try:
+            if hasattr(model, "prompt_learner"):
+                ctx = getattr(model.prompt_learner, "ctx", None)
+                if ctx is not None:
+                    print("[INFO] prompt_learner.ctx found, shape:", tuple(ctx.shape), "norm:", float(ctx.detach().cpu().norm()))
+                else:
+                    print("[WARN] model.prompt_learner exists but ctx is None")
+        except Exception as e:
+            print("[WARN] Could not inspect prompt_learner:", e)
+
+        lora_like = [n for n, _ in model.named_parameters() if "lora" in n.lower() or "out_adapter" in n.lower()]
+        print(f"[INFO] model has {len(lora_like)} param names containing 'lora'/'out_adapter' (sample):", lora_like[:50])
 
     model.eval()
     return model.to(device)
+
 
 # ---------- main inference loop ----------
 @torch.no_grad()
@@ -171,6 +247,7 @@ def run_inference(args):
     )
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
+    sample_idx = 0
 
 
     to_pil = transforms.ToPILImage()
@@ -354,10 +431,32 @@ def run_inference(args):
                     font=font,
                 )
 
-            filename = f"{cls_name}_{prompt_text}_{idx}.png"
+            # ----------------- 方案 B：从 loader.dataset.entries 获取原始 img_path 并构造文件名 -----------------
+            try:
+                entry = loader.dataset.entries[sample_idx + b]
+                raw_img_path = entry.img_path  # e.g. "bottle/test/broken_large/008.png"
+            except Exception:
+                # 如果索引越界或出错，退回到备用命名，避免程序崩溃
+                raw_img_path = os.path.basename(f"{cls_name}_{idx}.png")
+
+            # 规范化路径分隔符并拆分
+            norm_path = raw_img_path.replace("\\", "/")
+            parts = norm_path.split("/")
+            if len(parts) >= 2:
+                # 假设倒数第二项是 defect 文件夹名（例如 broken_large），倒数第一项是图片名
+                defect = parts[-2]
+                base_name = os.path.splitext(parts[-1])[0]  # 去掉后缀
+                filename = f"{cls_name}_{defect}_{base_name}.png"
+            else:
+                # 兜底：若路径格式不符合预期则使用 basename
+                filename = os.path.basename(norm_path)
+
             overlay_path = os.path.join(sample_dir, filename)
             overlay_pil.save(overlay_path)
             idx += 1
+
+        # 处理完当前 batch 后，推进 sample_idx（下一个 batch 将从这里继续）
+        sample_idx += images.size(0)
 
         # progress bar update
         speed = total_imgs / total_time if total_time > 0 else 0.0
