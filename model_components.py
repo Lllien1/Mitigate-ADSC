@@ -109,7 +109,9 @@ def apply_lora_to_sam(
 
 
 class AveragedPromptLearner(nn.Module):
-    """Encode short-word lists with SAM3's text encoder, mean-pool, and prepend learnable ctx."""
+    """Encode short-word lists with SAM3's text encoder, mean-pool, and prepend learnable ctx.
+    Extended: compute a learned per-keyword weight (small MLP) before averaging.
+    """
 
     def __init__(
         self,
@@ -121,10 +123,19 @@ class AveragedPromptLearner(nn.Module):
         super().__init__()
         self.text_encoder = text_encoder
         self.context_length = getattr(text_encoder, "context_length", 32)
-        self.width = text_encoder.encoder.width
+        self.width = text_encoder.encoder.width  # note: follow your text encoder attribute
         self.n_ctx = n_ctx
         self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
         self.proj = proj if proj is not None else text_encoder.resizer
+
+        # small MLP that computes a scalar logit per keyword embedding,
+        # used to produce a softmax weight over keywords
+        hidden = max(16, self.width // 8)
+        self.kweight_mlp = nn.Sequential(
+            nn.Linear(self.width, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
 
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
@@ -138,7 +149,6 @@ class AveragedPromptLearner(nn.Module):
             keywords, context_length=self.context_length
         ).to(device)
         _, tokens = self.text_encoder.encoder(tokenized)  # [b, seq, width]
-        # take EOT (argmax token id) for each word
         eot_indices = tokenized.argmax(dim=-1)
         word_embeds = tokens[torch.arange(len(keywords), device=device), eot_indices]
         return word_embeds  # [n_words, width]
@@ -148,21 +158,30 @@ class AveragedPromptLearner(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = device or self.ctx.device
         batch_features: List[torch.Tensor] = []
+        batch_masks: List[torch.Tensor] = []
         for words in prompt_lists:
-            with torch.no_grad():
-                word_embeds = self._encode_keywords(words, device)  # (n_words, width)
-                prototype = word_embeds.mean(dim=0, keepdim=True)  # (1, width)
+            # encode keywords using text encoder (no grad for text encoder)
+            word_embeds = self._encode_keywords(words, device)  # (n_words, width)
+            # compute scalar logits for each keyword via MLP (requires grad on MLP)
+            if word_embeds.shape[0] == 0:
+                # fallback: zero prototype
+                prototype = torch.zeros((1, self.width), device=device)
+            else:
+                # NOTE: word_embeds is computed under no_grad (text encoder frozen),
+                # kweight_mlp still learns to assign weights to these fixed embeddings.
+                logits = self.kweight_mlp(word_embeds)  # (n_words, 1)
+                weights = torch.softmax(logits.squeeze(-1), dim=0)  # (n_words,)
+                prototype = (weights.unsqueeze(-1) * word_embeds).sum(dim=0, keepdim=True)  # (1,width)
+
             ctx = self.ctx.unsqueeze(0).to(device)  # (1, n_ctx, width)
-            prototype = prototype.unsqueeze(0)  # (1, 1, width)
+            prototype = prototype.unsqueeze(0)  # (1,1,width)
             stacked = torch.cat([ctx, prototype], dim=1)  # (1, n_ctx+1, width)
             batch_features.append(stacked)
 
-        prompt_batch = torch.cat(batch_features, dim=0)  # (B, seq, width)
+        prompt_batch = torch.cat(batch_features, dim=0)  # (B, n_ctx+1, width)
         projected = self.proj(prompt_batch) if self.proj is not None else prompt_batch
         prompt_mask = torch.zeros(
-            (projected.shape[0], projected.shape[1]),
-            dtype=torch.bool,
-            device=projected.device,
+            (projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device
         )  # False = visible
         # return seq-first for transformer encoder
         return projected.transpose(0, 1), prompt_mask
