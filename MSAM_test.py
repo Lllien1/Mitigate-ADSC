@@ -374,6 +374,7 @@ def run_inference(args):
             per_class_counts[cls_name] += 1
 
         # visualization / save frames (same as original)
+        # visualization / save frames (rank by confidence, keep top-k, display prompt scores)
         for b in range(pred_masks.shape[0]):
             cls_name = class_names[b]
             prompts_b = prompt_lists[b] if prompt_lists else []
@@ -383,28 +384,78 @@ def run_inference(args):
             os.makedirs(sample_dir, exist_ok=True)
 
             img_pil = to_pil(images[b].cpu())
-            mask_np = pred_masks[b].squeeze().cpu().numpy()
+            mask_np = pred_masks[b].squeeze().cpu().numpy()  # probabilities (0..1)
+
+            # Build per-prompt masks and scores
             if mask_np.ndim == 2:
-                masks_stack = (mask_np > 0.5)[None, ...]
-                prompts_for_color = prompts_b if prompts_b else ["prompt"]
+                # single channel -> treat as one candidate
+                masks_list = [mask_np]
+                prompts_list = prompts_b if prompts_b else ["prompt"]
+                scores = [float(mask_np.mean())]
             else:
-                masks_stack = (mask_np > 0.5)
-                prompts_for_color = prompts_b if prompts_b else [f"c{i}" for i in range(mask_np.shape[0])]
+                # multi-channel: channel dim = number of candidates
+                C = mask_np.shape[0]
+                masks_list = [mask_np[i] for i in range(C)]
+                # if prompts_b provided and length matches channel count, use it; otherwise fallback
+                if prompts_b and len(prompts_b) == C:
+                    prompts_list = prompts_b
+                else:
+                    prompts_list = prompts_b if prompts_b else [f"c{i}" for i in range(C)]
+                scores = [float(m.mean()) for m in masks_list]
+
+            # Filter out candidates below confidence threshold
+            conf_thresh = getattr(args, "conf_thresh", 0.3)
+            candidates = []
+            for i, (s, m, p) in enumerate(zip(scores, masks_list, prompts_list)):
+                if s >= conf_thresh:
+                    candidates.append((s, m, p))
+
+            # If no candidates -> save original image as fallback (same behavior as original)
+            if not candidates:
+                filename = None
+                try:
+                    entry = loader.dataset.entries[sample_idx + b]
+                    raw_img_path = entry.img_path
+                except Exception:
+                    raw_img_path = os.path.basename(f"{cls_name}_{idx}.png")
+                norm_path = raw_img_path.replace("\\", "/")
+                parts = norm_path.split("/")
+                if len(parts) >= 2:
+                    defect = parts[-2]
+                    base_name = os.path.splitext(parts[-1])[0]
+                    filename = f"{defect}_{base_name}.png"
+                else:
+                    filename = os.path.basename(norm_path)
+                out_path = os.path.join(sample_dir, filename)
+                img_pil.save(out_path)
+                idx += 1
+                continue
+
+            # Sort by confidence and keep top-k
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            top_k = getattr(args, "top_k", 5)
+            candidates = candidates[:top_k]
+
+            # Build masks_stack and prompt/color lists from selected candidates
+            masks_stack = np.stack([(c[1] > 0.5) for c in candidates])  # (K,H,W)
+            prompts_for_color = [c[2] for c in candidates]
+            scores_for_prompt = [c[0] for c in candidates]
 
             colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
             frame = np.array(img_pil.convert("RGB"), dtype=np.uint8)
             frame = draw_masks_to_frame(frame, masks_stack.astype(bool), colors)
             overlay_pil = Image.fromarray(frame)
 
-            # legend bottom-left with prompt text
+            # legend bottom-left with prompt text + confidence
             draw = ImageDraw.Draw(overlay_pil)
             row_h = 12
             box_w = 10
             pad = 4
             legend_items = []
             max_w = 0
-            for p in prompts_for_color:
-                text = p
+            # show prompt + score e.g. "crack (0.87)"
+            for p, s in zip(prompts_for_color, scores_for_prompt):
+                text = f"{p} ({s:.2f})"
                 bbox = font.getbbox(text)
                 w = bbox[2] - bbox[0]
                 max_w = max(max_w, w)
@@ -431,24 +482,20 @@ def run_inference(args):
                     font=font,
                 )
 
-            # ----------------- 方案 B：从 loader.dataset.entries 获取原始 img_path 并构造文件名 -----------------
+            # 保存文件名（保持方案 B 的命名规则）
             try:
                 entry = loader.dataset.entries[sample_idx + b]
                 raw_img_path = entry.img_path  # e.g. "bottle/test/broken_large/008.png"
             except Exception:
-                # 如果索引越界或出错，退回到备用命名，避免程序崩溃
                 raw_img_path = os.path.basename(f"{cls_name}_{idx}.png")
 
-            # 规范化路径分隔符并拆分
             norm_path = raw_img_path.replace("\\", "/")
             parts = norm_path.split("/")
             if len(parts) >= 2:
-                # 假设倒数第二项是 defect 文件夹名（例如 broken_large），倒数第一项是图片名
                 defect = parts[-2]
                 base_name = os.path.splitext(parts[-1])[0]  # 去掉后缀
-                filename = f"{cls_name}_{defect}_{base_name}.png"
+                filename = f"{defect}_{base_name}.png"
             else:
-                # 兜底：若路径格式不符合预期则使用 basename
                 filename = os.path.basename(norm_path)
 
             overlay_path = os.path.join(sample_dir, filename)
@@ -512,6 +559,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable_parallel_lora", action="store_true")
     parser.add_argument("--parallel_lora_rank", type=int, default=16)
     parser.add_argument("--parallel_lora_alpha", type=float, default=None)
+
+    parser.add_argument("--conf_thresh", type=float, default=0.3, help="Confidence threshold below which masks are ignored")
+    parser.add_argument("--top_k", type=int, default=5, help="Keep top-K masks per image by confidence")
+
 
     args = parser.parse_args()
     run_inference(args)
