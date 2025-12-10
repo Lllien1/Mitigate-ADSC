@@ -387,6 +387,7 @@ def build_dataloaders(
     train_from_test: bool = False,
     specie_split_ratio: float = 0.8,
     specie_split_seed: int = 42,
+    splits_save_dir: Optional[str] = None,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -400,6 +401,7 @@ def build_dataloaders(
         train_from_test=train_from_test,
         specie_split_ratio=specie_split_ratio,
         specie_split_seed=specie_split_seed,
+        splits_save_dir=splits_save_dir,
     )
 
     # NOTE: if balance True we try to do weighted sampling.
@@ -542,6 +544,7 @@ def main(args: argparse.Namespace):
         train_from_test=args.train_from_test,
         specie_split_ratio=args.specie_split_ratio,
         specie_split_seed=args.specie_split_seed,
+        splits_save_dir=args.splits_save_dir,
     )
 
 
@@ -1300,5 +1303,6 @@ if __name__ == "__main__":
     parser.add_argument("--train_from_test", action="store_true",help="When set, build training set from MVTec test split defects only, per-specie split")
     parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
     parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
+    parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
     args = parser.parse_args()
     main(args)
