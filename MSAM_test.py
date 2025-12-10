@@ -280,39 +280,43 @@ def run_inference(args):
             custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
 
         pbar = tqdm(loader, desc="Inference", leave=True)
+        sample_idx = 0  # track index into loader.dataset.entries for filename mapping
+    
         for images, masks, prompt_lists, class_names in pbar:
             images = images.to(device)
-
-            # 如果用户提供了自定义 prompt，则覆盖；否则**优先使用 MVPROMPTS 映射**
+            # if user provided a single custom prompt -> override
+            custom_prompt: List[str] = []
+            if args.prompt:
+                custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
+    
+            # 如果用户提供了自定义 prompt，则覆盖；否则优先使用 MVPROMPTS 映射
             if custom_prompt:
                 prompt_lists = [custom_prompt for _ in prompt_lists]
             else:
                 new_prompt_lists = []
                 for i, cls_name in enumerate(class_names):
-                    # 规范化类名为小写以便在 MVPROMPTS 中查找
                     cls_key = cls_name.lower().strip()
-                    # 优先使用 MVPROMPTS 映射（方案 A 的行为）
                     mapped = MVPROMPTS.get(cls_key, None)
                     if mapped:
                         new_prompt_lists.append([w.strip() for w in mapped.split(",") if w.strip()])
                     else:
-                        # 如果 MVPROMPTS 中没有对应项，则回退到 dataset 提供的 prompt（若存在）
                         if prompt_lists and prompt_lists[i]:
                             new_prompt_lists.append(prompt_lists[i])
                         else:
                             new_prompt_lists.append(["anomaly"])
                 prompt_lists = new_prompt_lists
-
-
-        start = time.time()
-        out = model(images, prompt_lists)
-        infer_time = time.time() - start
-        total_time += infer_time
-        total_imgs += images.size(0)
-
-        pred_masks = out.get("pred_masks", None)
-        if pred_masks is None:
-            continue
+    
+            start = time.time()
+            out = model(images, prompt_lists)
+            infer_time = time.time() - start
+            total_time += infer_time
+            total_imgs += images.size(0)
+    
+            pred_masks = out.get("pred_masks", None)
+            if pred_masks is None:
+                # advance sample_idx still to keep alignment (to be safe)
+                sample_idx += images.size(0)
+                continue
         # reduce possible aux dimensions
         if pred_masks.dim() == 5:
             pred_masks = pred_masks[-1]
