@@ -230,7 +230,8 @@ class AveragedPromptLearner(nn.Module):
                 scores = scores / (self.token_attn_scale if self.token_attn_scale is not None else math.sqrt(self.width))
 
                 # mask positions beyond EOT
-                scores = scores.masked_fill(~token_mask, float("-1e9"))  # masked positions get -inf
+                min_val = torch.tensor(torch.finfo(scores.dtype).min, device=scores.device, dtype=scores.dtype)
+                scores = scores.masked_fill(~token_mask, min_val)
                 # softmax over seq_len
                 token_weights = torch.softmax(scores, dim=1)  # (n_words, seq_len)
                 # compute keyword embedding as weighted sum of token embeddings
