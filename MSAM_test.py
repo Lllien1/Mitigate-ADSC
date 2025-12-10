@@ -120,7 +120,7 @@ def run_inference(args):
         train_from_test=args.train_from_test,
         specie_split_ratio=args.specie_split_ratio,
         specie_split_seed=args.specie_split_seed,
-        save_dir=args.save_dir,
+        save_dir=args.splits_save_dir,
     )
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
