@@ -58,7 +58,7 @@ class MVTecMetaDataset(Dataset):
         mode: str = "test",
         k_shot: int = 0,
         obj_name: Optional[str] = None,
-        include_test_defects: bool = True, 
+        include_test_defects: bool = True,
         goods_per_class: Optional[int] = 10,
         aug_rate: float = 0.0,
         prompt_dict: Optional[Dict[str, List[str]]] = None,
@@ -70,6 +70,16 @@ class MVTecMetaDataset(Dataset):
         specie_split_ratio: float = 0.8,         # train ratio per specie (e.g. 0.8 => 80% train, 20% test)
         specie_split_seed: int = 42,             # deterministic seed for per-specie split
     ) -> None:
+        """
+        Dataset constructor.
+    
+        If train_from_test=True, we will build per-specie splits from meta_info['test'][cls]
+        and (if save_dir provided) save them to JSON for reproducibility; test-time will
+        prefer loading those JSON files if present to guarantee consistency.
+    
+        If train_from_test=False, behavior falls back to original k_shot logic (with
+        include_test_defects fallback).
+        """
         super().__init__()
         self.root = root
         self.aug_rate = aug_rate
@@ -77,16 +87,17 @@ class MVTecMetaDataset(Dataset):
         img_tf, mask_tf = _default_transforms()
         self.image_transform = image_transform or img_tf
         self.mask_transform = mask_transform or mask_tf
-
-        # persist new flags for use in selection logic:
+    
+        # Persist new flags
         self.train_from_test = train_from_test
         self.specie_split_ratio = specie_split_ratio
         self.specie_split_seed = specie_split_seed
-
+        self.save_dir = save_dir
+    
         meta_file = meta_path or os.path.join(root, "meta.json")
         with open(meta_file, "r", encoding="utf-8") as f:
             meta_info = json.load(f)
-
+    
         if mode == "train_all":
             split_meta = meta_info["train"]
             cls_names = list(split_meta.keys())
@@ -96,139 +107,89 @@ class MVTecMetaDataset(Dataset):
         else:
             split_meta = meta_info[mode]
             cls_names = list(split_meta.keys())
-
+    
         self.entries: List[SampleEntry] = []
+    
         for cls in cls_names:
             data_list = split_meta[cls]
-            # === REPLACE k-shot SECTION in MVTecMetaDataset.__init__ ===
-            # 新增参数说明（在 __init__ signature）： include_test_defects: bool = False, goods_per_class: int = 50
-            # (如果还没有，请在函数定义处添加对应默认参数)
-            #
-            # 替换原有 k_shot 处理逻辑为 defect-first + goods 补齐（优先取 test 中缺陷，并在无 good 时从 train 找 good）
-            
-            if getattr(self, "train_from_test", False):
-                test_meta_for_cls = meta_info.get("test", {}).get(cls, [])
-                # group only defects by specie_name
-                specie_map = {}
-                for d in test_meta_for_cls:
-                    if int(d.get("anomaly", 0)) != 1:
-                        continue
-                    specie = d.get("specie_name", d.get("cls_name", cls))
-                    specie_map.setdefault(specie, []).append(d)
-
-                rng = random.Random(getattr(self, "specie_split_seed", 42))
-                class_train, class_test = [], []
-
-                for specie, items in specie_map.items():
-                    rng.shuffle(items)
-                    n = len(items)
-                    if n == 0:
-                        continue
-                    # determine train count: round(n * ratio), ensure at least 1 train if n>0 and at least 1 test if n>1
-                    if n == 1:
-                        n_train = 1
-                    else:
-                        n_train = int(max(1, round(n * getattr(self, "specie_split_ratio", 0.8))))
-                        if n_train >= n:
-                            n_train = n - 1
-                    train_items = items[:n_train]
-                    test_items = items[n_train:]
-                    class_train.extend(train_items)
-                    class_test.extend(test_items)
-
-                if mode == "train":
-                    chosen = class_train.copy()
-                else:
-                    chosen = class_test.copy()
-
-                # save splits for reproducibility
-                if save_dir is not None:
-                    os.makedirs(save_dir, exist_ok=True)
-                    out_map_path = os.path.join(save_dir, f"specie_splits_{cls}.json")
-                    json_map = {"train": [], "test": []}
-                    for d in class_train:
-                        json_map["train"].append({"img_path": d["img_path"], "mask_path": d.get("mask_path", "")})
-                    for d in class_test:
-                        json_map["test"].append({"img_path": d["img_path"], "mask_path": d.get("mask_path", "")})
-                    try:
-                        with open(out_map_path, "w", encoding="utf-8") as f:
-                            json.dump(json_map, f, indent=2)
-                    except Exception:
-                        pass
-
-            elif mode in ("train", "train_all", "test") and k_shot > 0:
-                # === REPLACEMENT: use test-split defects only, per-specie 80/20 split ===
-                # 新增 __init__ 参数（请保证函数签名包含这些参数）:
-                #    train_from_test: bool = False,
-                #    specie_split_ratio: float = 0.8,
-                #    specie_split_seed: int = 42,
-                #
-                # 语义：
-                #  - 当 train_from_test=True 且 mode == "train" 时:
-                #       -> 使用 meta_info['test'][cls] 中的缺陷样本（anomaly==1），
-                #       -> 按 specie_name 分组，对每个组按 specie_split_ratio 随机切分为 train / test，
-                #       -> 将 train 子集加入 self.entries
-                #  - 当 train_from_test=True 且 mode == "test" 时:
-                #       -> 使用上面分割的 test 子集作为测试集合（同一 split seed 保证对应）
-                #
-                # 如果 train_from_test=False，保留原来的 k_shot/goods 逻辑（兼容旧行为）。
-
-                # read new flags from local variables (ensure __init__ signature contains them)
-                # train_from_test: use test split defects to build train/test per-specie
-                train_from_test = getattr(self, "train_from_test", False)
-                specie_split_ratio = getattr(self, "specie_split_ratio", 0.8)
-                specie_split_seed = getattr(self, "specie_split_seed", 42)
-
-                if train_from_test:
-                    # Build per-class per-specie splits from meta_info['test'][cls]
-                    chosen = []
-                    # get test list for this class (may be empty)
+    
+            # ==== Case 1: train_from_test mode (preferred) ====
+            if self.train_from_test:
+                chosen: List[Dict] = []
+    
+                # Try to load previously saved split file for reproducibility if provided
+                if self.save_dir is not None:
+                    split_file = os.path.join(self.save_dir, f"specie_splits_{cls}.json")
+                    if os.path.exists(split_file):
+                        try:
+                            with open(split_file, "r", encoding="utf-8") as f:
+                                js = json.load(f)
+                            sel_list = js.get("train", []) if mode == "train" else js.get("test", [])
+                            # Build lookup from available meta (test+train) to recover full dicts
+                            pool = []
+                            if "test" in meta_info and cls in meta_info["test"]:
+                                pool.extend(meta_info["test"][cls])
+                            if "train" in meta_info and cls in meta_info["train"]:
+                                pool.extend(meta_info["train"][cls])
+                            lookup = {}
+                            for d in pool:
+                                key = (d.get("img_path"), d.get("mask_path", ""))
+                                lookup[key] = d
+                            loaded = []
+                            for item in sel_list:
+                                key = (item.get("img_path"), item.get("mask_path", ""))
+                                if key in lookup:
+                                    loaded.append(lookup[key])
+                            if len(loaded) > 0:
+                                chosen = loaded
+                        except Exception:
+                            # if any error, fall back to deterministic split below
+                            chosen = []
+    
+                # If not loaded from file, do deterministic per-specie split from test meta
+                if not chosen:
                     test_meta_for_cls = meta_info.get("test", {}).get(cls, [])
-                    # filter only defect entries (anomaly==1) and group by specie_name
+                    # group only defects by specie_name and require mask_path existence
                     specie_map = {}
                     for d in test_meta_for_cls:
                         if int(d.get("anomaly", 0)) != 1:
                             continue
+                        maskp = d.get("mask_path")
+                        if not maskp:
+                            continue
+                        full_maskp = os.path.join(self.root, maskp)
+                        if not os.path.exists(full_maskp):
+                            # skip entries missing mask file
+                            continue
                         specie = d.get("specie_name", d.get("cls_name", cls))
                         specie_map.setdefault(specie, []).append(d)
-
-                    # deterministic RNG
-                    rng = random.Random(specie_split_seed)
-
-                    # we'll accumulate chosen train/test lists for this class
-                    class_train = []
-                    class_test = []
-
+    
+                    rng = random.Random(self.specie_split_seed)
+                    class_train: List[Dict] = []
+                    class_test: List[Dict] = []
+    
                     for specie, items in specie_map.items():
-                        # shuffle deterministically
                         rng.shuffle(items)
                         n = len(items)
                         if n == 0:
                             continue
-                        # number of train samples (at least 1 when n>0)
                         if n == 1:
                             n_train = 1
                         else:
-                            n_train = int(max(1, round(n * specie_split_ratio)))
-                            # ensure at least one left for test if n>1 and ratio yields all
+                            n_train = int(max(1, round(n * self.specie_split_ratio)))
                             if n_train >= n:
                                 n_train = n - 1
                         train_items = items[:n_train]
                         test_items = items[n_train:]
                         class_train.extend(train_items)
                         class_test.extend(test_items)
-
-                    if mode == "train":
-                        chosen = class_train.copy()
-                    else:
-                        # mode == "test" -> use the test portion
-                        chosen = class_test.copy()
-
-                    # if save_dir is provided, write out the per-class per-specie split mapping (for reproducibility)
-                    if save_dir is not None:
-                        os.makedirs(save_dir, exist_ok=True)
-                        out_map_path = os.path.join(save_dir, f"specie_splits_{cls}.json")
-                        # prepare serializable dict
+    
+                    chosen = class_train.copy() if mode == "train" else class_test.copy()
+    
+                    # save splits for reproducibility
+                    if self.save_dir is not None:
+                        os.makedirs(self.save_dir, exist_ok=True)
+                        out_map_path = os.path.join(self.save_dir, f"specie_splits_{cls}.json")
                         json_map = {"train": [], "test": []}
                         for d in class_train:
                             json_map["train"].append({"img_path": d["img_path"], "mask_path": d.get("mask_path", "")})
@@ -239,87 +200,96 @@ class MVTecMetaDataset(Dataset):
                                 json.dump(json_map, f, indent=2)
                         except Exception:
                             pass
-
-                else:
-                    # fallback to original k_shot handling if not using test-derived defects
-                    if mode in ("train", "train_all", "test") and k_shot > 0:
-                        train_defects = [d for d in data_list if int(d.get("anomaly", 0)) == 1 and d.get("mask_path")]
-                        train_goods = [d for d in data_list if int(d.get("anomaly", 0)) == 0]
-
-                        test_defects = []
-                        test_goods = []
-                        if include_test_defects:
-                            try:
-                                test_meta = meta_info.get("test", {})
-                                cls_test_list = test_meta.get(cls, [])
-                            except Exception:
-                                cls_test_list = []
-                            for d in cls_test_list:
-                                if int(d.get("anomaly", 0)) == 1 and d.get("mask_path"):
-                                    test_defects.append(d)
-                                elif int(d.get("anomaly", 0)) == 0:
-                                    test_goods.append(d)
-
-                        chosen_defects = test_defects.copy() if include_test_defects and len(test_defects) > 0 else []
-                        if len(chosen_defects) < k_shot:
-                            needed = k_shot - len(chosen_defects)
-                            if len(train_defects) >= needed:
-                                chosen_defects.extend(random.sample(train_defects, needed))
-                            else:
-                                chosen_defects.extend(train_defects)
-                                remaining = k_shot - len(chosen_defects)
-                                if remaining > 0:
-                                    pool = [d for d in data_list if d not in chosen_defects]
-                                    if len(pool) >= remaining:
-                                        chosen_defects.extend(random.sample(pool, remaining))
-                                    else:
-                                        chosen_defects.extend(pool)
-
-                        n_goods = goods_per_class if goods_per_class is not None else max(k_shot, 50)
-                        goods_pool = test_goods if include_test_defects and len(test_goods) > 0 else train_goods
-
-                        if len(goods_pool) >= n_goods:
-                            chosen_goods = random.sample(goods_pool, n_goods)
-                        else:
-                            union_pool = []
-                            if "train" in meta_info and cls in meta_info["train"]:
-                                union_pool.extend([d for d in meta_info["train"][cls] if int(d.get("anomaly",0))==0])
-                            if "test" in meta_info and cls in meta_info["test"]:
-                                union_pool.extend([d for d in meta_info["test"][cls] if int(d.get("anomaly",0))==0])
-                            seen = set()
-                            unique_union = []
-                            for d in union_pool:
-                                key = (d["img_path"], d.get("mask_path", ""))
-                                if key not in seen:
-                                    seen.add(key)
-                                    unique_union.append(d)
-                            union_pool = unique_union
-
-                            if len(union_pool) >= n_goods:
-                                chosen_goods = random.sample(union_pool, n_goods)
-                            else:
-                                chosen_goods = union_pool.copy()
-
-                        chosen = chosen_defects + chosen_goods
-                        random.shuffle(chosen)
+                        
+            # ==== Case 2: legacy k_shot handling (train/test from train split, optional include_test_defects) ====
+            elif mode in ("train", "train_all", "test") and k_shot > 0:
+                # original k_shot logic, using train split primarily and optional inclusion of test defects/goods
+                train_defects = [d for d in data_list if int(d.get("anomaly", 0)) == 1 and d.get("mask_path")]
+                train_goods = [d for d in data_list if int(d.get("anomaly", 0)) == 0]
+    
+                test_defects = []
+                test_goods = []
+                if include_test_defects:
+                    try:
+                        test_meta = meta_info.get("test", {})
+                        cls_test_list = test_meta.get(cls, [])
+                    except Exception:
+                        cls_test_list = []
+                    for d in cls_test_list:
+                        if int(d.get("anomaly", 0)) == 1 and d.get("mask_path"):
+                            test_defects.append(d)
+                        elif int(d.get("anomaly", 0)) == 0:
+                            test_goods.append(d)
+    
+                chosen_defects = test_defects.copy() if include_test_defects and len(test_defects) > 0 else []
+                if len(chosen_defects) < k_shot:
+                    needed = k_shot - len(chosen_defects)
+                    if len(train_defects) >= needed:
+                        chosen_defects.extend(random.sample(train_defects, needed))
                     else:
-                        chosen = data_list
-                # === END REPLACEMENT ===
-
-            
+                        chosen_defects.extend(train_defects)
+                        remaining = k_shot - len(chosen_defects)
+                        if remaining > 0:
+                            pool = [d for d in data_list if d not in chosen_defects]
+                            if len(pool) >= remaining:
+                                chosen_defects.extend(random.sample(pool, remaining))
+                            else:
+                                chosen_defects.extend(pool)
+    
+                n_goods = goods_per_class if goods_per_class is not None else max(k_shot, 50)
+                goods_pool = test_goods if include_test_defects and len(test_goods) > 0 else train_goods
+    
+                if len(goods_pool) >= n_goods:
+                    chosen_goods = random.sample(goods_pool, n_goods)
+                else:
+                    union_pool = []
+                    if "train" in meta_info and cls in meta_info["train"]:
+                        union_pool.extend([d for d in meta_info["train"][cls] if int(d.get("anomaly", 0)) == 0])
+                    if "test" in meta_info and cls in meta_info["test"]:
+                        union_pool.extend([d for d in meta_info["test"][cls] if int(d.get("anomaly", 0)) == 0])
+                    seen = set()
+                    unique_union = []
+                    for d in union_pool:
+                        key = (d["img_path"], d.get("mask_path", ""))
+                        if key not in seen:
+                            seen.add(key)
+                            unique_union.append(d)
+                    union_pool = unique_union
+    
+                    if len(union_pool) >= n_goods:
+                        chosen_goods = random.sample(union_pool, n_goods)
+                    else:
+                        chosen_goods = union_pool.copy()
+    
+                chosen = chosen_defects + chosen_goods
+                random.shuffle(chosen)
+    
+            else:
+                # default: use all entries from the provided split
+                chosen = data_list
+    
+            # Append validated entries to self.entries (ensure we only add items with mask_path for anomalies)
             for d in chosen:
+                # If anomaly flagged but mask missing, don't add as anomaly (skip to avoid later issues)
+                if int(d.get("anomaly", 0)) == 1:
+                    if not d.get("mask_path"):
+                        continue
+                    full_maskp = os.path.join(self.root, d.get("mask_path", ""))
+                    if not os.path.exists(full_maskp):
+                        continue
                 self.entries.append(
                     SampleEntry(
                         img_path=d["img_path"],
-                        mask_path=d["mask_path"],
+                        mask_path=d.get("mask_path", ""),
                         cls_name=d["cls_name"],
-                        anomaly=int(d["anomaly"]),
+                        anomaly=int(d.get("anomaly", 0)),
                         specie_name=d.get("specie_name", d["cls_name"]),
                     )
                 )
-
+    
         # cache class-wise test paths for mosaic augmentation
         self.test_cache = split_meta if "test" in meta_info else meta_info.get("test", {})
+
 
     def __len__(self) -> int:
         return len(self.entries)

@@ -9,6 +9,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 from tqdm import tqdm
+import inspect
 
 # ensure local sam3 package is importable
 sys.path.append(os.path.join(os.path.dirname(__file__), "sam3"))
@@ -18,8 +19,30 @@ from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
 from sam3.visualization_utils import draw_masks_to_frame
 
 
-def build_loader(root: str, meta_path: str, mode: str, batch_size: int):
-    ds = MVTecMetaDataset(root=root, meta_path=meta_path, mode=mode)
+def build_loader(
+    root: str,
+    meta_path: str,
+    mode: str,
+    batch_size: int,
+    include_test_defects: bool = False,
+    train_from_test: bool = False,
+    specie_split_ratio: float = 0.8,
+    specie_split_seed: int = 42,
+    splits_save_dir: Optional[str] = None,
+):
+    ds = MVTecMetaDataset(
+        root=root,
+        meta_path=meta_path,
+        mode=mode,
+        k_shot=0,  # inference/test flow generally not using k_shot here
+        aug_rate=0.0,
+        include_test_defects=include_test_defects,
+        goods_per_class=None,  # ensure no goods added when using train_from_test
+        train_from_test=train_from_test,
+        specie_split_ratio=specie_split_ratio,
+        specie_split_seed=specie_split_seed,
+        splits_save_dir=splits_save_dir,
+    )
 
     def collate_fn(batch):
         imgs, masks, prompt_lists, is_anomaly, class_names = zip(*batch)
@@ -31,35 +54,50 @@ def build_loader(root: str, meta_path: str, mode: str, batch_size: int):
         ds, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn
     )
 
+def _filter_kwargs_for_callable(func, kwargs: dict):
+    sig = inspect.signature(func)
+    ok = {}
+    for k, v in kwargs.items():
+        if k in sig.parameters:
+            ok[k] = v
+    return ok
 
 def load_model(args, device):
+    # prepare common kwargs from args
+    common_kwargs = {
+        "bpe_path": getattr(args, "bpe_path", None),
+        "sam3_ckpt": getattr(args, "sam3_ckpt", None),
+        "enable_lora": not getattr(args, "disable_lora", False),
+        "lora_rank": getattr(args, "lora_rank", 16),
+        "lora_alpha": getattr(args, "lora_alpha", None),
+        "freeze_vision": getattr(args, "freeze_vision", False),
+        "freeze_text": getattr(args, "freeze_text", False),
+        "device": device,
+        # optional parallel lora flags
+        "enable_parallel_lora": getattr(args, "enable_parallel_lora", False),
+        "parallel_lora_rank": getattr(args, "parallel_lora_rank", 16),
+        "parallel_lora_alpha": getattr(args, "parallel_lora_alpha", None),
+    }
+
     if args.use_official:
-        model = FineTuneSAM3Official(
-            bpe_path=args.bpe_path,
-            sam3_ckpt=args.sam3_ckpt,
-            enable_lora=not args.disable_lora,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            freeze_vision=args.freeze_vision,
-            freeze_text=args.freeze_text,
-            device=device,
-        )
+        Constructor = FineTuneSAM3Official
     else:
-        model = FineTuneSAM3(
-            bpe_path=args.bpe_path,
-            enable_lora=not args.disable_lora,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            freeze_vision=args.freeze_vision,
-            freeze_text=args.freeze_text,
-            device=device,
-        )
-        if args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
-            state = torch.load(args.sam3_ckpt, map_location="cpu")
-            model.load_state_dict(state, strict=False)
+        Constructor = FineTuneSAM3
+
+    # filter kwargs for the constructor signature
+    ctor_kwargs = _filter_kwargs_for_callable(Constructor.__init__, common_kwargs)
+    model = Constructor(**ctor_kwargs)
+
+    # load official sam3 checkpoint for non-custom builder if needed
+    if not args.use_official and args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
+        state = torch.load(args.sam3_ckpt, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+
+    # load fine-tuned checkpoint if provided
     if args.ckpt and os.path.exists(args.ckpt):
         model.load_state_dict(torch.load(args.ckpt, map_location=device), strict=False)
         print(f"[INFO] Loaded fine-tuned weights from {args.ckpt}")
+
     model.eval()
     return model.to(device)
 
@@ -74,7 +112,17 @@ def get_color_map(palette, prompt: str):
 @torch.no_grad()
 def run_inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    loader = build_loader(args.data_root, args.meta_path or os.path.join(args.data_root, "meta.json"), args.mode, args.batch_size)
+    loader = build_loader(
+        args.data_root,
+        args.meta_path or os.path.join(args.data_root, "meta.json"),
+        args.mode,
+        args.batch_size,
+        train_from_test=args.train_from_test,
+        specie_split_ratio=args.specie_split_ratio,
+        specie_split_seed=args.specie_split_seed,
+        save_dir=args.save_dir,
+        splits_save_dir=args.splits_save_dir
+    )
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -225,5 +273,19 @@ if __name__ == "__main__":
     parser.add_argument("--bpe_path", type=str, default=None)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--prompt", type=str, default=None, help="Custom prompt words, comma separated, to override dataset prompts.")
+    parser.add_argument("--include_test_defects", action="store_true",
+                    help="(legacy) include defects from test split when forming dataset")
+    parser.add_argument("--train_from_test", action="store_true",
+                        help="Build train/test from MVTec test-split defects per-specie (only defects).")
+    parser.add_argument("--specie_split_ratio", type=float, default=0.8,
+                        help="Train ratio per specie when building per-specie split from test defects (default 0.8).")
+    parser.add_argument("--specie_split_seed", type=int, default=42,
+                        help="Random seed for per-specie split reproducibility.")
+    # parallel lora args (if new model wrapper supports)
+    parser.add_argument("--enable_parallel_lora", action="store_true")
+    parser.add_argument("--parallel_lora_rank", type=int, default=16)
+    parser.add_argument("--parallel_lora_alpha", type=float, default=None)
+    parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
+
     args = parser.parse_args()
     run_inference(args)
