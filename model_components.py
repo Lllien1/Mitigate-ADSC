@@ -109,8 +109,17 @@ def apply_lora_to_sam(
 
 
 class AveragedPromptLearner(nn.Module):
-    """Encode short-word lists with SAM3's text encoder, mean-pool, and prepend learnable ctx.
-    Extended: compute a learned per-keyword weight (small MLP) before averaging.
+    """
+    SoWA-style prompt learner:
+      - token-level attention: for each keyword phrase, produce a keyword embedding
+        by attending over its token embeddings (learned query).
+      - keyword-level attention: attend over keyword embeddings to produce a single
+        prototype for the sample (learned query).
+      - prepend learnable ctx tokens to the prototype as before.
+
+    Returns:
+      prompt_seq: (n_ctx + 1, B, width)
+      prompt_mask: (B, n_ctx + 1)  -- False = visible (same convention as original code)
     """
 
     def __init__(
@@ -119,22 +128,36 @@ class AveragedPromptLearner(nn.Module):
         n_ctx: int = 4,
         freeze_text_encoder: bool = True,
         proj: Optional[nn.Module] = None,
+        token_attn_scale: Optional[float] = None,
+        keyword_attn_scale: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.text_encoder = text_encoder
         self.context_length = getattr(text_encoder, "context_length", 32)
-        self.width = text_encoder.encoder.width  # note: follow your text encoder attribute
-        self.n_ctx = n_ctx
-        self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
-        self.proj = proj if proj is not None else text_encoder.resizer
+        # width: embedding dim of text encoder tokens
+        self.width = getattr(text_encoder.encoder, "width", None)
+        if self.width is None:
+            # fallback to known attribute if layout differs
+            self.width = getattr(text_encoder, "width", None)
+        assert self.width is not None, "Cannot determine text encoder embedding width"
 
-        # small MLP that computes a scalar logit per keyword embedding,
-        # used to produce a softmax weight over keywords
-        hidden = max(16, self.width // 8)
-        self.kweight_mlp = nn.Sequential(
-            nn.Linear(self.width, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, 1),
+        self.n_ctx = n_ctx
+        # learnable context tokens
+        self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
+        self.proj = proj if proj is not None else getattr(text_encoder, "resizer", None)
+
+        # token-level learned query vector (used to score tokens within each keyword)
+        # we store as a parameter vector of size (width,)
+        self.q_token = nn.Parameter(torch.randn(self.width) * 0.02)
+        # keyword-level learned query vector (used to score keywords)
+        self.q_keyword = nn.Parameter(torch.randn(self.width) * 0.02)
+
+        # optional temperature / scaling factors (learnable hyperparams are optional)
+        self.token_attn_scale = (
+            token_attn_scale if token_attn_scale is not None else math.sqrt(self.width)
+        )
+        self.keyword_attn_scale = (
+            keyword_attn_scale if keyword_attn_scale is not None else math.sqrt(self.width)
         )
 
         if freeze_text_encoder:
@@ -142,37 +165,87 @@ class AveragedPromptLearner(nn.Module):
                 p.requires_grad = False
 
     @torch.no_grad()
-    def _encode_keywords(self, keywords: List[str], device: torch.device) -> torch.Tensor:
+    def _tokenize_and_encode(self, keywords: List[str], device: torch.device):
+        """
+        Tokenize a list of keywords and return:
+           token_ids: tensor (n_words, seq_len) -- token id per position (uses .argmax as before)
+           eot_indices: tensor (n_words,) -- position index of EOT / last meaningful token (same as before)
+           token_embs: tensor (n_words, seq_len, width) -- token embeddings from text_encoder.encoder
+        This mirrors the original pipeline but returns token-level embeddings (not just EOT).
+        """
         if len(keywords) == 0:
             keywords = ["normal"]
-        tokenized = self.text_encoder.tokenizer(
-            keywords, context_length=self.context_length
-        ).to(device)
-        _, tokens = self.text_encoder.encoder(tokenized)  # [b, seq, width]
-        eot_indices = tokenized.argmax(dim=-1)
-        word_embeds = tokens[torch.arange(len(keywords), device=device), eot_indices]
-        return word_embeds  # [n_words, width]
+        # tokenizer existing interface in repo:
+        tokenized = self.text_encoder.tokenizer(keywords, context_length=self.context_length).to(device)
+        # tokenized is used previously with argmax to get eot indices
+        eot_indices = tokenized.argmax(dim=-1)  # shape: (n_words, ) or (n_words, seq_len)? repo's original code worked
+        # In original code they did tokens[range, eot_indices] so eot_indices must be (n_words,) giving the index.
+        # To be robust: if eot_indices is 2D, take argmax across seq to get position index per word:
+        if eot_indices.dim() > 1:
+            # eot_indices maybe shape (n_words, seq_len) if tokenizer returns weird shape
+            # take the position of the highest value across seq dimension
+            eot_indices = eot_indices.argmax(dim=1)
 
-    def forward(
-        self, prompt_lists: Sequence[List[str]], device: Optional[torch.device] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # run text encoder to get token embeddings: tokens: (n_words, seq_len, width)
+        _, tokens = self.text_encoder.encoder(tokenized)
+        # Ensure tokens is float tensor on device
+        tokens = tokens.to(device)
+
+        # Build mask for valid token positions for each keyword using eot_indices:
+        seq_len = tokens.shape[1]
+        pos = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
+        # token_mask True for positions <= eot_index (i.e., valid tokens), False otherwise
+        token_mask = pos <= eot_indices.unsqueeze(1)  # shape (n_words, seq_len), dtype=bool
+
+        return eot_indices, tokens, token_mask
+
+    def forward(self, prompt_lists: Sequence[List[str]], device: Optional[torch.device] = None):
+        """
+        Input:
+          prompt_lists: Sequence of lists of keyword strings, length B
+        Output:
+          prompt_seq: (n_ctx+1, B, width)
+          prompt_mask: (B, n_ctx+1)  (False = visible)
+        """
         device = device or self.ctx.device
-        batch_features: List[torch.Tensor] = []
-        batch_masks: List[torch.Tensor] = []
+        batch_features = []
+
         for words in prompt_lists:
-            # encode keywords using text encoder (no grad for text encoder)
-            word_embeds = self._encode_keywords(words, device)  # (n_words, width)
-            # compute scalar logits for each keyword via MLP (requires grad on MLP)
-            if word_embeds.shape[0] == 0:
-                # fallback: zero prototype
+            # encode tokens and compute token-level keyword embeddings
+            eot_indices, tokens, token_mask = self._tokenize_and_encode(words, device=device)
+            # tokens: (n_words, seq_len, width)
+            n_words = tokens.shape[0]
+
+            if n_words == 0:
+                # fallback to zero prototype
                 prototype = torch.zeros((1, self.width), device=device)
             else:
-                # NOTE: word_embeds is computed under no_grad (text encoder frozen),
-                # kweight_mlp still learns to assign weights to these fixed embeddings.
-                logits = self.kweight_mlp(word_embeds)  # (n_words, 1)
-                weights = torch.softmax(logits.squeeze(-1), dim=0)  # (n_words,)
-                prototype = (weights.unsqueeze(-1) * word_embeds).sum(dim=0, keepdim=True)  # (1,width)
+                # token-level attention:
+                # scores = (tokens @ q_token) / scale  -> (n_words, seq_len)
+                # mask out positions after EOT with -1e9
+                q = self.q_token.view(self.width, 1)  # (width,1)
+                # compute dot product along width: (n_words, seq_len, width) @ (width,1) -> (n_words, seq_len, 1)
+                # faster as torch.einsum or matmul
+                scores = torch.matmul(tokens, q).squeeze(-1)  # (n_words, seq_len)
+                scores = scores / (self.token_attn_scale if self.token_attn_scale is not None else math.sqrt(self.width))
 
+                # mask positions beyond EOT
+                scores = scores.masked_fill(~token_mask, float("-1e9"))  # masked positions get -inf
+                # softmax over seq_len
+                token_weights = torch.softmax(scores, dim=1)  # (n_words, seq_len)
+                # compute keyword embedding as weighted sum of token embeddings
+                keyword_embeds = (token_weights.unsqueeze(-1) * tokens).sum(dim=1)  # (n_words, width)
+
+                # keyword-level attention: compute scores over the n_words
+                qk = self.q_keyword.view(self.width, 1)  # (width,1)
+                kw_scores = torch.matmul(keyword_embeds, qk).squeeze(-1)  # (n_words,)
+                kw_scores = kw_scores / (self.keyword_attn_scale if self.keyword_attn_scale is not None else math.sqrt(self.width))
+                kw_weights = torch.softmax(kw_scores, dim=0)  # (n_words,)
+
+                # produce prototype as weighted sum of keyword embeddings
+                prototype = (kw_weights.unsqueeze(-1) * keyword_embeds).sum(dim=0, keepdim=True)  # (1, width)
+
+            # prepend ctx tokens as before
             ctx = self.ctx.unsqueeze(0).to(device)  # (1, n_ctx, width)
             prototype = prototype.unsqueeze(0)  # (1,1,width)
             stacked = torch.cat([ctx, prototype], dim=1)  # (1, n_ctx+1, width)
@@ -180,8 +253,8 @@ class AveragedPromptLearner(nn.Module):
 
         prompt_batch = torch.cat(batch_features, dim=0)  # (B, n_ctx+1, width)
         projected = self.proj(prompt_batch) if self.proj is not None else prompt_batch
-        prompt_mask = torch.zeros(
-            (projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device
-        )  # False = visible
-        # return seq-first for transformer encoder
+        # prompt_mask: False = visible (same convention); all ctx + prototype are visible (False)
+        prompt_mask = torch.zeros((projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device)
+        # return seq-first for transformer encoder (seq,len first)
         return projected.transpose(0, 1), prompt_mask
+# -------------------------------------------------------------------------------
