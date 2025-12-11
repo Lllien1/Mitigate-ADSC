@@ -3,6 +3,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sam3.model.text_encoder_ve import VETextEncoder
 
@@ -107,6 +108,142 @@ def apply_lora_to_sam(
             wrapped.append(name)
     return wrapped
 
+class PerClassTemplatePromptLearner(nn.Module):
+    """
+    Per-class template + SoWA-style prompt learner.
+
+    Usage:
+      pl = PerClassTemplatePromptLearner(text_encoder, class_names=class_list, n_ctx=4, num_templates=4)
+      prompt_seq, prompt_mask = pl(prompt_lists, class_ids=[cls_idx_0, cls_idx_1, ...], device=device)
+    """
+
+    def __init__(
+        self,
+        text_encoder,
+        class_names: Sequence[str],
+        n_ctx: int = 4,
+        num_templates: int = 4,
+        freeze_text_encoder: bool = True,
+        proj: Optional[nn.Module] = None,
+        token_attn_scale: Optional[float] = None,
+        keyword_attn_scale: Optional[float] = None,
+    ):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.context_length = getattr(text_encoder, "context_length", 32)
+        self.width = getattr(text_encoder.encoder, "width", None)
+        assert self.width is not None, "Cannot find text encoder width"
+        self.n_ctx = n_ctx
+        self.num_templates = num_templates
+        self.class_names = list(class_names)
+        self.class_to_idx = {c.lower(): i for i, c in enumerate(self.class_names)}
+        self.num_classes = len(self.class_names)
+
+        self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
+        # class templates
+        self.class_templates = nn.Parameter(
+            torch.randn(self.num_classes, num_templates, self.width) * 0.02
+        )  # (C, T, W)
+
+        self.proj = proj if proj is not None else getattr(text_encoder, "resizer", None)
+
+        # SoWA-like: token-level and keyword-level queries
+        self.q_token = nn.Parameter(torch.randn(self.width) * 0.02)
+        self.q_keyword = nn.Parameter(torch.randn(self.width) * 0.02)
+        self.token_attn_scale = token_attn_scale if token_attn_scale is not None else math.sqrt(self.width)
+        self.keyword_attn_scale = keyword_attn_scale if keyword_attn_scale is not None else math.sqrt(self.width)
+
+        if freeze_text_encoder:
+            for p in self.text_encoder.parameters():
+                p.requires_grad = False
+
+    @torch.no_grad()
+    def _tokenize_and_encode(self, keywords: List[str], device: torch.device):
+        """Tokenize and run text encoder return tokens and token_mask (True for valid tokens)."""
+        if len(keywords) == 0:
+            keywords = ["normal"]
+        tokenized = self.text_encoder.tokenizer(keywords, context_length=self.context_length).to(device)
+        eot_indices = tokenized.argmax(dim=-1)
+        if eot_indices.dim() > 1:
+            eot_indices = eot_indices.argmax(dim=1)
+        _, tokens = self.text_encoder.encoder(tokenized)  # (N, seq_len, W)
+        tokens = tokens.to(device)
+        seq_len = tokens.shape[1]
+        pos = torch.arange(seq_len, device=device).unsqueeze(0)
+        token_mask = pos <= eot_indices.unsqueeze(1)  # (N, seq_len)
+        return tokens, token_mask
+
+    def forward(self, prompt_lists: Sequence[List[str]], class_ids: Optional[Sequence[int]] = None, device: Optional[torch.device] = None):
+        """
+        prompt_lists: Sequence[B] of list[str]
+        class_ids: optional Sequence[B] of ints (0..num_classes-1)
+        returns prompt_seq (L,B,W), prompt_mask (B,L)
+        """
+        device = device or self.ctx.device
+        B = len(prompt_lists)
+
+        # flatten keywords
+        all_keywords = []
+        counts = []
+        for kws in prompt_lists:
+            kws_clean = [w for w in kws if w]
+            counts.append(len(kws_clean))
+            all_keywords.extend(kws_clean)
+        N = len(all_keywords)
+
+        if N == 0:
+            # fallback: zero prototype
+            keyword_prototypes = torch.zeros((B, 1, self.width), device=device)
+        else:
+            tokenized = self.text_encoder.tokenizer(all_keywords, context_length=self.context_length).to(device)
+            eot = tokenized.argmax(dim=-1)
+            if eot.dim() > 1:
+                eot = eot.argmax(dim=1)
+            _, tokens = self.text_encoder.encoder(tokenized)  # (N, seq_len, W)
+            tokens = tokens.to(device)
+            seq_len = tokens.shape[1]
+            pos = torch.arange(seq_len, device=device).unsqueeze(0)
+            token_mask = pos <= eot.unsqueeze(1)
+
+            # token-level attention:
+            q = self.q_token.view(self.width, 1).to(device)
+            scores = torch.matmul(tokens, q).squeeze(-1) / (self.token_attn_scale or math.sqrt(self.width))
+            min_val = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(~token_mask, min_val)
+            token_w = torch.softmax(scores, dim=1)  # (N, seq_len)
+            keyword_embeds_all = (token_w.unsqueeze(-1) * tokens).sum(dim=1)  # (N, W)
+
+            # regroup per sample
+            max_k = max(counts) if max(counts) > 0 else 1
+            kw_padded = torch.zeros((B, max_k, self.width), device=device)
+            kw_mask = torch.ones((B, max_k), dtype=torch.bool, device=device)
+            idx = 0
+            for i, k in enumerate(counts):
+                if k > 0:
+                    kw_padded[i, :k, :] = keyword_embeds_all[idx: idx + k]
+                    kw_mask[i, :k] = False
+                    idx += k
+
+            # keyword-level attention
+            qk = self.q_keyword.view(self.width, 1).to(device)
+            kw_scores = torch.matmul(kw_padded, qk).squeeze(-1) / (self.keyword_attn_scale or math.sqrt(self.width))  # (B, max_k)
+            kw_scores = kw_scores.masked_fill(kw_mask, min_val)
+            kw_w = torch.softmax(kw_scores, dim=1)  # (B,max_k)
+            keyword_prototypes = (kw_w.unsqueeze(-1) * kw_padded).sum(dim=1, keepdim=True)  # (B,1,W)
+
+        # class templates batch
+        if class_ids is None:
+            class_templates_batch = self.class_templates[0].unsqueeze(0).repeat(B, 1, 1)
+        else:
+            ids = torch.tensor(class_ids, dtype=torch.long, device=device)
+            class_templates_batch = self.class_templates[ids]  # (B, T, W)
+
+        ctx_b = self.ctx.unsqueeze(0).to(device).repeat(B, 1, 1)  # (B, n_ctx, W)
+        stacked = torch.cat([ctx_b, class_templates_batch, keyword_prototypes], dim=1)  # (B, n_ctx+T+1, W)
+        projected = self.proj(stacked) if self.proj is not None else stacked
+        prompt_mask = torch.zeros((projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device)
+
+        return projected.transpose(0, 1), prompt_mask
 
 class AveragedPromptLearner(nn.Module):
     """

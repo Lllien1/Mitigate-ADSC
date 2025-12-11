@@ -23,6 +23,11 @@ from torch.cuda.amp import autocast, GradScaler
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
 
+import numpy as np
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+
+
 def setup_distributed(args):
     """
     初始化分布式（在使用 torch.distributed.run 启动时，环境变量会提供 LOCAL_RANK, RANK, WORLD_SIZE）
@@ -579,6 +584,13 @@ def main(args: argparse.Namespace):
         else:
             other_params.append(p)
     print(f"[INFO] trainable params: prompt/LoRA={len(prompt_and_lora)}, others={len(other_params)}")
+    # Print prompt-related parameters and requires_grad for diagnosis
+    print("[INFO] Prompt-related params (name, requires_grad, shape):")
+    for n, p in model.named_parameters():
+        nl = n.lower()
+        if ("prompt" in nl) or ("template" in nl) or ("kweight" in nl) or ("lora" in nl):
+            print(f"  {n}: requires_grad={p.requires_grad}, shape={tuple(p.shape)}")
+
 
     # ---------------------------
     # (2-a) 可学习的损失权重（Kendall）
@@ -1146,61 +1158,139 @@ def main(args: argparse.Namespace):
                 # Contrastive alignment (InfoNCE) between visual pooled vector and prompt prototype
                 align_loss = torch.tensor(0.0, device=device)
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
-                    # get prompt prototype: call prompt_learner (returns sequence-first often)
-                    prompt_seq, prompt_mask = model_core.prompt_learner(prompt_lists, device=device)
-                    # prompt_seq[-1] might be shape (B, D) or (D, B) or (S, B, D) depending on implementation
-                    prompt_last = prompt_seq[-1]
-                
-                    # Normalize prompt_last to (B, D)
-                    if prompt_last.dim() == 2:
-                        # either (B,D) or (D,B)
-                        if prompt_last.shape[0] == B:
-                            prompt_proto = prompt_last  # (B, D)
-                        elif prompt_last.shape[1] == B:
-                            prompt_proto = prompt_last.transpose(0, 1)  # (B, D)
-                        else:
-                            # fallback: try reshape
-                            prompt_proto = prompt_last.reshape(B, -1)[:, :prompt_last.numel() // B]
-                    elif prompt_last.dim() == 3:
-                        # shape (S, B, D) -> take last along S
-                        prompt_proto = prompt_last[-1]
-                        if prompt_proto.shape[0] != B:
-                            # then transpose
-                            if prompt_proto.shape[1] == B:
-                                prompt_proto = prompt_proto.transpose(0, 1)
+                    # Prefer prompt_seq from model output if available
+                    prompt_seq = out.get("prompt_seq", None)
+                    if prompt_seq is None:
+                        try:
+                            prompt_seq, _ = model_core.prompt_learner(prompt_lists, device=device)
+                        except Exception as e:
+                            print("[WARN] cannot obtain prompt_seq from model_core.prompt_learner:", e)
+                            prompt_seq = None
+
+                    # Normalize extraction into (B, D)
+                    prompt_proto = None
+                    if prompt_seq is not None:
+                        # prompt_seq is seq-first (S, B, D)
+                        last = prompt_seq[-1]
+                        if last.dim() == 2:
+                            # last may be (B, D) or (D, B)
+                            if last.shape[0] == B:
+                                prompt_proto = last
+                            elif last.shape[1] == B:
+                                prompt_proto = last.transpose(0, 1).contiguous()
                             else:
-                                prompt_proto = prompt_proto.reshape(B, -1)[:, :prompt_proto.numel() // B]
-                    else:
-                        # final fallback: create zeros
-                        prompt_proto = torch.zeros((B, prompt_last.numel() // B), device=device, dtype=prompt_last.dtype)
-                
-                    # get visual pooled representation: prefer decoder_hs (out["decoder_hs"])
-                    decoder_hs = out.get("decoder_hs", None)
-                    if decoder_hs is not None:
-                        if decoder_hs.dim() == 4:
-                            hs_last = decoder_hs[-1]  # (L,B,Q,D) -> maybe last -> (B,Q,D) if dims were reduced
-                            # If hs_last dim is (L,B,Q,D) already handled, we ensure hs_last is (B,Q,D)
-                            if hs_last.dim() == 4:
-                                hs_last = hs_last[-1]
+                                prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
+                        elif last.dim() == 3:
+                            # (S, B, D) -> we already indexed last as last => usually (B, D)
+                            prompt_proto = last if last.shape[0] == B else last[-1]
                         else:
-                            hs_last = decoder_hs  # expecting (B,Q,D)
-                        # If hs_last is (Q,B,D) transpose
-                        if hs_last.dim() == 3 and hs_last.shape[0] == Q and hs_last.shape[1] == B:
-                            hs_last = hs_last.permute(1, 0, 2)
-                        # pool across queries
-                        v_pooled = hs_last.mean(dim=1)  # (B, D)
-                        # compute contrastive only if batch sizes / dims match
-                        if v_pooled.shape[0] == prompt_proto.shape[0] and v_pooled.shape[1] == prompt_proto.shape[1]:
-                            align_loss = contrastive_loss_from_pooled(v_pooled, prompt_proto, temp=args.align_temp)
-                        else:
-                            # print debug to help if shapes mismatch
-                            print(f"[WARN] align shape mismatch: v_pooled {v_pooled.shape} prompt_proto {prompt_proto.shape}")
-                            align_loss = torch.tensor(0.0, device=device)
-                    else:
+                            prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
+
+                    # Build mask embedding using preferred decoder spatial features, fallback to decoder_hs pooling
+                    mask_embed = None
+                    decoder_feat = out.get("decoder_features", None)
+                    if decoder_feat is not None:
+                        # expected decoder_feat shape (B, C, Hf, Wf)
+                        try:
+                            Bf, C, Hf, Wf = decoder_feat.shape
+                            # downsample/resize GT masks to (Hf, Wf)
+                            gt_ds = F.interpolate(masks.unsqueeze(1).float(), size=(Hf, Wf), mode='nearest').squeeze(1)  # (B,Hf,Wf)
+                            feat = decoder_feat.permute(0, 2, 3, 1).reshape(B, Hf * Wf, C)  # (B, Hf*Wf, C)
+                            mask_flat = gt_ds.view(B, Hf * Wf).unsqueeze(-1)  # (B, Hf*Wf,1)
+                            pos_counts = mask_flat.sum(dim=1).clamp(min=1.0).to(device)
+                            mask_sum = (feat * mask_flat).sum(dim=1)  # (B,C)
+                            mask_embed = mask_sum / pos_counts  # (B,C)
+                        except Exception as e:
+                            print("[WARN] decoder_features pooling failed:", e)
+                            mask_embed = None
+
+                    if mask_embed is None:
+                        # fallback to decoder_hs (pooled over queries)
+                        decoder_hs = out.get("decoder_hs", None)
+                        if decoder_hs is not None:
+                            try:
+                                hs_last = decoder_hs
+                                # if hs_last is (L,B,Q,D) get last L and ensure shape (B,Q,D)
+                                if hs_last.dim() == 4:
+                                    hs_last = hs_last[-1]  # -> (B,Q,D) or (Q,B,D)
+                                if hs_last.dim() == 3 and hs_last.shape[0] == Q and hs_last.shape[1] == B:
+                                    hs_last = hs_last.permute(1, 0, 2).contiguous()
+                                # pool across queries
+                                v_pooled = hs_last.mean(dim=1)  # (B, D)
+                                mask_embed = v_pooled
+                            except Exception as e:
+                                print("[WARN] decoder_hs pooling failed:", e)
+                                mask_embed = None
+
+                    # If still None, fallback to zeros to avoid crash
+                    if mask_embed is None:
+                        mask_embed = torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)
+
+                    # Ensure dim match: project mask_embed to prompt_proto dim if necessary
+                    if prompt_proto is not None:
+                        Dp = prompt_proto.shape[1]
+                        Dm = mask_embed.shape[1]
+                        if Dm != Dp:
+                            # create or reuse a small linear projector on model_core to map dims
+                            if not hasattr(model_core, "_align_proj"):
+                                model_core._align_proj = nn.Linear(Dm, Dp).to(device)
+                            mask_embed = model_core._align_proj(mask_embed)
+
+                    # L2 normalize and compute symmetric InfoNCE
+                    if prompt_proto is None:
+                        # can't compute align: leave zero
                         align_loss = torch.tensor(0.0, device=device)
+                    else:
+                        p_norm = F.normalize(prompt_proto, dim=1)
+                        m_norm = F.normalize(mask_embed, dim=1)
+
+                        # use helper contrastive_loss_from_pooled (already defined in file)
+                        try:
+                            align_loss = contrastive_loss_from_pooled(p_norm, m_norm, temp=args.align_temp)
+                        except Exception as e:
+                            # fallback compute manual symmetric nce
+                            logits = (p_norm @ m_norm.t()) / float(args.align_temp)
+                            labels_local = torch.arange(B, device=device)
+                            align_loss = 0.5 * (F.cross_entropy(logits, labels_local) + F.cross_entropy(logits.t(), labels_local))
+
+                        # Diagnostics: pos/neg stats and norms (log every args.log_freq steps)
+                        if (step % getattr(args, "log_freq", 100)) == 0:
+                            sim = (p_norm @ m_norm.t()) / float(args.align_temp)
+                            labels_local = torch.arange(B, device=device)
+                            pos = sim[range(B), labels_local]
+                            mask_offdiag = ~torch.eye(B, dtype=torch.bool, device=device)
+                            neg = sim.masked_select(mask_offdiag).view(B, B - 1)
+                            pos_mean, pos_std = float(pos.mean().item()), float(pos.std().item())
+                            neg_mean, neg_std = float(neg.mean().item()), float(neg.std().item())
+                            p_mean, p_std = float(p_norm.norm(dim=1).mean().item()), float(p_norm.norm(dim=1).std().item())
+                            m_mean, m_std = float(m_norm.norm(dim=1).mean().item()), float(m_norm.norm(dim=1).std().item())
+                            print(f"[ALIGN] step={step} align_loss={align_loss.item():.6f} pos_mean={pos_mean:.4f} pos_std={pos_std:.4f} neg_mean={neg_mean:.4f} neg_std={neg_std:.4f}")
+                            print(f"[NORM] p_mean={p_mean:.4f} p_std={p_std:.4f} | m_mean={m_mean:.4f} m_std={m_std:.4f}")
+
+                            # TSNE: sample up to tsne_samples per type
+                            if (step % getattr(args, "tsne_freq", 500)) == 0:
+                                ns = min(getattr(args, "tsne_samples", 64), B)
+                                sel = np.random.choice(B, ns, replace=False)
+                                p_sample = p_norm[sel].detach().cpu().numpy()
+                                m_sample = m_norm[sel].detach().cpu().numpy()
+                                X = np.concatenate([p_sample, m_sample], axis=0)
+                                try:
+                                    Z = TSNE(n_components=2, perplexity=30, init='pca').fit_transform(X)
+                                    plt.figure(figsize=(5,5))
+                                    plt.scatter(Z[:ns,0], Z[:ns,1], c='C0', label='prompt', alpha=0.8)
+                                    plt.scatter(Z[ns:,0], Z[ns:,1], c='C1', label='mask', alpha=0.8)
+                                    plt.legend()
+                                    plt.title(f"t-SNE step{step}")
+                                    tsne_out_dir = os.path.join(args.log_dir, "tsne")
+                                    os.makedirs(tsne_out_dir, exist_ok=True)
+                                    plt.savefig(os.path.join(tsne_out_dir, f"tsne_step{step}.png"), dpi=150)
+                                    plt.close()
+                                except Exception as e:
+                                    print("[WARN] TSNE failed:", e)
                 else:
                     align_loss = torch.tensor(0.0, device=device)
                 # -------------------------
+
 
                 # Combine losses: use learned weights (Kendall) if requested, otherwise use args.loss_alpha/beta/gamma
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
@@ -1216,7 +1306,7 @@ def main(args: argparse.Namespace):
                 loss = total_loss
 
             # ===== AMP autocast 结束 =====
-
+        
             if not torch.isfinite(loss):
                 print(f"[WARN] Skip batch with non-finite loss (loss={loss.item()}, focal={loss_focal.item()}, dice={loss_dice.item()}, iou={loss_iou.item()})")
                 continue
@@ -1224,6 +1314,22 @@ def main(args: argparse.Namespace):
             optimizer.zero_grad()
             # 使用 GradScaler 做 backward + step
             scaler.scale(loss).backward()
+
+            # --- Diagnostic: grad norms for prompt-related params ---
+            grad_norms = []
+            for n,p in model.named_parameters():
+                nl = n.lower()
+                if p.grad is not None and (("prompt" in nl) or ("template" in nl) or ("kweight" in nl) or ("lora" in nl)):
+                    grad_norms.append((n, float(p.grad.norm().item())))
+            if len(grad_norms) > 0 and (step % getattr(args, "log_freq", 100) == 0):
+                # print few entries (avoid overwhelming)
+                print("[GRADS] sample prompt-related grad norms (top 10):")
+                for name, gn in grad_norms[:20]:
+                    print(f"  {name}: {gn:.4e}")
+                vals = np.array([v for (_, v) in grad_norms])
+                print(f"[GRADS] mean={vals.mean():.4e}, std={vals.std():.4e}, max={vals.max():.4e}")
+            # --- Diagnostic: grad norms for prompt-related params ---
+
             scaler.step(optimizer)
             scaler.update()
 
@@ -1307,5 +1413,10 @@ if __name__ == "__main__":
     parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
     parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
     parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
+    #--------------- Diagnostic logging args ---------------
+    parser.add_argument("--log_freq", type=int, default=100, help="Logging frequency (steps) for align diagnostics")
+    parser.add_argument("--tsne_freq", type=int, default=500, help="TSNE save frequency (steps)")
+    parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
+
     args = parser.parse_args()
     main(args)

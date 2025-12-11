@@ -3,7 +3,8 @@ from typing import List, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from model_components import AveragedPromptLearner, apply_lora_to_sam
+from model_components import AveragedPromptLearner, apply_lora_to_sam, PerClassTemplatePromptLearner
+import json
 from sam3.model_builder import (
     _create_segmentation_head,
     _create_sam3_transformer,
@@ -55,12 +56,22 @@ class FineTuneSAM3(nn.Module):
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-        self.prompt_learner = AveragedPromptLearner(
-            text_encoder=self.text_encoder,
-            n_ctx=4,
-            freeze_text_encoder=freeze_text,
-            proj=self.text_encoder.resizer,
-        )
+        if getattr(args, "prompt_learner_type", "") == "perclass":
+            self.prompt_learner = PerClassTemplatePromptLearner(
+                text_encoder=self.text_encoder,
+                class_names=args.class_list,
+                n_ctx=getattr(args, "n_ctx", 4),
+                num_templates=getattr(args, "num_templates", 4),
+                freeze_text_encoder=getattr(args, "freeze_text", True),
+                proj=getattr(self.text_encoder, "resizer", None),
+            )
+        else:
+            self.prompt_learner = AveragedPromptLearner(
+                text_encoder=self.text_encoder,
+                n_ctx=4,
+                freeze_text_encoder=freeze_text,
+                proj=self.text_encoder.resizer,
+            )
         self.to(self.device)
 
     def forward(self, images: torch.Tensor, prompt_lists: Sequence[List[str]]) -> dict:
@@ -202,12 +213,22 @@ class FineTuneSAM3Official(nn.Module):
                 p.requires_grad = False
 
         text_encoder = self.backbone.language_backbone
-        self.prompt_learner = AveragedPromptLearner(
-            text_encoder=text_encoder,
-            n_ctx=4,
-            freeze_text_encoder=freeze_text,
-            proj=text_encoder.resizer if hasattr(text_encoder, "resizer") else None,
-        )
+        if getattr(args, "prompt_learner_type", "") == "perclass":
+            self.prompt_learner = PerClassTemplatePromptLearner(
+                text_encoder=self.text_encoder,
+                class_names=args.class_list,
+                n_ctx=getattr(args, "n_ctx", 4),
+                num_templates=getattr(args, "num_templates", 4),
+                freeze_text_encoder=getattr(args, "freeze_text", True),
+                proj=getattr(self.text_encoder, "resizer", None),
+            )
+        else:
+            self.prompt_learner = AveragedPromptLearner(
+                text_encoder=text_encoder,
+                n_ctx=4,
+                freeze_text_encoder=freeze_text,
+                proj=text_encoder.resizer if hasattr(text_encoder, "resizer") else None,
+            )
 
         self.to(self.device)
 
@@ -235,61 +256,99 @@ class FineTuneSAM3Official(nn.Module):
                 mapped[k] = v
         return mapped
 
-    def forward(self, images: torch.Tensor, prompt_lists: Sequence[List[str]]) -> dict:
-        images = images.to(self.device)
-        backbone_out = self.backbone.forward_image(images)
-        vis_feats = backbone_out["backbone_fpn"][-self.num_feature_levels :]
-        vis_pos = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
-        vis_feat_sizes = [x.shape[-2:] for x in vis_pos]
+def forward(self, images: torch.Tensor, prompt_lists: Sequence[List[str]], class_names: Optional[Sequence[str]] = None) -> dict:
+    """
+    Modified forward:
+      - accepts optional class_names (list of strings) so per-class prompt learner can be used
+      - returns prompt_seq and decoder_features in the out dict so training can compute align losses
+    """
+    images = images.to(self.device)
+    backbone_out = self.backbone.forward_image(images)
+    vis_feats = backbone_out["backbone_fpn"][-self.num_feature_levels :]
+    vis_pos = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
+    vis_feat_sizes = [x.shape[-2:] for x in vis_pos]
 
+    # ---------- handle prompt learner with optional class_names ----------
+    if class_names is not None and hasattr(self, "prompt_learner"):
+        # map class_names to indices using prompt_learner.class_to_idx (safe get)
+        cls_ids = [self.prompt_learner.class_to_idx.get(c.lower(), 0) if c is not None else 0 for c in class_names]
+        prompt_seq, prompt_mask = self.prompt_learner(prompt_lists, class_ids=cls_ids, device=self.device)
+    else:
         prompt_seq, prompt_mask = self.prompt_learner(prompt_lists, device=self.device)
-        prompt_pos = torch.zeros_like(prompt_seq)
+    prompt_pos = torch.zeros_like(prompt_seq)
 
-        img_feats = [x.flatten(2).permute(2, 0, 1) for x in vis_feats]
-        img_pos = [x.flatten(2).permute(2, 0, 1) for x in vis_pos]
+    # prepare image features for encoder
+    img_feats = [x.flatten(2).permute(2, 0, 1) for x in vis_feats]
+    img_pos = [x.flatten(2).permute(2, 0, 1) for x in vis_pos]
 
-        memory = self.transformer.encoder(
-            src=img_feats.copy(),
-            src_key_padding_mask=None,
-            src_pos=img_pos.copy(),
-            prompt=prompt_seq,
-            prompt_pos=prompt_pos,
-            prompt_key_padding_mask=prompt_mask,
-            feat_sizes=vis_feat_sizes,
-            encoder_extra_kwargs=None,
-        )
+    memory = self.transformer.encoder(
+        src=img_feats.copy(),
+        src_key_padding_mask=None,
+        src_pos=img_pos.copy(),
+        prompt=prompt_seq,
+        prompt_pos=prompt_pos,
+        prompt_key_padding_mask=prompt_mask,
+        feat_sizes=vis_feat_sizes,
+        encoder_extra_kwargs=None,
+    )
 
-        bs = images.shape[0]
-        tgt = self.transformer.decoder.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        hs, reference_boxes, dec_presence_out, dec_presence_feats = self.transformer.decoder(
-            tgt=tgt,
-            memory=memory["memory"],
-            memory_key_padding_mask=memory["padding_mask"],
-            pos=memory["pos_embed"],
-            reference_boxes=None,
-            level_start_index=memory["level_start_index"],
-            spatial_shapes=memory["spatial_shapes"],
-            valid_ratios=memory["valid_ratios"],
-            tgt_mask=None,
-            memory_text=prompt_seq,
-            text_attention_mask=prompt_mask,
-        )
-        hs = hs.permute(0, 2, 1, 3).contiguous()
+    bs = images.shape[0]
+    tgt = self.transformer.decoder.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+    hs, reference_boxes, dec_presence_out, dec_presence_feats = self.transformer.decoder(
+        tgt=tgt,
+        memory=memory["memory"],
+        memory_key_padding_mask=memory["padding_mask"],
+        pos=memory["pos_embed"],
+        reference_boxes=None,
+        level_start_index=memory["level_start_index"],
+        spatial_shapes=memory["spatial_shapes"],
+        valid_ratios=memory["valid_ratios"],
+        tgt_mask=None,
+        memory_text=prompt_seq,
+        text_attention_mask=prompt_mask,
+    )
+    hs = hs.permute(0, 2, 1, 3).contiguous()
 
-        seg_out = self.segmentation_head(
-            backbone_feats=vis_feats,
-            obj_queries=hs,
-            image_ids=torch.arange(bs, device=self.device),
-            encoder_hidden_states=memory["memory"],
-            prompt=prompt_seq,
-            prompt_mask=prompt_mask,
-        )
+    seg_out = self.segmentation_head(
+        backbone_feats=vis_feats,
+        obj_queries=hs,
+        image_ids=torch.arange(bs, device=self.device),
+        encoder_hidden_states=memory["memory"],
+        prompt=prompt_seq,
+        prompt_mask=prompt_mask,
+    )
 
-        return {
-            "pred_masks": seg_out.get("pred_masks"),
-            "semantic_seg": seg_out.get("semantic_seg"),
-            "presence_logit": seg_out.get("presence_logit"),
-            "iou_predictions": seg_out.get("iou_predictions"),
-            "decoder_hs": hs,
-            "reference_boxes": reference_boxes,
-        }
+    # Build return dict. Include prompt_seq (L,B,W) for align loss.
+    out = {
+        "pred_masks": seg_out.get("pred_masks"),
+        "semantic_seg": seg_out.get("semantic_seg"),
+        "presence_logit": seg_out.get("presence_logit"),
+        "iou_predictions": seg_out.get("iou_predictions"),
+        "decoder_hs": hs,
+        "reference_boxes": reference_boxes,
+        # return prompt_seq so training can extract prototype via prompt_seq[-1]
+        "prompt_seq": prompt_seq,
+    }
+
+    # Try to attach a spatial decoder feature map for mask-embedding pooling:
+    # Preferred: if segmentation_head returns a mask feature map, use it.
+    # Fallback: use backbone top-level feature vis_feats[0] (B,C,H,W).
+    decoder_feat = None
+    # commonly segmentation heads provide "mask_features" or "mask_pred_feats" etc. try several keys:
+    for key in ("mask_features", "decoder_features", "mask_feat", "mask_pred_feat"):
+        if key in seg_out and seg_out.get(key) is not None:
+            decoder_feat = seg_out.get(key)
+            break
+
+    if decoder_feat is None:
+        # fallback to backbone feature (first FPN level)
+        # ensure vis_feats[0] is in (B,C,H,W); if it's list, pick first
+        try:
+            decoder_feat = vis_feats[0]
+        except Exception:
+            decoder_feat = None
+
+    out["decoder_features"] = decoder_feat  # may be None if unavailable
+
+    return out
+

@@ -105,7 +105,7 @@ def build_loader(
         return imgs, masks, list(prompt_lists), list(class_names)
 
     return torch.utils.data.DataLoader(
-        ds, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn
+        ds, batch_size=batch_size, shuffle=False, num_workers=8, collate_fn=collate_fn
     )
 
 # ---------- model loading (keep compatible) ----------
@@ -133,13 +133,18 @@ def load_model(args, device):
         "parallel_lora_alpha": getattr(args, "parallel_lora_alpha", None),
     }
 
-    if args.use_official:
-        Constructor = FineTuneSAM3Official
-    else:
-        Constructor = FineTuneSAM3
-
-    ctor_kwargs = _filter_kwargs_for_callable(Constructor.__init__, common_kwargs)
-    model = Constructor(**ctor_kwargs)
+    with open(args.meta_path, 'r') as f:
+        meta = json.load(f)
+    # meta is expected to have classes keys; adapt to your meta.json structure
+    # For MVTec, meta might contain list of classes or mapping; find class example:
+    class_list = sorted(list(meta.get('classes', meta.get('class_list', meta.keys()))))
+    # Or if meta.json format differs, extract appropriate list of class names
+    args.class_list = class_list
+    
+    # In load_model or where you call Constructor:
+    Constructor = FineTuneSAM3Official if args.use_official else FineTuneSAM3
+    # pass through class_list to prompt learner init, e.g.,
+    model = Constructor(..., class_list=args.class_list, prompt_learner_type='perclass', num_templates=4)
 
     # load base sam3 if needed (non-official)
     if not args.use_official and args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
@@ -233,7 +238,10 @@ def load_model(args, device):
 # ---------- main inference loop ----------
 @torch.no_grad()
 def run_inference(args):
+    # device / loader / model 构建
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+
+    # 建议：可以在这里调整 build_loader 内的 num_workers / pin_memory（见后文）
     loader = build_loader(
         args.data_root,
         args.meta_path or os.path.join(args.data_root, "meta.json"),
@@ -245,11 +253,11 @@ def run_inference(args):
         specie_split_seed=getattr(args, "specie_split_seed", 42),
         save_dir=getattr(args, "save_dir", None),
     )
+
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
-    sample_idx = 0
 
-
+    # 绘图/颜色/字体等
     to_pil = transforms.ToPILImage()
     palette = [
         (255, 99, 71),
@@ -261,68 +269,72 @@ def run_inference(args):
     ]
     font = ImageFont.load_default()
 
-    idx = 0
+    # 状态变量
+    idx = 0  # 全局文件序号（保持你原来的行为）
+    sample_idx = 0  # 用于从 loader.dataset.entries 中读取原始 img_path
     total_imgs = 0
     total_time = 0.0
 
-    # accumulators
-    global_stats = defaultdict(float)
-    global_counts = defaultdict(int)
+    # accumulators for final class-level stats
+    global_stats = defaultdict(float)   # keys: dice_sum, iou_sum, prec_sum, rec_sum, f1_sum, img_count
     per_class_stats = defaultdict(lambda: defaultdict(float))
     per_class_counts = defaultdict(int)
 
-    pbar = tqdm(loader, desc="Inference", leave=True)
-    for images, masks, prompt_lists, class_names in pbar:
+    # tqdm 以“图片”为单位，总量为 dataset length
+    dataset_len = len(loader.dataset) if hasattr(loader, "dataset") else 0
+    # 使用 total=dataset_len, unit='img', 那么每处理一张图就 pbar.update(1)
+    pbar = tqdm(total=dataset_len, desc="Inference", unit="img", leave=True)
+
+    # 主循环：单层循环，避免重复遍历 loader
+    for images, masks, prompt_lists, class_names in loader:
+        # images, masks 来自 DataLoader，images.shape[0] = batch_size (最后一个batch可能小于batch_size)
         images = images.to(device)
-        # if user provided a single custom prompt -> override
+        # 先处理 prompts（用户自定义 或 MVPROMPTS 映射）
         custom_prompt: List[str] = []
-        if args.prompt:
+        if getattr(args, "prompt", None):
             custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
 
-        pbar = tqdm(loader, desc="Inference", leave=True)
-        sample_idx = 0  # track index into loader.dataset.entries for filename mapping
-    
-        for images, masks, prompt_lists, class_names in pbar:
-            images = images.to(device)
-            # if user provided a single custom prompt -> override
-            custom_prompt: List[str] = []
-            if args.prompt:
-                custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
-    
-            # 如果用户提供了自定义 prompt，则覆盖；否则优先使用 MVPROMPTS 映射
-            if custom_prompt:
-                prompt_lists = [custom_prompt for _ in prompt_lists]
-            else:
-                new_prompt_lists = []
-                for i, cls_name in enumerate(class_names):
-                    cls_key = cls_name.lower().strip()
-                    mapped = MVPROMPTS.get(cls_key, None)
-                    if mapped:
-                        new_prompt_lists.append([w.strip() for w in mapped.split(",") if w.strip()])
+        if custom_prompt:
+            prompt_lists = [custom_prompt for _ in prompt_lists]
+        else:
+            new_prompt_lists = []
+            for i, cls_name in enumerate(class_names):
+                cls_key = cls_name.lower().strip()
+                mapped = MVPROMPTS.get(cls_key, None)
+                if mapped:
+                    new_prompt_lists.append([w.strip() for w in mapped.split(",") if w.strip()])
+                else:
+                    if prompt_lists and i < len(prompt_lists) and prompt_lists[i]:
+                        new_prompt_lists.append(prompt_lists[i])
                     else:
-                        if prompt_lists and prompt_lists[i]:
-                            new_prompt_lists.append(prompt_lists[i])
-                        else:
-                            new_prompt_lists.append(["anomaly"])
-                prompt_lists = new_prompt_lists
-    
-            start = time.time()
-            out = model(images, prompt_lists)
-            infer_time = time.time() - start
-            total_time += infer_time
-            total_imgs += images.size(0)
-    
-            pred_masks = out.get("pred_masks", None)
-            if pred_masks is None:
-                # advance sample_idx still to keep alignment (to be safe)
-                sample_idx += images.size(0)
-                continue
-        # reduce possible aux dimensions
+                        new_prompt_lists.append(["anomaly"])
+            prompt_lists = new_prompt_lists
+
+        # 计时（确保测量真实 GPU time）
+        t0 = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        out = model(images, prompt_lists)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t1 = time.perf_counter()
+        batch_time = t1 - t0
+        total_time += batch_time
+        batch_imgs = images.size(0)
+        total_imgs += batch_imgs
+
+        pred_masks = out.get("pred_masks", None)
+        if pred_masks is None:
+            # 即使没有预测，也要推进 pbar 与 sample_idx，保持对齐
+            pbar.update(batch_imgs)
+            sample_idx += batch_imgs
+            continue
+
+        # 处理 pred_masks -> 概率
         if pred_masks.dim() == 5:
             pred_masks = pred_masks[-1]
-        if pred_masks.dim() == 4:
-            # (B, C, H, W) or (B,1,H,W) -> keep as is
-            pass
         pred_masks = torch.sigmoid(pred_masks)
         if pred_masks.shape[-2:] != masks.shape[-2:]:
             pred_masks = torch.nn.functional.interpolate(
@@ -330,21 +342,21 @@ def run_inference(args):
             )
 
         gt = (masks > 0.5).float().to(device)
-        valid = gt.flatten(1).sum(dim=1) > 0
 
-        # compute per-image metrics
-        for b in range(images.size(0)):
+        # 逐张样本处理（可视化 / 保存 / 统计）
+        for b in range(batch_imgs):
             cls_name = class_names[b]
-            # get prediction for sample
-            pm = pred_masks[b]  # shape: (C,H,W) or (1,H,W)
-            gm = gt[b]  # shape: (1,H,W)
+            prompts_b = prompt_lists[b] if prompt_lists else []
+            prompts_b = prompts_b if isinstance(prompts_b, list) else [prompts_b]
 
-            # combine multi-channel masks (OR across channels)
+            pm = pred_masks[b]  # (C,H,W) or (1,H,W)
+            gm = gt[b]  # (1,H,W)
+
+            # 将多通道合并到单个布尔 mask (OR across channels)
             if pm.dim() == 3 and pm.shape[0] > 1:
                 pm_bin = (pm > 0.5).float()
                 pm_comb = pm_bin.max(dim=0).values  # (H,W)
             else:
-                # single channel
                 if pm.dim() == 3:
                     pm_single = pm.squeeze(0)
                 else:
@@ -355,13 +367,13 @@ def run_inference(args):
 
             # compute metrics
             metrics = safe_binary_metrics(pm_comb, gm_single)
-            iou = metrics["iou"][0]
-            dice = metrics["dice"][0]
-            prec = metrics["precision"][0]
-            rec = metrics["recall"][0]
-            f1 = metrics["f1"][0]
+            iou = float(metrics["iou"][0])
+            dice = float(metrics["dice"][0])
+            prec = float(metrics["precision"][0])
+            rec = float(metrics["recall"][0])
+            f1 = float(metrics["f1"][0])
 
-            # accumulate global
+            # accumulate global sums
             global_stats["iou_sum"] += iou
             global_stats["dice_sum"] += dice
             global_stats["prec_sum"] += prec
@@ -369,7 +381,7 @@ def run_inference(args):
             global_stats["f1_sum"] += f1
             global_stats["img_count"] += 1
 
-            # per-class
+            # accumulate per-class
             per_class_stats[cls_name]["iou_sum"] += iou
             per_class_stats[cls_name]["dice_sum"] += dice
             per_class_stats[cls_name]["prec_sum"] += prec
@@ -377,119 +389,87 @@ def run_inference(args):
             per_class_stats[cls_name]["f1_sum"] += f1
             per_class_counts[cls_name] += 1
 
-        # visualization / save frames (same as original)
-        # visualization / save frames (rank by confidence, keep top-k, display prompt scores)
-        for b in range(pred_masks.shape[0]):
-            cls_name = class_names[b]
-            prompts_b = prompt_lists[b] if prompt_lists else []
-            prompts_b = prompts_b if isinstance(prompts_b, list) else [prompts_b]
-            prompt_text = "_".join(prompts_b) if prompts_b else "prompt"
-            sample_dir = os.path.join(args.output_dir, cls_name)
-            os.makedirs(sample_dir, exist_ok=True)
+            # --- 可视化: 排序 top_k + 阈值过滤（保持你之前的展示） ---
+            # build candidates (channel-wise or single channel)
+            masks_list = []
+            prompts_for_candidates = []
+            scores = []
 
-            img_pil = to_pil(images[b].cpu())
-            mask_np = pred_masks[b].squeeze().cpu().numpy()  # probabilities (0..1)
-
-            # Build per-prompt masks and scores
-            if mask_np.ndim == 2:
-                # single channel -> treat as one candidate
-                masks_list = [mask_np]
-                prompts_list = prompts_b if prompts_b else ["prompt"]
-                scores = [float(mask_np.mean())]
-            else:
-                # multi-channel: channel dim = number of candidates
-                C = mask_np.shape[0]
-                masks_list = [mask_np[i] for i in range(C)]
-                # if prompts_b provided and length matches channel count, use it; otherwise fallback
+            if pm.dim() == 3 and pm.shape[0] > 1:
+                C = pm.shape[0]
+                for c in range(C):
+                    m = pm[c].detach().cpu().numpy()
+                    masks_list.append(m)
                 if prompts_b and len(prompts_b) == C:
-                    prompts_list = prompts_b
+                    prompts_for_candidates = prompts_b
                 else:
-                    prompts_list = prompts_b if prompts_b else [f"c{i}" for i in range(C)]
-                scores = [float(m.mean()) for m in masks_list]
+                    if prompts_b:
+                        prompts_for_candidates = (prompts_b * ((C // len(prompts_b)) + 1))[:C]
+                    else:
+                        prompts_for_candidates = [f"c{i}" for i in range(C)]
+                scores = [float(np.mean(m)) for m in masks_list]
+            else:
+                if pm.dim() == 3:
+                    pm_single = pm.squeeze(0)
+                else:
+                    pm_single = pm
+                m = pm_single.detach().cpu().numpy()
+                masks_list = [m]
+                prompts_for_candidates = [prompts_b[0] if prompts_b else "prompt"]
+                scores = [float(np.mean(m))]
 
-            # Filter out candidates below confidence threshold
+            # filter and top_k
             conf_thresh = getattr(args, "conf_thresh", 0.3)
             candidates = []
-            for i, (s, m, p) in enumerate(zip(scores, masks_list, prompts_list)):
+            for s, m, p in zip(scores, masks_list, prompts_for_candidates):
                 if s >= conf_thresh:
                     candidates.append((s, m, p))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                top_k = getattr(args, "top_k", 5)
+                candidates = candidates[:top_k]
 
-            # If no candidates -> save original image as fallback (same behavior as original)
-            if not candidates:
-                filename = None
-                try:
-                    entry = loader.dataset.entries[sample_idx + b]
-                    raw_img_path = entry.img_path
-                except Exception:
-                    raw_img_path = os.path.basename(f"{cls_name}_{idx}.png")
-                norm_path = raw_img_path.replace("\\", "/")
-                parts = norm_path.split("/")
-                if len(parts) >= 2:
-                    defect = parts[-2]
-                    base_name = os.path.splitext(parts[-1])[0]
-                    filename = f"{defect}_{base_name}.png"
-                else:
-                    filename = os.path.basename(norm_path)
-                out_path = os.path.join(sample_dir, filename)
-                img_pil.save(out_path)
-                idx += 1
-                continue
+                masks_stack = np.stack([(c[1] > 0.5) for c in candidates])
+                prompts_for_color = [c[2] for c in candidates]
+                scores_for_prompt = [c[0] for c in candidates]
 
-            # Sort by confidence and keep top-k
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            top_k = getattr(args, "top_k", 5)
-            candidates = candidates[:top_k]
+                colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
+                img_pil = to_pil(images[b].cpu())
+                frame = np.array(img_pil.convert("RGB"), dtype=np.uint8)
+                frame = draw_masks_to_frame(frame, masks_stack.astype(bool), colors)
+                overlay_pil = Image.fromarray(frame)
 
-            # Build masks_stack and prompt/color lists from selected candidates
-            masks_stack = np.stack([(c[1] > 0.5) for c in candidates])  # (K,H,W)
-            prompts_for_color = [c[2] for c in candidates]
-            scores_for_prompt = [c[0] for c in candidates]
+                # legend
+                draw = ImageDraw.Draw(overlay_pil)
+                row_h = 12
+                box_w = 10
+                pad = 4
+                legend_items = []
+                max_w = 0
+                for p, s in zip(prompts_for_color, scores_for_prompt):
+                    text = f"{p} ({s:.2f})"
+                    bbox = font.getbbox(text)
+                    w = bbox[2] - bbox[0]
+                    max_w = max(max_w, w)
+                    legend_items.append((text, w))
+                legend_h = row_h * len(prompts_for_color) + pad * 2
+                legend_w = box_w + 4 + max_w + pad * 2
+                legend_x = 5
+                legend_y = overlay_pil.height - legend_h - 5
+                draw.rectangle([legend_x, legend_y, legend_x + legend_w, legend_y + legend_h], fill=(0, 0, 0))
+                for i_, (text, _) in enumerate(legend_items):
+                    color = get_color_map(palette, prompts_for_color[i_])
+                    y = legend_y + pad + i_ * row_h
+                    draw.rectangle([legend_x + pad, y, legend_x + pad + box_w, y + box_w], fill=color)
+                    draw.text((legend_x + pad + box_w + 4, y - 2), text, fill=(255, 255, 255), font=font)
+            else:
+                # no candidate above threshold: just use the original image as overlay_pil
+                overlay_pil = to_pil(images[b].cpu())
 
-            colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
-            frame = np.array(img_pil.convert("RGB"), dtype=np.uint8)
-            frame = draw_masks_to_frame(frame, masks_stack.astype(bool), colors)
-            overlay_pil = Image.fromarray(frame)
-
-            # legend bottom-left with prompt text + confidence
-            draw = ImageDraw.Draw(overlay_pil)
-            row_h = 12
-            box_w = 10
-            pad = 4
-            legend_items = []
-            max_w = 0
-            # show prompt + score e.g. "crack (0.87)"
-            for p, s in zip(prompts_for_color, scores_for_prompt):
-                text = f"{p} ({s:.2f})"
-                bbox = font.getbbox(text)
-                w = bbox[2] - bbox[0]
-                max_w = max(max_w, w)
-                legend_items.append((text, w))
-            legend_h = row_h * len(prompts_for_color) + pad * 2
-            legend_w = box_w + 4 + max_w + pad * 2
-            legend_x = 5
-            legend_y = overlay_pil.height - legend_h - 5
-            draw.rectangle(
-                [legend_x, legend_y, legend_x + legend_w, legend_y + legend_h],
-                fill=(0, 0, 0),
-            )
-            for i, (text, _) in enumerate(legend_items):
-                color = get_color_map(palette, prompts_for_color[i])
-                y = legend_y + pad + i * row_h
-                draw.rectangle(
-                    [legend_x + pad, y, legend_x + pad + box_w, y + box_w],
-                    fill=color,
-                )
-                draw.text(
-                    (legend_x + pad + box_w + 4, y - 2),
-                    text,
-                    fill=(255, 255, 255),
-                    font=font,
-                )
-
-            # 保存文件名（保持方案 B 的命名规则）
+            # --- 文件名生成（使用 dataset.entries 对齐） ---
             try:
                 entry = loader.dataset.entries[sample_idx + b]
-                raw_img_path = entry.img_path  # e.g. "bottle/test/broken_large/008.png"
+                raw_img_path = entry.img_path
             except Exception:
                 raw_img_path = os.path.basename(f"{cls_name}_{idx}.png")
 
@@ -497,43 +477,60 @@ def run_inference(args):
             parts = norm_path.split("/")
             if len(parts) >= 2:
                 defect = parts[-2]
-                base_name = os.path.splitext(parts[-1])[0]  # 去掉后缀
+                base_name = os.path.splitext(parts[-1])[0]
                 filename = f"{defect}_{base_name}.png"
             else:
                 filename = os.path.basename(norm_path)
 
+            sample_dir = os.path.join(args.output_dir, cls_name)
+            os.makedirs(sample_dir, exist_ok=True)
             overlay_path = os.path.join(sample_dir, filename)
-            overlay_pil.save(overlay_path)
+            try:
+                overlay_pil.save(overlay_path)
+            except Exception:
+                # fallback: save via BytesIO to avoid PIL blocking on some systems
+                import io
+                buf = io.BytesIO()
+                overlay_pil.save(buf, format="PNG")
+                with open(overlay_path, "wb") as f:
+                    f.write(buf.getvalue())
             idx += 1
 
-        # 处理完当前 batch 后，推进 sample_idx（下一个 batch 将从这里继续）
-        sample_idx += images.size(0)
+        # end of batch: advance sample_idx and update progress bar + fps
+        sample_idx += batch_imgs
+        # update pbar by number of images processed
+        pbar.update(batch_imgs)
+        # show realtime fps (images/sec)
+        fps = (total_imgs / total_time) if total_time > 0 else 0.0
+        # Use compact postfix to avoid heavy formatting cost
+        pbar.set_postfix({"imgs": int(total_imgs), "fps": f"{fps:.2f}"})
 
-        # progress bar update
-        speed = total_imgs / total_time if total_time > 0 else 0.0
-        avg_dice = global_stats["dice_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
-        avg_iou = global_stats["iou_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
-        pbar.set_postfix(imgs=total_imgs, fps=speed, dice=avg_dice, iou=avg_iou)
+    # finished all batches: close pbar
+    pbar.close()
 
-    # final summary
-    final_speed = total_imgs / total_time if total_time > 0 else 0.0
-    final_dice = global_stats["dice_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
-    final_iou = global_stats["iou_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
-    final_prec = global_stats["prec_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
-    final_rec = global_stats["rec_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
-    final_f1 = global_stats["f1_sum"] / global_stats["img_count"] if global_stats["img_count"] > 0 else 0.0
+    # final summary: per-class averages
+    final_img_count = int(global_stats.get("img_count", 0))
+    final_speed = (total_imgs / total_time) if total_time > 0 else 0.0
+    final_dice = (global_stats["dice_sum"] / final_img_count) if final_img_count > 0 else 0.0
+    final_iou = (global_stats["iou_sum"] / final_img_count) if final_img_count > 0 else 0.0
+    final_prec = (global_stats["prec_sum"] / final_img_count) if final_img_count > 0 else 0.0
+    final_rec = (global_stats["rec_sum"] / final_img_count) if final_img_count > 0 else 0.0
+    final_f1 = (global_stats["f1_sum"] / final_img_count) if final_img_count > 0 else 0.0
 
     print(f"[INFO] Inference done. images={total_imgs}, fps={final_speed:.2f}, avg_dice={final_dice:.4f}, avg_iou={final_iou:.4f}, precision={final_prec:.4f}, recall={final_rec:.4f}, f1={final_f1:.4f}")
 
     # per-class breakdown
     print("\nPer-class summary:")
     for cls, cnt in per_class_counts.items():
+        if cnt == 0:
+            continue
         iou = per_class_stats[cls]["iou_sum"] / cnt
         dice = per_class_stats[cls]["dice_sum"] / cnt
         prec = per_class_stats[cls]["prec_sum"] / cnt
         rec = per_class_stats[cls]["rec_sum"] / cnt
         f1 = per_class_stats[cls]["f1_sum"] / cnt
         print(f"  {cls}: n={cnt}, dice={dice:.4f}, iou={iou:.4f}, prec={prec:.4f}, rec={rec:.4f}, f1={f1:.4f}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("MSAM test")
