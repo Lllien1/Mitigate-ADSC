@@ -496,6 +496,14 @@ def main(args: argparse.Namespace):
     MASK_DOWNSAMPLE = int(args.mask_downsample)
     NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image)
 
+    with open(args.meta_path, 'r') as f:
+        meta = json.load(f)
+    if isinstance(meta, dict):
+        class_list = sorted(list(meta.get('classes', meta.get('class_list', meta.keys()))))
+    else:
+        class_list = list(meta)
+    args.class_list = class_list
+
     if args.use_official:
         model = FineTuneSAM3Official(
             bpe_path=args.bpe_path,
@@ -511,6 +519,9 @@ def main(args: argparse.Namespace):
             # parallel_lora_alpha=args.parallel_lora_alpha,
             # ----- new: for parallel lora -----
             device=device,
+            class_list=args.class_list,
+            prompt_learner_type='perclass',
+            num_templates=getattr(args, "num_templates", 4),
         )
     else:
         model = FineTuneSAM3(
@@ -579,7 +590,8 @@ def main(args: argparse.Namespace):
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "lora" in n or "prompt_learner" in n:
+        nl = n.lower()
+        if ("lora" in nl) or ("prompt" in nl) or ("template" in nl) or ("out_adapter" in nl):
             prompt_and_lora.append(p)
         else:
             other_params.append(p)
@@ -642,7 +654,7 @@ def main(args: argparse.Namespace):
 
             # ===== AMP autocast: forward + loss 计算都放在半精度上下文 =====
             with autocast(enabled=(device.type == "cuda")):
-                out = model(images, prompt_lists)
+                out = model(images, prompt_lists, class_names)
                 pred_masks = out["pred_masks"]
                 if pred_masks is None:
                     raise RuntimeError("Segmentation head did not return pred_masks.")

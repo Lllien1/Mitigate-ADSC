@@ -144,7 +144,15 @@ def load_model(args, device):
     # In load_model or where you call Constructor:
     Constructor = FineTuneSAM3Official if args.use_official else FineTuneSAM3
     # pass through class_list to prompt learner init, e.g.,
-    model = Constructor(..., class_list=args.class_list, prompt_learner_type='perclass', num_templates=4)
+    ctor_kwargs = _filter_kwargs_for_callable(Constructor, common_kwargs)
+    # add class_list & perclass args explicitly
+    ctor_kwargs.update({
+        "class_list": args.class_list,
+        "prompt_learner_type": "perclass",
+        "num_templates": getattr(args, "num_templates", 4),
+        "n_ctx": getattr(args, "n_ctx", 4),
+    })
+    model = Constructor(**ctor_kwargs)
 
     # load base sam3 if needed (non-official)
     if not args.use_official and args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
@@ -315,7 +323,7 @@ def run_inference(args):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
-        out = model(images, prompt_lists)
+        out = model(images, prompt_lists, class_names)
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
