@@ -991,31 +991,49 @@ def main(args: argparse.Namespace):
                 # ====== END DEBUG BLOCK ======
 
 
-                # matched branch — compute on downsampled masks to save memory
+                # ---------- matched branch: gather matched preds and GT, then compute losses ----------
                 if tgt_idx is None or tgt_idx.numel() == 0:
                     loss_focal = torch.tensor(0.0, device=device)
                     loss_dice = torch.tensor(0.0, device=device)
                 else:
-                    # pred_matched and tgt_matched as before (M, MD, MD)
-                    # COMPUTE FOCAL per-pixel map, then per-mask average
-                    loss_map = sam_sigmoid_focal_loss(pred_matched_ds, tm_ds, num_boxes,
-                                                      alpha=0.25, gamma=2.0,
-                                                      loss_on_multimask=False, triton=False,
-                                                      reduce=False)  # (M, MD, MD)
+                    # 1) Gather matched predicted masks (from pred_masks_ds) and matched GT masks (from targets)
+                    # pred_masks_ds: (B, Q, MD, MD)
+                    # batch_idx, src_idx, tgt_idx are 1D tensors (M,)
+                    pred_matched_ds = pred_masks_ds[batch_idx, src_idx]  # (M, MD, MD)
                 
-                    # per-mask mean (over pixels)
-                    per_mask = loss_map.mean(dim=(1,2))  # (M,)
+                    # targets["segments"] is flattened G x H x W in full resolution; pick tgt_idx and downsample to MASK_DOWNSAMPLE
+                    tgt_masks_flat = targets["segments"][tgt_idx]  # (M, H, W) or (M,1,H,W)
+                    if tgt_masks_flat.dim() == 4:
+                        tgt_masks_flat = tgt_masks_flat.squeeze(1)  # -> (M, H, W)
+                    # downsample GT with nearest (binary -> soft nearest preserves positive pixels)
+                    tm_ds = F.interpolate(tgt_masks_flat.unsqueeze(1).float(), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                          mode="nearest").squeeze(1)  # (M, MD, MD)
                 
-                    # sum over matched masks, then normalize by number of boxes
-                    loss_focal = per_mask.sum() / max(1.0, float(num_boxes))
+                    # 2) number used for normalization (scalar)
+                    num_boxes = float(max(1.0, src_idx.numel()))  # matches in the batch; safe >0
                 
-                    # dice: do similar per-mask averaging if you want
-                    loss_dice_map = sam_dice_loss(pred_matched_ds, tm_ds, num_boxes,
-                                                  loss_on_multimask=False, reduce=False)
-                    loss_dice = loss_dice_map.mean(dim=(1,2)).sum() / max(1.0, float(num_boxes))
-
+                    # 3) compute focal per-pixel map (reduce=False returns per-pixel loss map with same spatial dims)
+                    loss_map = sam_sigmoid_focal_loss(
+                        pred_matched_ds, tm_ds, num_boxes,
+                        alpha=0.25, gamma=2.0,
+                        loss_on_multimask=False, triton=False,
+                        reduce=False
+                    )  # shape (M, MD, MD)  => per-pixel loss for each matched mask
+                
+                    # per-mask mean over pixels
+                    per_mask = loss_map.mean(dim=(1, 2))  # (M,)
+                    # final focal: sum per-mask averages, divided by number of boxes (same convention as original)
+                    loss_focal = per_mask.sum() / max(1.0, num_boxes)
+                
+                    # 4) dice: compute per-pixel dice map then same averaging
+                    loss_dice_map = sam_dice_loss(
+                        pred_matched_ds, tm_ds, num_boxes,
+                        loss_on_multimask=False, reduce=False
+                    )  # (M, MD, MD)
+                    loss_dice = loss_dice_map.mean(dim=(1, 2)).sum() / max(1.0, num_boxes)
+                
                     # -------------------------
-                    # background/unmatched loss (sample K negatives per image), compute on downsampled masks
+                    # background/unmatched loss (sample K negatives per image), unchanged logic
                     loss_focal_bg = torch.tensor(0.0, device=device)
                     loss_dice_bg = torch.tensor(0.0, device=device)
                     total_bg_samples = 0.0
@@ -1028,37 +1046,37 @@ def main(args: argparse.Namespace):
                             mask_un = torch.ones_like(all_q, dtype=torch.bool)
                             mask_un[src_q] = False
                             unmatched_q = all_q[mask_un]
-
+                
                         if unmatched_q.numel() == 0:
                             continue
                         
                         k = min(NEG_SAMPLES_PER_IMAGE, int(unmatched_q.numel()))
                         perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
                         sampled_unmatched_q = unmatched_q[perm]
-
-                        preds_bg_ds = pred_masks_ds[b, sampled_unmatched_q]  # already (k, MD, MD)
-                        
-                        # Downsample to save memory
+                
+                        preds_bg_ds = pred_masks_ds[b, sampled_unmatched_q]  # (k, MD, MD)
+                
+                        # Downsample to save memory (if needed) — but pred_masks_ds already MD sized; keep as is or resample
                         if preds_bg_ds.dim() == 3:
                             preds_bg_ds = F.interpolate(preds_bg_ds.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
                                                         mode="bilinear", align_corners=False).squeeze(1)
-                        else:
-                            preds_bg_ds = preds_bg_ds
-
+                
                         zeros = torch.zeros_like(preds_bg_ds)
-
+                
                         nb = float(sampled_unmatched_q.numel())
+                        # here we keep reduce=True for bg as original: returns scalar per call (matching original scaling)
                         loss_focal_bg += sam_sigmoid_focal_loss(preds_bg_ds, zeros, nb, alpha=0.25, gamma=2.0,
                                                                 loss_on_multimask=False, triton=False)
                         loss_dice_bg += sam_dice_loss(preds_bg_ds, zeros, nb, loss_on_multimask=False, reduce=True)
                         total_bg_samples += nb
-
+                
                     if total_bg_samples > 0:
                         loss_focal_bg = loss_focal_bg / (total_bg_samples / float(pred_masks.shape[0]))
                         loss_dice_bg = loss_dice_bg / (total_bg_samples / float(pred_masks.shape[0]))
-
+                
                     loss_focal = loss_focal + 0.5 * loss_focal_bg
                     loss_dice = loss_dice + 0.5 * loss_dice_bg
+
 
 
                         
