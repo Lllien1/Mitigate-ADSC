@@ -181,6 +181,7 @@ class FineTuneSAM3Official(nn.Module):
         self.hidden_dim = self.transformer.d_model
         self.num_feature_levels = full_model.num_feature_levels
 
+
         # parallel LoRA injection (keep existing)
         if enable_parallel_lora:
             from sam3.model.vitdet import Attention
@@ -264,7 +265,7 @@ class FineTuneSAM3Official(nn.Module):
         vis_feats = backbone_out["backbone_fpn"][-self.num_feature_levels :]
         vis_pos = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
         vis_feat_sizes = [x.shape[-2:] for x in vis_pos]
-    
+
         # ---------- handle prompt learner with optional class_names ----------
         if class_names is not None and hasattr(self, "prompt_learner"):
             # map class_names to indices using prompt_learner.class_to_idx (safe get)
@@ -273,11 +274,11 @@ class FineTuneSAM3Official(nn.Module):
         else:
             prompt_seq, prompt_mask = self.prompt_learner(prompt_lists, device=self.device)
         prompt_pos = torch.zeros_like(prompt_seq)
-    
+
         # prepare image features for encoder
         img_feats = [x.flatten(2).permute(2, 0, 1) for x in vis_feats]
         img_pos = [x.flatten(2).permute(2, 0, 1) for x in vis_pos]
-    
+
         memory = self.transformer.encoder(
             src=img_feats.copy(),
             src_key_padding_mask=None,
@@ -288,7 +289,7 @@ class FineTuneSAM3Official(nn.Module):
             feat_sizes=vis_feat_sizes,
             encoder_extra_kwargs=None,
         )
-    
+
         bs = images.shape[0]
         tgt = self.transformer.decoder.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         hs, reference_boxes, dec_presence_out, dec_presence_feats = self.transformer.decoder(
@@ -305,7 +306,7 @@ class FineTuneSAM3Official(nn.Module):
             text_attention_mask=prompt_mask,
         )
         hs = hs.permute(0, 2, 1, 3).contiguous()
-    
+
         seg_out = self.segmentation_head(
             backbone_feats=vis_feats,
             obj_queries=hs,
@@ -314,7 +315,7 @@ class FineTuneSAM3Official(nn.Module):
             prompt=prompt_seq,
             prompt_mask=prompt_mask,
         )
-    
+
         # Build return dict. Include prompt_seq (L,B,W) for align loss.
         out = {
             "pred_masks": seg_out.get("pred_masks"),
@@ -326,7 +327,7 @@ class FineTuneSAM3Official(nn.Module):
             # return prompt_seq so training can extract prototype via prompt_seq[-1]
             "prompt_seq": prompt_seq,
         }
-    
+
         # Try to attach a spatial decoder feature map for mask-embedding pooling:
         # Preferred: if segmentation_head returns a mask feature map, use it.
         # Fallback: use backbone top-level feature vis_feats[0] (B,C,H,W).
@@ -336,7 +337,7 @@ class FineTuneSAM3Official(nn.Module):
             if key in seg_out and seg_out.get(key) is not None:
                 decoder_feat = seg_out.get(key)
                 break
-            
+
         if decoder_feat is None:
             # fallback to backbone feature (first FPN level)
             # ensure vis_feats[0] is in (B,C,H,W); if it's list, pick first
@@ -344,8 +345,8 @@ class FineTuneSAM3Official(nn.Module):
                 decoder_feat = vis_feats[0]
             except Exception:
                 decoder_feat = None
-    
+
         out["decoder_features"] = decoder_feat  # may be None if unavailable
-    
+
         return out
 

@@ -27,6 +27,8 @@ import numpy as np
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
+import json
+
 
 def setup_distributed(args):
     """
@@ -1246,6 +1248,11 @@ def main(args: argparse.Namespace):
                             # create or reuse a small linear projector on model_core to map dims
                             if not hasattr(model_core, "_align_proj"):
                                 model_core._align_proj = nn.Linear(Dm, Dp).to(device)
+                                optimizer.add_param_group({
+                                    "params": model_core._align_proj.parameters(),
+                                    "lr": args.lr_main,       # 也可以专门设一个 lr，如 args.lr_align（如果需要）
+                                    "weight_decay": 0.0
+                                })
                             mask_embed = model_core._align_proj(mask_embed)
 
                     # L2 normalize and compute symmetric InfoNCE
@@ -1425,10 +1432,13 @@ if __name__ == "__main__":
     parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
     parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
     parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
+
     #--------------- Diagnostic logging args ---------------
     parser.add_argument("--log_freq", type=int, default=100, help="Logging frequency (steps) for align diagnostics")
     parser.add_argument("--tsne_freq", type=int, default=500, help="TSNE save frequency (steps)")
     parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
+
+    
 
     args = parser.parse_args()
     main(args)
