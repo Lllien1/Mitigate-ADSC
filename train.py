@@ -351,6 +351,34 @@ def contrastive_loss_from_pooled(v: torch.Tensor, t: torch.Tensor, temp: float =
     return 0.5 * (loss_v2t + loss_t2v)
 
 
+def supervised_contrastive_loss(
+    anchor: torch.Tensor, positive: torch.Tensor, pos_mask: torch.Tensor, temp: float = 0.07, eps: float = 1e-6
+):
+    """Multi-positive supervised contrastive loss.
+
+    anchor, positive: (B, D)
+    pos_mask: (B, B) binary mask where pos_mask[i, j] = 1 marks j as a positive for anchor i (diagonal included).
+    """
+
+    assert anchor.dim() == 2 and positive.dim() == 2
+    assert anchor.shape == positive.shape
+    assert pos_mask.shape[0] == pos_mask.shape[1] == anchor.shape[0]
+
+    anchor = F.normalize(anchor, dim=-1)
+    positive = F.normalize(positive, dim=-1)
+    pos_mask = pos_mask.float()
+
+    logits = (anchor @ positive.t()) / temp  # (B, B)
+    logits = logits - logits.max(dim=1, keepdim=True).values  # numerical stability
+    exp_logits = torch.exp(logits)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + eps)
+
+    pos_counts = pos_mask.sum(dim=1).clamp(min=1.0)
+    mean_log_prob_pos = (pos_mask * log_prob).sum(dim=1) / pos_counts
+    loss = -mean_log_prob_pos.mean()
+    return loss
+
+
 
 def pairwise_iou(preds_sigmoid: torch.Tensor, gts: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Compute pairwise IoU between Q preds and G GT masks on CPU."""
@@ -882,6 +910,7 @@ def main(args: argparse.Namespace):
                 targets_num_boxes = targets["num_boxes"].tolist()  # list of ints
                 out["indices"] = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device, targets_num_boxes=targets_num_boxes)
                 indices = out["indices"]  # local alias for later loops
+                indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
 
                 # --- end matcher robust handling ---
                 
@@ -897,14 +926,13 @@ def main(args: argparse.Namespace):
                     print("DBG targets num_boxes:", targets["num_boxes"].tolist())
                 
                     # 2) matcher raw shapes
-                    print("DBG matcher raw shapes:", 
+                    print("DBG matcher raw shapes:",
                           "batch_idx", None if batch_idx is None else tuple(batch_idx.shape),
                           "src_idx", None if src_idx is None else tuple(src_idx.shape),
                           "tgt_idx", None if tgt_idx is None else tuple(tgt_idx.shape))
-                
+
                     # 3) matched per image (use convert helper)
-                    indices_tmp = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
-                    print("DBG matched per image:", [int(s.shape[0]) for s, _ in indices_tmp])
+                    print("DBG matched per image:", [int(s.shape[0]) for s, _ in indices_per_image])
                 
                     # 4) model outputs stats
                     print("DBG pred_masks shape:", pred_masks.shape, "mean/std:", float(pred_masks.mean().item()), float(pred_masks.std().item()))
@@ -1155,9 +1183,6 @@ def main(args: argparse.Namespace):
                     # build presence target matrix (B, Q)
                     presence_targets = torch.zeros_like(presence_logit, dtype=torch.float32, device=device)
 
-                    # get indices per image using our helper (already computed into 'indices' local alias)
-                    indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
-
                     # Defensive assignment: filter out-of-range indices and print diagnostics
                     Q_dim = presence_targets.shape[1]
                     for b in range(images.shape[0]):
@@ -1185,7 +1210,7 @@ def main(args: argparse.Namespace):
 
 
                 # -------------------------
-                # Contrastive alignment (InfoNCE) between visual pooled vector and prompt prototype
+                # Contrastive alignment (multi-positive) between visual pooled vector and prompt prototype
                 align_loss = torch.tensor(0.0, device=device)
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
                     # Prefer prompt_seq from model output if available
@@ -1216,8 +1241,46 @@ def main(args: argparse.Namespace):
                         else:
                             prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
 
+                    # Prepare decoder hidden states for query-level alignment
+                    hs_last = None
+                    decoder_hs_raw = out.get("decoder_hs", None)
+                    if decoder_hs_raw is not None:
+                        try:
+                            hs_last = decoder_hs_raw
+                            if hs_last.dim() == 4:
+                                hs_last = hs_last[-1]
+                            if hs_last.dim() == 3 and hs_last.shape[0] == Q and hs_last.shape[1] == B:
+                                hs_last = hs_last.permute(1, 0, 2).contiguous()
+                            if hs_last.dim() != 3:
+                                hs_last = None
+                        except Exception as e:
+                            print("[WARN] decoder_hs normalization failed:", e)
+                            hs_last = None
+
+                    # Build semantic positive mask by grouping identical prompts / classes / anomaly flags
+                    pos_mask = torch.eye(B, device=device)
+                    try:
+                        anomaly_flags = (
+                            is_anomaly.tolist() if torch.is_tensor(is_anomaly) else list(is_anomaly)
+                        )
+                        groups = {}
+                        for idx in range(B):
+                            prompt_key = "|".join(prompt_lists[idx]) if prompt_lists else ""
+                            cls_key = class_names[idx] if class_names else ""
+                            prefix = "defect" if anomaly_flags[idx] else "normal"
+                            key = f"{prefix}::{cls_key}::{prompt_key}"
+                            groups.setdefault(key, []).append(idx)
+                        pos_mask = torch.zeros((B, B), device=device)
+                        for ids in groups.values():
+                            idx_tensor = torch.tensor(ids, device=device, dtype=torch.long)
+                            pos_mask[idx_tensor.unsqueeze(1), idx_tensor.unsqueeze(0)] = 1.0
+                    except Exception as e:
+                        print("[WARN] building positive mask failed:", e)
+                        pos_mask = torch.eye(B, device=device)
+
                     # Build mask embedding using preferred decoder spatial features, fallback to decoder_hs pooling
                     mask_embed = None
+                    bg_embed = None
                     decoder_feat = out.get("decoder_features", None)
                     if decoder_feat is not None:
                         # expected decoder_feat shape (B, C, Hf, Wf)
@@ -1230,33 +1293,60 @@ def main(args: argparse.Namespace):
                             pos_counts = mask_flat.sum(dim=1).clamp(min=1.0).to(device)
                             mask_sum = (feat * mask_flat).sum(dim=1)  # (B,C)
                             mask_embed = mask_sum / pos_counts  # (B,C)
+
+                            bg_flat = (1.0 - mask_flat).clamp(min=0.0)
+                            bg_counts = bg_flat.sum(dim=1).clamp(min=1.0).to(device)
+                            bg_sum = (feat * bg_flat).sum(dim=1)
+                            bg_embed = bg_sum / bg_counts
                         except Exception as e:
                             print("[WARN] decoder_features pooling failed:", e)
                             mask_embed = None
+                            bg_embed = None
 
-                    if mask_embed is None:
+                    if mask_embed is None or bg_embed is None:
                         # fallback to decoder_hs (pooled over queries)
-                        decoder_hs = out.get("decoder_hs", None)
-                        if decoder_hs is not None:
+                        if hs_last is not None:
                             try:
-                                hs_last = decoder_hs
-                                # if hs_last is (L,B,Q,D) get last L and ensure shape (B,Q,D)
-                                if hs_last.dim() == 4:
-                                    hs_last = hs_last[-1]  # -> (B,Q,D) or (Q,B,D)
-                                if hs_last.dim() == 3 and hs_last.shape[0] == Q and hs_last.shape[1] == B:
-                                    hs_last = hs_last.permute(1, 0, 2).contiguous()
-                                # pool across queries
-                                v_pooled = hs_last.mean(dim=1)  # (B, D)
-                                mask_embed = v_pooled
+                                pos_list = []
+                                bg_list = []
+                                for b in range(B):
+                                    src_q, _ = indices_per_image[b]
+                                    src_q = src_q.to(device).long()
+                                    if src_q.numel() > 0:
+                                        pos_feat = hs_last[b, src_q].mean(dim=0)
+                                        pos_list.append(pos_feat)
+
+                                        if src_q.numel() < hs_last.shape[1]:
+                                            neg_mask = torch.ones(hs_last.shape[1], device=device, dtype=torch.bool)
+                                            neg_mask[src_q] = False
+                                            bg_candidates = hs_last[b, neg_mask]
+                                            if bg_candidates.numel() > 0:
+                                                bg_list.append(bg_candidates.mean(dim=0))
+                                            else:
+                                                bg_list.append(hs_last[b].mean(dim=0))
+                                        else:
+                                            bg_list.append(hs_last[b].mean(dim=0))
+                                    else:
+                                        pooled = hs_last[b].mean(dim=0)
+                                        pos_list.append(pooled)
+                                        bg_list.append(pooled)
+
+                                if mask_embed is None:
+                                    mask_embed = torch.stack(pos_list, dim=0)
+                                if bg_embed is None:
+                                    bg_embed = torch.stack(bg_list, dim=0)
                             except Exception as e:
                                 print("[WARN] decoder_hs pooling failed:", e)
                                 mask_embed = None
+                                bg_embed = None
 
                     # If still None, fallback to zeros to avoid crash
                     if mask_embed is None:
                         mask_embed = torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)
+                    if bg_embed is None:
+                        bg_embed = torch.zeros_like(mask_embed)
 
-                    # Ensure dim match: project mask_embed to prompt_proto dim if necessary
+                    # Ensure dim match: project mask_embed/bg_embed to prompt_proto dim if necessary
                     if prompt_proto is not None:
                         Dp = prompt_proto.shape[1]
                         Dm = mask_embed.shape[1]
@@ -1270,8 +1360,8 @@ def main(args: argparse.Namespace):
                                     "weight_decay": 0.0
                                 })
                             mask_embed = model_core._align_proj(mask_embed)
+                            bg_embed = model_core._align_proj(bg_embed)
 
-                    # L2 normalize and compute symmetric InfoNCE
                     if prompt_proto is None:
                         # can't compute align: leave zero
                         align_loss = torch.tensor(0.0, device=device)
@@ -1279,14 +1369,70 @@ def main(args: argparse.Namespace):
                         p_norm = F.normalize(prompt_proto, dim=1)
                         m_norm = F.normalize(mask_embed, dim=1)
 
-                        # use helper contrastive_loss_from_pooled (already defined in file)
+                        align_components = []
                         try:
-                            align_loss = contrastive_loss_from_pooled(p_norm, m_norm, temp=args.align_temp)
+                            align_components.append(supervised_contrastive_loss(p_norm, m_norm, pos_mask, temp=args.align_temp))
                         except Exception as e:
-                            # fallback compute manual symmetric nce
-                            logits = (p_norm @ m_norm.t()) / float(args.align_temp)
-                            labels_local = torch.arange(B, device=device)
-                            align_loss = 0.5 * (F.cross_entropy(logits, labels_local) + F.cross_entropy(logits.t(), labels_local))
+                            print("[WARN] supervised contrastive failed:", e)
+
+                        # query-level alignment and query selection
+                        if hs_last is not None:
+                            matched_mask = [src_q.numel() > 0 for src_q, _ in indices_per_image]
+                            if any(matched_mask):
+                                matched_indices = torch.tensor(
+                                    [i for i, flag in enumerate(matched_mask) if flag], device=device, dtype=torch.long
+                                )
+                                matched_prompt = p_norm[matched_indices]
+                                matched_queries = torch.stack(
+                                    [hs_last[i, indices_per_image[i][0].to(device).long()].mean(dim=0) for i in matched_indices.tolist()],
+                                    dim=0,
+                                )
+                                pos_mask_subset = pos_mask[matched_indices][:, matched_indices]
+                                try:
+                                    align_components.append(
+                                        supervised_contrastive_loss(
+                                            matched_prompt, matched_queries, pos_mask_subset, temp=args.align_temp
+                                        )
+                                    )
+                                except Exception as e:
+                                    print("[WARN] query-level contrastive failed:", e)
+
+                            select_losses = []
+                            for b in range(B):
+                                src_q, _ = indices_per_image[b]
+                                if src_q.numel() == 0:
+                                    continue
+                                target = src_q[0].to(device).long().clamp(max=hs_last.shape[1] - 1)
+                                logits_q = (p_norm[b : b + 1] @ F.normalize(hs_last[b], dim=-1).t()) / float(args.align_temp)
+                                select_losses.append(F.cross_entropy(logits_q, target.view(1)))
+
+                            if len(select_losses) > 0:
+                                query_select_loss = torch.stack(select_losses).mean()
+                                align_components.append(args.lambda_query_select * query_select_loss)
+
+                        # background anchor: normal prompts pull to bg, defects push away
+                        bg_loss = torch.tensor(0.0, device=device)
+                        if bg_embed is not None:
+                            bg_norm = F.normalize(bg_embed, dim=1)
+                            anomaly_flags = is_anomaly
+                            if not torch.is_tensor(anomaly_flags):
+                                anomaly_flags = torch.tensor(anomaly_flags, device=device)
+                            anomaly_flags = anomaly_flags.view(-1).to(device)
+                            normal_mask = anomaly_flags == 0
+                            defect_mask = anomaly_flags != 0
+                            bg_terms = []
+                            if normal_mask.any():
+                                pos_sim = (p_norm[normal_mask] * bg_norm[normal_mask]).sum(dim=1)
+                                bg_terms.append((1.0 - pos_sim).mean())
+                            if defect_mask.any():
+                                neg_sim = (p_norm[defect_mask] * bg_norm[defect_mask]).sum(dim=1)
+                                bg_terms.append(F.relu(neg_sim - args.bg_margin).mean())
+                            if len(bg_terms) > 0:
+                                bg_loss = torch.stack(bg_terms).mean()
+                                align_components.append(args.lambda_bg * bg_loss)
+
+                        if len(align_components) > 0:
+                            align_loss = sum(align_components)
 
                         # Diagnostics: pos/neg stats and norms (log every args.log_freq steps)
                         if (step % getattr(args, "log_freq", 100)) == 0:
@@ -1437,6 +1583,9 @@ if __name__ == "__main__":
     parser.add_argument("--neg_samples_per_image", type=int, default=50, help="Max negative (unmatched) queries to sample per image for background loss")
     parser.add_argument("--lambda_align", type=float, default=0.1, help="weight for contrastive alignment loss (InfoNCE)")
     parser.add_argument("--align_temp", type=float, default=0.07, help="temperature for contrastive alignment")
+    parser.add_argument("--lambda_query_select", type=float, default=0.5, help="weight for query selection softmax loss")
+    parser.add_argument("--lambda_bg", type=float, default=0.1, help="weight for background anchor alignment")
+    parser.add_argument("--bg_margin", type=float, default=0.2, help="margin to push defect prompts away from background")
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
     parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
