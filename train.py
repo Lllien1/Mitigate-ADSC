@@ -342,59 +342,53 @@ def supervised_contrastive_loss(
 
 
 def query_text_alignment_loss(
-    decoder_hs: torch.Tensor,      # (B, Q, D) decoder hidden states
-    prompt_proto: torch.Tensor,    # (B, D) prompt prototype
-    indices: list,                 # matcher 返回的匹配结果 [(src_q, tgt_q), ...]
-    temp: float = 0.07
+    decoder_hs: torch.Tensor,      
+    prompt_proto: torch.Tensor,    
+    indices: list,                 
+    temp: float = 0.07,
+    selection_weight: float = 0.1  # 新增：降低 selection loss 权重
 ):
-    """
-    Query-Text 对齐损失：
-    1. 对比损失：matched query 应该和 prompt 最相似
-    2. 选择损失：softmax 分类，prompt 应该选中正确的 query
-    
-    这解决了原来只做图级别对齐、没有 query 级别对齐的问题。
-    """
     B, Q, D = decoder_hs.shape
     device = decoder_hs.device
     
-    # 归一化
-    hs_norm = F.normalize(decoder_hs, dim=-1)  # (B, Q, D)
-    p_norm = F.normalize(prompt_proto, dim=-1)  # (B, D)
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    p_norm = F.normalize(prompt_proto, dim=-1)
     
     loss_contrastive = torch.tensor(0.0, device=device)
     loss_selection = torch.tensor(0.0, device=device)
     valid_count = 0
     
+    # 使用更大的温度来软化 selection
+    selection_temp = 0.2  # 比 contrastive temp 更大
+    
     for b in range(B):
         src_q, tgt_q = indices[b]
         
         if src_q.numel() == 0:
-            # 没有匹配的 query（正常图或无GT）
             continue
         
-        # 取第一个匹配的 query（MVTec 通常只有一个 GT）
         matched_q_idx = int(src_q[0].item())
-        
-        # 确保索引在有效范围内
         if matched_q_idx >= Q:
             continue
         
-        # h_matched: (D,)
         h_matched = hs_norm[b, matched_q_idx]
         p = p_norm[b]
         
-        # 计算 matched query 和 prompt 的相似度
+        # Contrastive: 使用原温度
         pos_sim = (h_matched * p).sum() / temp
+        all_sim_contrastive = (hs_norm[b] @ p) / temp
+        loss_contrastive = loss_contrastive - (pos_sim - torch.logsumexp(all_sim_contrastive, dim=0))
         
-        # 计算所有 queries 和 prompt 的相似度
-        all_sim = (hs_norm[b] @ p) / temp  # (Q,)
-        
-        # NCE loss
-        loss_contrastive = loss_contrastive - (pos_sim - torch.logsumexp(all_sim, dim=0))
-        
-        # Selection Loss: prompt 应该选中正确的 query
+        # Selection: 使用更大温度 + Label Smoothing
+        all_sim_selection = (hs_norm[b] @ p) / selection_temp
         target = torch.tensor([matched_q_idx], device=device)
-        loss_selection = loss_selection + F.cross_entropy(all_sim.unsqueeze(0), target)
+        
+        # Label smoothing 防止过度自信
+        loss_selection = loss_selection + F.cross_entropy(
+            all_sim_selection.unsqueeze(0), 
+            target,
+            label_smoothing=0.1  # 软化目标
+        )
         
         valid_count += 1
     
@@ -402,8 +396,8 @@ def query_text_alignment_loss(
         loss_contrastive = loss_contrastive / valid_count
         loss_selection = loss_selection / valid_count
     
-    return loss_contrastive + loss_selection
-
+    # 降低 selection loss 的贡献
+    return loss_contrastive + selection_weight * loss_selection
 
 def compute_visual_embedding_with_background(
     decoder_features,    # (B, C, H, W) 或 (B, Q, D)
