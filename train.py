@@ -848,7 +848,9 @@ def main(args: argparse.Namespace):
 
     # Freeze everything except LoRA/prompt params
     for n, p in model.named_parameters():
-        if ("lora" in n) or ("prompt_learner" in n) or ("prompt" in n):
+        nl = n.lower()
+        if ("lora" in nl) or ("out_adapter" in nl) or ("prompt_learner" in nl) or ("prompt" in nl) \
+           or ("segmentation_head" in nl):
             p.requires_grad = True
         else:
             p.requires_grad = False

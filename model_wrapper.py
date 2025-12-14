@@ -181,6 +181,14 @@ class FineTuneSAM3Official(nn.Module):
         self.hidden_dim = self.transformer.d_model
         self.num_feature_levels = full_model.num_feature_levels
 
+        if enable_lora:
+            wrapped = apply_lora_to_sam(
+                self.backbone.vision_backbone.trunk,
+                target_substrings=("qkv",),   # 关键：让 LoRA 直接改 attention 权重
+                rank=lora_rank,
+                alpha=lora_alpha,
+            )
+            print(f"[INFO] Applied qkv-LoRA to {len(wrapped)} linear layers in vision trunk")        
 
         # parallel LoRA injection (keep existing)
         if enable_parallel_lora:
