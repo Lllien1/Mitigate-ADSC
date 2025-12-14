@@ -251,7 +251,272 @@ def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B: int, devic
     return out
 
 
+# ==================== 新增：改进的对齐损失相关函数 ====================
 
+def get_prompt_group_labels(prompt_lists, class_names, device):
+    """
+    根据 (class_name, prompt_tuple) 生成分组标签。
+    同一类别+同一组 prompt 的样本会获得相同的 label。
+    """
+    group_to_id = {}
+    labels = []
+    for cls, prompts in zip(class_names, prompt_lists):
+        # 用 (类名, 排序后的prompt元组) 作为 key
+        key = (cls, tuple(sorted(prompts)) if prompts else ())
+        if key not in group_to_id:
+            group_to_id[key] = len(group_to_id)
+        labels.append(group_to_id[key])
+    return torch.tensor(labels, dtype=torch.long, device=device)
+
+
+def supervised_contrastive_loss(
+    v: torch.Tensor,      # (B, D) visual embeddings
+    t: torch.Tensor,      # (B, D) text/prompt embeddings  
+    labels: torch.Tensor, # (B,) 每个样本的类别/组ID
+    temp: float = 0.07
+):
+    """
+    Multi-positive supervised contrastive loss.
+    同一 label 的样本互为正样本，不同 label 的样本为负样本。
+    解决了原始 InfoNCE 把语义相同的 prompt 当负样本的问题。
+    """
+    B = v.shape[0]
+    device = v.device
+    
+    v = F.normalize(v, dim=-1)
+    t = F.normalize(t, dim=-1)
+    
+    # 计算相似度矩阵 (B, B)
+    sim_v2t = (v @ t.t()) / temp
+    sim_t2v = sim_v2t.t()
+    
+    # 构建正样本 mask: labels[i] == labels[j] 时为 True
+    labels_col = labels.view(-1, 1)
+    positive_mask = (labels_col == labels_col.t()).float()  # (B, B)
+    
+    # 对角线 mask
+    eye_mask = torch.eye(B, device=device)
+    
+    # 排除自身的正样本 mask
+    pos_mask_no_self = positive_mask * (1 - eye_mask)
+    
+    # 检查是否有正样本（排除只有自己一个的情况）
+    has_positives = pos_mask_no_self.sum(dim=1) > 0
+    
+    if has_positives.sum() == 0:
+        # 退化到标准 InfoNCE（每个样本只有自己是正样本）
+        labels_diag = torch.arange(B, device=device)
+        loss_v2t = F.cross_entropy(sim_v2t, labels_diag)
+        loss_t2v = F.cross_entropy(sim_t2v, labels_diag)
+        return 0.5 * (loss_v2t + loss_t2v)
+    
+    # SupCon loss: 对每个正样本对单独计算 loss
+    loss = torch.tensor(0.0, device=device)
+    count = 0
+    
+    for i in range(B):
+        pos_indices = torch.where(positive_mask[i] > 0)[0]  # 包含自身
+        
+        for j in pos_indices:
+            numerator = sim_v2t[i, j]
+            denominator = torch.logsumexp(sim_v2t[i], dim=0)
+            loss = loss - (numerator - denominator)
+            count += 1
+    
+    loss = loss / max(count, 1)
+    
+    # 对称方向 t->v
+    loss_t2v = torch.tensor(0.0, device=device)
+    count_t2v = 0
+    for i in range(B):
+        pos_indices = torch.where(positive_mask[i] > 0)[0]
+        for j in pos_indices:
+            numerator = sim_t2v[i, j]
+            denominator = torch.logsumexp(sim_t2v[i], dim=0)
+            loss_t2v = loss_t2v - (numerator - denominator)
+            count_t2v += 1
+    
+    loss_t2v = loss_t2v / max(count_t2v, 1)
+    
+    return 0.5 * (loss + loss_t2v)
+
+
+def query_text_alignment_loss(
+    decoder_hs: torch.Tensor,      # (B, Q, D) decoder hidden states
+    prompt_proto: torch.Tensor,    # (B, D) prompt prototype
+    indices: list,                 # matcher 返回的匹配结果 [(src_q, tgt_q), ...]
+    temp: float = 0.07
+):
+    """
+    Query-Text 对齐损失：
+    1. 对比损失：matched query 应该和 prompt 最相似
+    2. 选择损失：softmax 分类，prompt 应该选中正确的 query
+    
+    这解决了原来只做图级别对齐、没有 query 级别对齐的问题。
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    # 归一化
+    hs_norm = F.normalize(decoder_hs, dim=-1)  # (B, Q, D)
+    p_norm = F.normalize(prompt_proto, dim=-1)  # (B, D)
+    
+    loss_contrastive = torch.tensor(0.0, device=device)
+    loss_selection = torch.tensor(0.0, device=device)
+    valid_count = 0
+    
+    for b in range(B):
+        src_q, tgt_q = indices[b]
+        
+        if src_q.numel() == 0:
+            # 没有匹配的 query（正常图或无GT）
+            continue
+        
+        # 取第一个匹配的 query（MVTec 通常只有一个 GT）
+        matched_q_idx = int(src_q[0].item())
+        
+        # 确保索引在有效范围内
+        if matched_q_idx >= Q:
+            continue
+        
+        # h_matched: (D,)
+        h_matched = hs_norm[b, matched_q_idx]
+        p = p_norm[b]
+        
+        # 计算 matched query 和 prompt 的相似度
+        pos_sim = (h_matched * p).sum() / temp
+        
+        # 计算所有 queries 和 prompt 的相似度
+        all_sim = (hs_norm[b] @ p) / temp  # (Q,)
+        
+        # NCE loss
+        loss_contrastive = loss_contrastive - (pos_sim - torch.logsumexp(all_sim, dim=0))
+        
+        # Selection Loss: prompt 应该选中正确的 query
+        target = torch.tensor([matched_q_idx], device=device)
+        loss_selection = loss_selection + F.cross_entropy(all_sim.unsqueeze(0), target)
+        
+        valid_count += 1
+    
+    if valid_count > 0:
+        loss_contrastive = loss_contrastive / valid_count
+        loss_selection = loss_selection / valid_count
+    
+    return loss_contrastive + loss_selection
+
+
+def compute_visual_embedding_with_background(
+    decoder_features,    # (B, C, H, W) 或 (B, Q, D)
+    masks: torch.Tensor, # (B, H, W) GT masks
+    is_anomaly: list,    # 每张图是否是异常
+    device
+):
+    """
+    为正常图和异常图分别计算视觉 embedding：
+    - 异常图：GT mask 区域的 pooling（缺陷区域）
+    - 正常图：全图 global average pooling（背景/正常区域）
+    
+    这解决了正常样本对 align 零贡献的问题。
+    """
+    B = masks.shape[0]
+    
+    if decoder_features is None:
+        return None, None
+    
+    # 处理不同形状的 decoder_features
+    if decoder_features.dim() == 4:
+        # (B, C, H, W) 空间特征
+        _, C, Hf, Wf = decoder_features.shape
+        feat = decoder_features.permute(0, 2, 3, 1).reshape(B, Hf * Wf, C)
+        
+        # 下采样 mask 到特征图大小
+        masks_ds = F.interpolate(
+            masks.unsqueeze(1).float(), 
+            size=(Hf, Wf), 
+            mode='nearest'
+        ).squeeze(1)
+        masks_flat = masks_ds.view(B, Hf * Wf, 1)
+        use_spatial = True
+    elif decoder_features.dim() == 3:
+        # (B, Q, D) query 特征
+        feat = decoder_features
+        C = feat.shape[-1]
+        masks_flat = None
+        use_spatial = False
+    else:
+        return None, None
+    
+    embeddings = []
+    is_background = []
+    
+    for b in range(B):
+        if is_anomaly[b]:
+            # 异常图：mask 区域 pooling
+            if use_spatial and masks_flat is not None:
+                mask_b = masks_flat[b]
+                pos_count = mask_b.sum().clamp(min=1.0)
+                emb = (feat[b] * mask_b).sum(dim=0) / pos_count
+            else:
+                emb = feat[b].mean(dim=0)
+            embeddings.append(emb)
+            is_background.append(False)
+        else:
+            # 正常图：全图 global pooling（背景锚点）
+            emb = feat[b].mean(dim=0)
+            embeddings.append(emb)
+            is_background.append(True)
+    
+    embeddings = torch.stack(embeddings, dim=0)
+    is_background_tensor = torch.tensor(is_background, dtype=torch.bool, device=device)
+    
+    return embeddings, is_background_tensor
+
+
+def align_loss_with_background_margin(
+    prompt_proto: torch.Tensor,     # (B, D)
+    visual_embed: torch.Tensor,     # (B, D)
+    is_background: torch.Tensor,    # (B,) bool
+    group_labels: torch.Tensor,     # (B,) 分组标签
+    temp: float = 0.07,
+    margin: float = 0.5
+):
+    """
+    改进的对齐损失：
+    1. 同类对齐：supervised contrastive
+    2. Margin 约束：defect prompt 应该远离 background embedding
+    """
+    B = prompt_proto.shape[0]
+    device = prompt_proto.device
+    
+    p_norm = F.normalize(prompt_proto, dim=-1)
+    v_norm = F.normalize(visual_embed, dim=-1)
+    
+    # 1. Supervised contrastive loss（同类对齐）
+    loss_align = supervised_contrastive_loss(v_norm, p_norm, group_labels, temp)
+    
+    # 2. Margin loss: defect prompts 应该远离 background embeddings
+    anomaly_indices = torch.where(~is_background)[0]
+    normal_indices = torch.where(is_background)[0]
+    
+    loss_margin = torch.tensor(0.0, device=device)
+    margin_count = 0
+    
+    if len(anomaly_indices) > 0 and len(normal_indices) > 0:
+        for ai in anomaly_indices:
+            p_anom = p_norm[ai]
+            for ni in normal_indices:
+                v_bg = v_norm[ni]
+                sim = (p_anom * v_bg).sum()
+                # hinge loss: max(0, sim + margin)
+                loss_margin = loss_margin + F.relu(sim + margin)
+                margin_count += 1
+    
+    if margin_count > 0:
+        loss_margin = loss_margin / margin_count
+    
+    return loss_align + 0.5 * loss_margin
+
+# ==================== 新增函数结束 ====================
 
 def focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
     prob = torch.sigmoid(logits)
@@ -336,15 +601,22 @@ def normalize_presence_logits(pred_logits, B, Q, device):
         return torch.zeros((B, Q, 1), device=device, dtype=torch.float32)
 
 
-def contrastive_loss_from_pooled(v: torch.Tensor, t: torch.Tensor, temp: float = 0.07):
+def contrastive_loss_from_pooled(v: torch.Tensor, t: torch.Tensor, temp: float = 0.07, 
+                                  group_labels: torch.Tensor = None):
     """
-    Symmetric InfoNCE / contrastive loss between v and t (both shape [B, D]).
-    Returns scalar loss (mean of v->t and t->v).
+    Symmetric contrastive loss between v and t (both shape [B, D]).
+    如果提供 group_labels，使用 supervised contrastive（同组互为正样本）。
+    否则退化为标准 InfoNCE。
     """
     assert v.dim() == 2 and t.dim() == 2 and v.shape[0] == t.shape[0]
+    
+    if group_labels is not None:
+        return supervised_contrastive_loss(v, t, group_labels, temp)
+    
+    # 原始 InfoNCE fallback
     v = F.normalize(v, dim=-1)
     t = F.normalize(t, dim=-1)
-    logits = (v @ t.t()) / temp  # shape (B, B)
+    logits = (v @ t.t()) / temp
     labels = torch.arange(v.shape[0], device=v.device)
     loss_v2t = F.cross_entropy(logits, labels)
     loss_t2v = F.cross_entropy(logits.t(), labels)
@@ -516,9 +788,9 @@ def main(args: argparse.Namespace):
             freeze_vision=args.freeze_vision,
             freeze_text=args.freeze_text,
             # ----- new: for parallel lora -----
-            # enable_parallel_lora=args.enable_parallel_lora,
-            # parallel_lora_rank=args.parallel_lora_rank,
-            # parallel_lora_alpha=args.parallel_lora_alpha,
+            enable_parallel_lora=args.enable_parallel_lora,
+            parallel_lora_rank=args.parallel_lora_rank,
+            parallel_lora_alpha=args.parallel_lora_alpha,
             # ----- new: for parallel lora -----
             device=device,
             class_list=args.class_list,
@@ -992,48 +1264,57 @@ def main(args: argparse.Namespace):
 
 
                 # ---------- matched branch: gather matched preds and GT, then compute losses ----------
+
                 if tgt_idx is None or tgt_idx.numel() == 0:
                     loss_focal = torch.tensor(0.0, device=device)
                     loss_dice = torch.tensor(0.0, device=device)
                 else:
-                    # 1) Gather matched predicted masks (from pred_masks_ds) and matched GT masks (from targets)
-                    # pred_masks_ds: (B, Q, MD, MD)
-                    # batch_idx, src_idx, tgt_idx are 1D tensors (M,)
+                    # gather predictions and GT (as before)
                     pred_matched_ds = pred_masks_ds[batch_idx, src_idx]  # (M, MD, MD)
-                
-                    # targets["segments"] is flattened G x H x W in full resolution; pick tgt_idx and downsample to MASK_DOWNSAMPLE
-                    tgt_masks_flat = targets["segments"][tgt_idx]  # (M, H, W) or (M,1,H,W)
+
+                    tgt_masks_flat = targets["segments"][tgt_idx]
                     if tgt_masks_flat.dim() == 4:
-                        tgt_masks_flat = tgt_masks_flat.squeeze(1)  # -> (M, H, W)
-                    # downsample GT with nearest (binary -> soft nearest preserves positive pixels)
-                    tm_ds = F.interpolate(tgt_masks_flat.unsqueeze(1).float(), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
-                                          mode="nearest").squeeze(1)  # (M, MD, MD)
-                
-                    # 2) number used for normalization (scalar)
-                    num_boxes = float(max(1.0, src_idx.numel()))  # matches in the batch; safe >0
-                
-                    # 3) compute focal per-pixel map (reduce=False returns per-pixel loss map with same spatial dims)
+                        tgt_masks_flat = tgt_masks_flat.squeeze(1)
+                    tm_ds = F.interpolate(
+                        tgt_masks_flat.unsqueeze(1).float(),
+                        size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                        mode="nearest"
+                    ).squeeze(1)  # (M, MD, MD)
+
+                    num_boxes = float(max(1.0, src_idx.numel()))
+
+                    # --- focal: per-pixel map -> per-mask mean -> normalize ---
                     loss_map = sam_sigmoid_focal_loss(
                         pred_matched_ds, tm_ds, num_boxes,
                         alpha=0.25, gamma=2.0,
                         loss_on_multimask=False, triton=False,
                         reduce=False
-                    )  # shape (M, MD, MD)  => per-pixel loss for each matched mask
-                
+                    )  # (M, MD, MD)
+
                     # per-mask mean over pixels
                     per_mask = loss_map.mean(dim=(1, 2))  # (M,)
-                    # final focal: sum per-mask averages, divided by number of boxes (same convention as original)
                     loss_focal = per_mask.sum() / max(1.0, num_boxes)
-                
-                    # 4) dice: compute per-pixel dice map then same averaging
+
+                    # --- dice: sam_dice_loss(..., reduce=False) returns per-mask scalars (M,) ---
                     loss_dice_map = sam_dice_loss(
                         pred_matched_ds, tm_ds, num_boxes,
                         loss_on_multimask=False, reduce=False
-                    )  # (M, MD, MD)
-                    loss_dice = loss_dice_map.mean(dim=(1, 2)).sum() / max(1.0, num_boxes)
-                
+                    )  # typically shape (M,) for reduce=False
+
+                    # handle both cases robustly:
+                    if loss_dice_map.dim() == 3:
+                        # (M, H, W) -> collapse to per-mask scalars
+                        per_mask_dice = loss_dice_map.mean(dim=(1, 2))
+                    elif loss_dice_map.dim() == 1:
+                        per_mask_dice = loss_dice_map
+                    else:
+                        # fallback: flatten trailing dims to compute a per-mask mean
+                        per_mask_dice = loss_dice_map.view(loss_dice_map.shape[0], -1).mean(dim=1)
+
+                    loss_dice = per_mask_dice.sum() / max(1.0, num_boxes)
+
                     # -------------------------
-                    # background/unmatched loss (sample K negatives per image), unchanged logic
+                    # background/unmatched loss (unchanged)
                     loss_focal_bg = torch.tensor(0.0, device=device)
                     loss_dice_bg = torch.tensor(0.0, device=device)
                     total_bg_samples = 0.0
@@ -1046,36 +1327,34 @@ def main(args: argparse.Namespace):
                             mask_un = torch.ones_like(all_q, dtype=torch.bool)
                             mask_un[src_q] = False
                             unmatched_q = all_q[mask_un]
-                
+
                         if unmatched_q.numel() == 0:
                             continue
                         
                         k = min(NEG_SAMPLES_PER_IMAGE, int(unmatched_q.numel()))
                         perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
                         sampled_unmatched_q = unmatched_q[perm]
-                
+
                         preds_bg_ds = pred_masks_ds[b, sampled_unmatched_q]  # (k, MD, MD)
-                
-                        # Downsample to save memory (if needed) — but pred_masks_ds already MD sized; keep as is or resample
                         if preds_bg_ds.dim() == 3:
                             preds_bg_ds = F.interpolate(preds_bg_ds.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
                                                         mode="bilinear", align_corners=False).squeeze(1)
-                
+
                         zeros = torch.zeros_like(preds_bg_ds)
-                
                         nb = float(sampled_unmatched_q.numel())
-                        # here we keep reduce=True for bg as original: returns scalar per call (matching original scaling)
+
                         loss_focal_bg += sam_sigmoid_focal_loss(preds_bg_ds, zeros, nb, alpha=0.25, gamma=2.0,
                                                                 loss_on_multimask=False, triton=False)
                         loss_dice_bg += sam_dice_loss(preds_bg_ds, zeros, nb, loss_on_multimask=False, reduce=True)
                         total_bg_samples += nb
-                
+
                     if total_bg_samples > 0:
                         loss_focal_bg = loss_focal_bg / (total_bg_samples / float(pred_masks.shape[0]))
                         loss_dice_bg = loss_dice_bg / (total_bg_samples / float(pred_masks.shape[0]))
-                
+
                     loss_focal = loss_focal + 0.5 * loss_focal_bg
                     loss_dice = loss_dice + 0.5 * loss_dice_bg
+
 
 
 
@@ -1185,10 +1464,17 @@ def main(args: argparse.Namespace):
 
 
                 # -------------------------
-                # Contrastive alignment (InfoNCE) between visual pooled vector and prompt prototype
+                # 改进的 Contrastive Alignment：
+                # 1. 使用 supervised contrastive（同类互为正样本）
+                # 2. 区分异常/正常样本的 visual embedding
+                # 3. 添加 margin loss 推开 defect prompt 和 background
+                # 4. 添加 query-level alignment
+                # -------------------------
                 align_loss = torch.tensor(0.0, device=device)
+                query_align_loss = torch.tensor(0.0, device=device)
+                
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
-                    # Prefer prompt_seq from model output if available
+                    # ===== Step 1: 获取 prompt prototype =====
                     prompt_seq = out.get("prompt_seq", None)
                     if prompt_seq is None:
                         try:
@@ -1197,13 +1483,10 @@ def main(args: argparse.Namespace):
                             print("[WARN] cannot obtain prompt_seq from model_core.prompt_learner:", e)
                             prompt_seq = None
 
-                    # Normalize extraction into (B, D)
                     prompt_proto = None
                     if prompt_seq is not None:
-                        # prompt_seq is seq-first (S, B, D)
                         last = prompt_seq[-1]
                         if last.dim() == 2:
-                            # last may be (B, D) or (D, B)
                             if last.shape[0] == B:
                                 prompt_proto = last
                             elif last.shape[1] == B:
@@ -1211,111 +1494,122 @@ def main(args: argparse.Namespace):
                             else:
                                 prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
                         elif last.dim() == 3:
-                            # (S, B, D) -> we already indexed last as last => usually (B, D)
                             prompt_proto = last if last.shape[0] == B else last[-1]
                         else:
                             prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
 
-                    # Build mask embedding using preferred decoder spatial features, fallback to decoder_hs pooling
-                    mask_embed = None
+                    # ===== Step 2: 获取 visual embedding（区分异常/正常）=====
                     decoder_feat = out.get("decoder_features", None)
-                    if decoder_feat is not None:
-                        # expected decoder_feat shape (B, C, Hf, Wf)
-                        try:
-                            Bf, C, Hf, Wf = decoder_feat.shape
-                            # downsample/resize GT masks to (Hf, Wf)
-                            gt_ds = F.interpolate(masks.unsqueeze(1).float(), size=(Hf, Wf), mode='nearest').squeeze(1)  # (B,Hf,Wf)
-                            feat = decoder_feat.permute(0, 2, 3, 1).reshape(B, Hf * Wf, C)  # (B, Hf*Wf, C)
-                            mask_flat = gt_ds.view(B, Hf * Wf).unsqueeze(-1)  # (B, Hf*Wf,1)
-                            pos_counts = mask_flat.sum(dim=1).clamp(min=1.0).to(device)
-                            mask_sum = (feat * mask_flat).sum(dim=1)  # (B,C)
-                            mask_embed = mask_sum / pos_counts  # (B,C)
-                        except Exception as e:
-                            print("[WARN] decoder_features pooling failed:", e)
-                            mask_embed = None
+                    if decoder_feat is None:
+                        decoder_feat = out.get("decoder_hs", None)
+                        if decoder_feat is not None and decoder_feat.dim() == 4:
+                            decoder_feat = decoder_feat[-1]
+                        # 确保 decoder_feat 是 (B, Q, D) 格式
+                        if decoder_feat is not None and decoder_feat.dim() == 3:
+                            if decoder_feat.shape[0] == Q and decoder_feat.shape[1] == B:
+                                decoder_feat = decoder_feat.permute(1, 0, 2).contiguous()
+                    
+                    # 使用改进的函数：区分异常/正常样本
+                    visual_embed, is_background = compute_visual_embedding_with_background(
+                        decoder_features=decoder_feat,
+                        masks=masks,
+                        is_anomaly=is_anomaly,  # 从 batch 数据中获取
+                        device=device
+                    )
+                    
+                    if visual_embed is None:
+                        visual_embed = torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)
+                        is_background = torch.zeros(B, dtype=torch.bool, device=device)
 
-                    if mask_embed is None:
-                        # fallback to decoder_hs (pooled over queries)
-                        decoder_hs = out.get("decoder_hs", None)
-                        if decoder_hs is not None:
-                            try:
-                                hs_last = decoder_hs
-                                # if hs_last is (L,B,Q,D) get last L and ensure shape (B,Q,D)
-                                if hs_last.dim() == 4:
-                                    hs_last = hs_last[-1]  # -> (B,Q,D) or (Q,B,D)
-                                if hs_last.dim() == 3 and hs_last.shape[0] == Q and hs_last.shape[1] == B:
-                                    hs_last = hs_last.permute(1, 0, 2).contiguous()
-                                # pool across queries
-                                v_pooled = hs_last.mean(dim=1)  # (B, D)
-                                mask_embed = v_pooled
-                            except Exception as e:
-                                print("[WARN] decoder_hs pooling failed:", e)
-                                mask_embed = None
-
-                    # If still None, fallback to zeros to avoid crash
-                    if mask_embed is None:
-                        mask_embed = torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)
-
-                    # Ensure dim match: project mask_embed to prompt_proto dim if necessary
+                    # ===== Step 3: 维度对齐 =====
                     if prompt_proto is not None:
                         Dp = prompt_proto.shape[1]
-                        Dm = mask_embed.shape[1]
+                        Dm = visual_embed.shape[1]
                         if Dm != Dp:
-                            # create or reuse a small linear projector on model_core to map dims
                             if not hasattr(model_core, "_align_proj"):
                                 model_core._align_proj = nn.Linear(Dm, Dp).to(device)
                                 optimizer.add_param_group({
                                     "params": model_core._align_proj.parameters(),
-                                    "lr": args.lr_main,       # 也可以专门设一个 lr，如 args.lr_align（如果需要）
+                                    "lr": args.lr_main,
                                     "weight_decay": 0.0
                                 })
-                            mask_embed = model_core._align_proj(mask_embed)
+                            visual_embed = model_core._align_proj(visual_embed)
 
-                    # L2 normalize and compute symmetric InfoNCE
-                    if prompt_proto is None:
-                        # can't compute align: leave zero
-                        align_loss = torch.tensor(0.0, device=device)
-                    else:
-                        p_norm = F.normalize(prompt_proto, dim=1)
-                        m_norm = F.normalize(mask_embed, dim=1)
+                    # ===== Step 4: 计算改进的 align loss =====
+                    if prompt_proto is not None:
+                        # 构建分组标签（同类 defect 互为正样本）
+                        group_labels = get_prompt_group_labels(prompt_lists, class_names, device)
+                        
+                        # 使用带 margin 的 supervised contrastive loss
+                        align_margin = getattr(args, 'align_margin', 0.5)
+                        align_loss = align_loss_with_background_margin(
+                            prompt_proto=prompt_proto,
+                            visual_embed=visual_embed,
+                            is_background=is_background,
+                            group_labels=group_labels,
+                            temp=args.align_temp,
+                            margin=align_margin
+                        )
+                        
+                        # ===== Step 5: Query-level alignment（关键改进）=====
+                        lambda_query_align = getattr(args, 'lambda_query_align', 0.5)
+                        if lambda_query_align > 0:
+                            decoder_hs = out.get("decoder_hs", None)
+                            if decoder_hs is not None:
+                                # 确保 decoder_hs 是 (B, Q, D) 格式
+                                if decoder_hs.dim() == 4:
+                                    decoder_hs = decoder_hs[-1]
+                                if decoder_hs.dim() == 3:
+                                    if decoder_hs.shape[0] == Q and decoder_hs.shape[1] == B:
+                                        decoder_hs = decoder_hs.permute(1, 0, 2).contiguous()
+                                
+                                # 计算 query-level alignment loss
+                                query_align_loss = query_text_alignment_loss(
+                                    decoder_hs=decoder_hs,
+                                    prompt_proto=prompt_proto,
+                                    indices=indices,
+                                    temp=args.align_temp
+                                )
 
-                        # use helper contrastive_loss_from_pooled (already defined in file)
-                        try:
-                            align_loss = contrastive_loss_from_pooled(p_norm, m_norm, temp=args.align_temp)
-                        except Exception as e:
-                            # fallback compute manual symmetric nce
-                            logits = (p_norm @ m_norm.t()) / float(args.align_temp)
-                            labels_local = torch.arange(B, device=device)
-                            align_loss = 0.5 * (F.cross_entropy(logits, labels_local) + F.cross_entropy(logits.t(), labels_local))
-
-                        # Diagnostics: pos/neg stats and norms (log every args.log_freq steps)
+                        # ===== Diagnostics =====
                         if (step % getattr(args, "log_freq", 100)) == 0:
+                            p_norm = F.normalize(prompt_proto, dim=1)
+                            m_norm = F.normalize(visual_embed, dim=1)
                             sim = (p_norm @ m_norm.t()) / float(args.align_temp)
-                            labels_local = torch.arange(B, device=device)
-                            pos = sim[range(B), labels_local]
-                            mask_offdiag = ~torch.eye(B, dtype=torch.bool, device=device)
-                            neg = sim.masked_select(mask_offdiag).view(B, B - 1)
-                            pos_mean, pos_std = float(pos.mean().item()), float(pos.std().item())
-                            neg_mean, neg_std = float(neg.mean().item()), float(neg.std().item())
-                            p_mean, p_std = float(p_norm.norm(dim=1).mean().item()), float(p_norm.norm(dim=1).std().item())
-                            m_mean, m_std = float(m_norm.norm(dim=1).mean().item()), float(m_norm.norm(dim=1).std().item())
-                            print(f"[ALIGN] step={step} align_loss={align_loss.item():.6f} pos_mean={pos_mean:.4f} pos_std={pos_std:.4f} neg_mean={neg_mean:.4f} neg_std={neg_std:.4f}")
-                            print(f"[NORM] p_mean={p_mean:.4f} p_std={p_std:.4f} | m_mean={m_mean:.4f} m_std={m_std:.4f}")
+                            
+                            # 计算同组/异组的相似度统计
+                            same_group = (group_labels.unsqueeze(0) == group_labels.unsqueeze(1))
+                            pos_sim = sim[same_group].mean().item() if same_group.sum() > 0 else 0
+                            neg_sim = sim[~same_group].mean().item() if (~same_group).sum() > 0 else 0
+                            
+                            print(f"[ALIGN] step={step} align_loss={align_loss.item():.6f} "
+                                  f"query_align={query_align_loss.item():.6f} "
+                                  f"pos_sim={pos_sim:.4f} neg_sim={neg_sim:.4f}")
+                            
+                            # 打印 background vs anomaly embedding 统计
+                            n_bg = is_background.sum().item()
+                            n_anom = (~is_background).sum().item()
+                            print(f"[BG/ANOM] n_background={n_bg}, n_anomaly={n_anom}")
 
-                            # TSNE: sample up to tsne_samples per type
-                            if (step % getattr(args, "tsne_freq", 500)) == 0:
+                            # TSNE
+                            if (step % getattr(args, "tsne_freq", 500)) == 0 and B >= 4:
                                 ns = min(getattr(args, "tsne_samples", 64), B)
                                 sel = np.random.choice(B, ns, replace=False)
                                 p_sample = p_norm[sel].detach().cpu().numpy()
                                 m_sample = m_norm[sel].detach().cpu().numpy()
+                                labels_sample = group_labels[sel].cpu().numpy()
                                 X = np.concatenate([p_sample, m_sample], axis=0)
                                 try:
-                                    Z = TSNE(n_components=2, perplexity=30, init='pca').fit_transform(X)
-                                    plt.figure(figsize=(5,5))
-                                    plt.scatter(Z[:ns,0], Z[:ns,1], c='C0', label='prompt', alpha=0.8)
-                                    plt.scatter(Z[ns:,0], Z[ns:,1], c='C1', label='mask', alpha=0.8)
+                                    Z = TSNE(n_components=2, perplexity=min(30, ns-1), init='pca').fit_transform(X)
+                                    plt.figure(figsize=(6, 6))
+                                    # prompt embeddings
+                                    scatter1 = plt.scatter(Z[:ns, 0], Z[:ns, 1], c=labels_sample, 
+                                                          cmap='tab10', marker='o', alpha=0.8, label='prompt')
+                                    # visual embeddings
+                                    scatter2 = plt.scatter(Z[ns:, 0], Z[ns:, 1], c=labels_sample, 
+                                                          cmap='tab10', marker='x', alpha=0.8, label='visual')
                                     plt.legend()
-                                    plt.title(f"t-SNE step{step}")
+                                    plt.title(f"t-SNE step{step} (color=group)")
                                     tsne_out_dir = os.path.join(args.log_dir, "tsne")
                                     os.makedirs(tsne_out_dir, exist_ok=True)
                                     plt.savefig(os.path.join(tsne_out_dir, f"tsne_step{step}.png"), dpi=150)
@@ -1324,19 +1618,23 @@ def main(args: argparse.Namespace):
                                     print("[WARN] TSNE failed:", e)
                 else:
                     align_loss = torch.tensor(0.0, device=device)
+                    query_align_loss = torch.tensor(0.0, device=device)
                 # -------------------------
 
 
-                # Combine losses: use learned weights (Kendall) if requested, otherwise use args.loss_alpha/beta/gamma
+                # Combine losses: 包含新的 query_align_loss
+                lambda_query_align = getattr(args, 'lambda_query_align', 0.5)
+                
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
-                    # log_var_focal/log_var_dice/log_var_iou defined in main scope and added to optimizer
                     loss_main = (torch.exp(-log_var_focal) * loss_focal + log_var_focal) + \
                                 (torch.exp(-log_var_dice)  * loss_dice  + log_var_dice) + \
                                 (torch.exp(-log_var_iou)   * loss_iou   + log_var_iou)
-                    total_loss = loss_main + args.presence_weight * loss_presence + args.lambda_align * align_loss
+                    total_loss = loss_main + args.presence_weight * loss_presence + \
+                                 args.lambda_align * align_loss + lambda_query_align * query_align_loss
                 else:
                     total_loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
-                    total_loss = total_loss + args.presence_weight * loss_presence + args.lambda_align * align_loss
+                    total_loss = total_loss + args.presence_weight * loss_presence + \
+                                 args.lambda_align * align_loss + lambda_query_align * query_align_loss
 
                 loss = total_loss
 
@@ -1388,6 +1686,9 @@ def main(args: argparse.Namespace):
                 writer.add_scalar("loss/presence", loss_presence.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/align", align_loss.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
+            
 
             running_loss += loss.item()
             running_steps += 1
@@ -1449,12 +1750,14 @@ if __name__ == "__main__":
     parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
     parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
 
+
     #--------------- Diagnostic logging args ---------------
     parser.add_argument("--log_freq", type=int, default=100, help="Logging frequency (steps) for align diagnostics")
     parser.add_argument("--tsne_freq", type=int, default=500, help="TSNE save frequency (steps)")
     parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
-
     
+    parser.add_argument("--align_margin", type=float, default=0.5,help="Margin for pushing defect prompts away from background embeddings")
+    parser.add_argument("--lambda_query_align", type=float, default=0.5,help="Weight for query-level alignment loss (让 prompt 选中正确的 query)")
 
     args = parser.parse_args()
     main(args)
