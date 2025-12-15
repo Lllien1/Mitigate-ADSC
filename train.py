@@ -58,6 +58,28 @@ def collate_fn(batch):
     masks = torch.stack(masks, dim=0)
     return imgs, masks, list(prompts), list(anomalies), list(classes)
 
+def chk(name, x):
+    if x is None: 
+        return True
+    ok = torch.isfinite(x).all().item()
+    if not ok:
+        print(f"[NAN/INF] {name} =", x.detach().float().cpu())
+    return ok
+
+def grad_finite_check(model, key="transformer.decoder"):
+    bad = []
+    for n,p in model.named_parameters():
+        if key in n.lower() and p.requires_grad and p.grad is not None:
+            if not torch.isfinite(p.grad).all():
+                bad.append(n)
+                if len(bad) >= 5:
+                    break
+    if bad:
+        print("[BAD GRAD] examples:", bad)
+        return False
+    return True
+
+
 
 def mask_to_box(mask: torch.Tensor):
     """Convert a binary mask (H,W) to cxcywh normalized box; return None if empty."""
@@ -1098,7 +1120,13 @@ def main(args: argparse.Namespace):
     optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
 
     # 新增：AMP 的 GradScaler（只在 CUDA 下启用）
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    scaler = GradScaler(
+        enabled=(device.type == "cuda"),
+        init_scale=2**8,          # 默认 2**16 太激进
+        growth_factor=2.0,
+        backoff_factor=0.5,
+        growth_interval=2000
+    )
 
     matcher = BinaryHungarianMatcher(cost_class=1.0, cost_bbox=1.0, cost_giou=1.0)
 
@@ -1506,48 +1534,112 @@ def main(args: argparse.Namespace):
                     loss_dice = per_mask_dice.sum() / max(1.0, num_boxes)
 
                     # -------------------------
-                    # background/unmatched loss (unchanged)
+                    # ---------- matched + background losses (FP32 stable) ----------
+                    loss_focal = torch.tensor(0.0, device=device)
+                    loss_dice  = torch.tensor(0.0, device=device)
+
                     loss_focal_bg = torch.tensor(0.0, device=device)
-                    loss_dice_bg = torch.tensor(0.0, device=device)
-                    total_bg_samples = 0.0
-                    all_q = torch.arange(pred_masks.shape[1], device=device)
-                    for b in range(pred_masks.shape[0]):
-                        src_q, tgt_q = indices[b]
-                        if src_q.numel() == 0:
-                            unmatched_q = all_q
-                        else:
-                            mask_un = torch.ones_like(all_q, dtype=torch.bool)
-                            mask_un[src_q] = False
-                            unmatched_q = all_q[mask_un]
+                    loss_dice_bg  = torch.tensor(0.0, device=device)
+                    num_bg_images = 0
 
-                        if unmatched_q.numel() == 0:
-                            continue
-                        
-                        k = min(NEG_SAMPLES_PER_IMAGE, int(unmatched_q.numel()))
-                        perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
-                        sampled_unmatched_q = unmatched_q[perm]
+                    # 关键：对 pred_masks_ds 做一次“可反传”的安全化（clamp 会截断极端梯度，nan_to_num 只在出现 nan/inf 时兜底）
+                    pred_masks_ds_safe = torch.nan_to_num(pred_masks_ds, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
 
-                        preds_bg_ds = pred_masks_ds[b, sampled_unmatched_q]  # (k, MD, MD)
-                        if preds_bg_ds.dim() == 3:
-                            preds_bg_ds = F.interpolate(preds_bg_ds.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
-                                                        mode="bilinear", align_corners=False).squeeze(1)
+                    with torch.cuda.amp.autocast(enabled=False):
+                        # ===== matched positives =====
+                        if tgt_idx is not None and tgt_idx.numel() > 0:
+                            pm = pred_masks_ds_safe[batch_idx, src_idx].float()   # (M, MD, MD)
 
-                        zeros = torch.zeros_like(preds_bg_ds)
-                        nb = float(sampled_unmatched_q.numel())
+                            tgt_masks_flat = targets["segments"][tgt_idx]
+                            if tgt_masks_flat.dim() == 4:
+                                tgt_masks_flat = tgt_masks_flat.squeeze(1)
+                            tm = F.interpolate(
+                                tgt_masks_flat.unsqueeze(1).float(),
+                                size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                mode="nearest"
+                            ).squeeze(1)  # (M, MD, MD)
 
-                        loss_focal_bg += sam_sigmoid_focal_loss(preds_bg_ds, zeros, nb, alpha=0.25, gamma=2.0,
-                                                                loss_on_multimask=False, triton=False)
-                        loss_dice_bg += sam_dice_loss(preds_bg_ds, zeros, nb, loss_on_multimask=False, reduce=True)
-                        total_bg_samples += nb
+                            # 再 clamp 一次，避免 focal 内部极端 logits（尤其是你刚解冻 decoder 时）
+                            pm = pm.clamp(-20.0, 20.0)
 
-                    if total_bg_samples > 0:
-                        loss_focal_bg = loss_focal_bg / (total_bg_samples / float(pred_masks.shape[0]))
-                        loss_dice_bg = loss_dice_bg / (total_bg_samples / float(pred_masks.shape[0]))
+                            # reduce=False -> per-mask mean -> batch mean
+                            fmap = sam_sigmoid_focal_loss(
+                                pm, tm, num_boxes=1.0,
+                                alpha=0.25, gamma=2.0,
+                                loss_on_multimask=False, triton=False,
+                                reduce=False
+                            )
+                            if fmap.dim() == 3:
+                                loss_focal = fmap.mean(dim=(1, 2)).mean()
+                            else:
+                                loss_focal = fmap.view(fmap.shape[0], -1).mean(dim=1).mean()
 
-                    loss_focal = loss_focal + 0.5 * loss_focal_bg
-                    loss_dice = loss_dice + 0.5 * loss_dice_bg
+                            dmap = sam_dice_loss(
+                                pm, tm, num_boxes=1.0,
+                                loss_on_multimask=False, reduce=False
+                            )
+                            if dmap.dim() == 3:
+                                dmap = dmap.mean(dim=(1, 2))
+                            elif dmap.dim() != 1:
+                                dmap = dmap.view(dmap.shape[0], -1).mean(dim=1)
+                            loss_dice = dmap.mean()
 
+                        # ===== background/unmatched (sample negatives) =====
+                        all_q = torch.arange(pred_masks.shape[1], device=device)
+                        for b in range(pred_masks.shape[0]):
+                            src_q, _ = indices[b]
+                            if src_q.numel() == 0:
+                                unmatched_q = all_q
+                            else:
+                                mask_un = torch.ones_like(all_q, dtype=torch.bool)
+                                mask_un[src_q] = False
+                                unmatched_q = all_q[mask_un]
 
+                            if unmatched_q.numel() == 0:
+                                continue
+                            
+                            k = min(NEG_SAMPLES_PER_IMAGE, int(unmatched_q.numel()))
+                            perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
+                            sampled_q = unmatched_q[perm]
+
+                            preds_bg = pred_masks_ds_safe[b, sampled_q].float()   # (k, MD, MD)
+                            preds_bg = preds_bg.clamp(-20.0, 20.0)
+                            zeros = torch.zeros_like(preds_bg)
+
+                            bg_map = sam_sigmoid_focal_loss(
+                                preds_bg, zeros, num_boxes=1.0,
+                                alpha=0.25, gamma=2.0,
+                                loss_on_multimask=False, triton=False,
+                                reduce=False
+                            )
+                            if bg_map.dim() == 3:
+                                loss_focal_bg = loss_focal_bg + bg_map.mean(dim=(1, 2)).mean()
+                            else:
+                                loss_focal_bg = loss_focal_bg + bg_map.view(bg_map.shape[0], -1).mean(dim=1).mean()
+
+                            bg_d = sam_dice_loss(
+                                preds_bg, zeros, num_boxes=1.0,
+                                loss_on_multimask=False, reduce=False
+                            )
+                            if bg_d.dim() == 3:
+                                bg_d = bg_d.mean(dim=(1, 2))
+                            elif bg_d.dim() != 1:
+                                bg_d = bg_d.view(bg_d.shape[0], -1).mean(dim=1)
+                            loss_dice_bg = loss_dice_bg + bg_d.mean()
+
+                            num_bg_images += 1
+
+                        if num_bg_images > 0:
+                            loss_focal_bg = loss_focal_bg / float(num_bg_images)
+                            loss_dice_bg  = loss_dice_bg  / float(num_bg_images)
+
+                    # 背景权重：建议先压低，先让 decoder 稳住（你现在 0.1 也可能偏大）
+                    bg_w = 0.05
+                    loss_focal = loss_focal + bg_w * loss_focal_bg
+                    loss_dice  = loss_dice  + bg_w * loss_dice_bg
+
+                    if step % 50 == 0:
+                        print(f"[BG LOSS] focal_bg={float(loss_focal_bg):.4f} dice_bg={float(loss_dice_bg):.4f} bg_w={bg_w} num_bg_images={num_bg_images}")
 
 
                         
@@ -1853,10 +1945,48 @@ def main(args: argparse.Namespace):
                 continue
 
             optimizer.zero_grad()
+
+            # 在 loss.backward() 之前
+            chk("loss_total", loss)
+
+            # 你真正的分割loss就是 focal/dice/iou 的组合（用同一套权重）
+            loss_seg = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
+            chk("loss_seg", loss_seg)
+
+            chk("align_loss", align_loss)
+            chk("query_align_loss", query_align_loss)
+
+            # 变量名应为 loss_presence
+            chk("presence_loss", loss_presence)
             # 使用 GradScaler 做 backward + step
             scaler.scale(loss).backward()
 
+            # 1) 先 unscale 再检查/clip
+            scaler.unscale_(optimizer)
+
+            # 2) clip（先用 1.0 或 0.5 都行，先把 nan 压住）
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=1.0
+            )
+
+            # 3) 再做有限性检查（更可信）
+            ok = grad_finite_check(model, "transformer.decoder")
+            if not ok:
+                print("[WARN] non-finite grads -> skip step, scaler downscale")
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
+
             # --- Diagnostic: grad norms for prompt-related params ---
+            grad_finite_check(model, "transformer.decoder")
+            if step == 0:
+                for n, p in model.named_parameters():
+                    nl = n.lower()
+                    if "transformer.decoder" in nl and p.requires_grad:
+                        print("[GRAD CHECK]", n, "grad_is_none=", (p.grad is None),
+                              "grad_norm=", (p.grad.norm().item() if p.grad is not None else None))
+                        break
             grad_norms = []
             for n,p in model.named_parameters():
                 nl = n.lower()
