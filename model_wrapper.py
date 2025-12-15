@@ -341,9 +341,10 @@ class FineTuneSAM3Official(nn.Module):
         # Fallback: use backbone top-level feature vis_feats[0] (B,C,H,W).
         decoder_feat = None
         # commonly segmentation heads provide "mask_features" or "mask_pred_feats" etc. try several keys:
-        for key in ("mask_features", "decoder_features", "mask_feat", "mask_pred_feat"):
-            if key in seg_out and seg_out.get(key) is not None:
-                decoder_feat = seg_out.get(key)
+        for key in ("mask_features", "mask_feat", "mask_pred_feat", "decoder_features"):
+            v = seg_out.get(key, None)
+            if isinstance(v, torch.Tensor) and v is not None and v.dim() == 4:
+                decoder_feat = v
                 break
 
         if decoder_feat is None:

@@ -1,6 +1,7 @@
 import argparse
 import os
 import torch.distributed as dist
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import sys
@@ -253,19 +254,161 @@ def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B: int, devic
 
 # ==================== 新增：改进的对齐损失相关函数 ====================
 
+# === Decoder LoRA 相关类 ===
+class LoRALinear(nn.Module):
+    """LoRA adapter for linear layers - 用于给 decoder 添加低秩适配器"""
+    def __init__(self, in_features: int, out_features: int, rank: int = 8, alpha: float = 16.0):
+        super().__init__()
+        self.rank = rank
+        self.scaling = alpha / rank
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_B)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
+
+
+def apply_lora_to_decoder(model, rank: int = 8, alpha: float = 16.0):
+    """给 decoder 的 attention 层添加 LoRA，显存友好的微调方式"""
+    decoder = None
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'decoder'):
+        decoder = model.transformer.decoder
+    elif hasattr(model, 'module') and hasattr(model.module, 'transformer'):
+        decoder = model.module.transformer.decoder
+    
+    if decoder is None:
+        print("[WARN] Cannot find decoder")
+        return 0
+    
+    lora_count = 0
+    device = next(decoder.parameters()).device
+    lora_modules = nn.ModuleList()  # 用于存储所有 LoRA 模块，确保参数被正确追踪
+    
+    # 遍历所有 Linear 层，给 attention 相关的添加 LoRA
+    for name, module in list(decoder.named_modules()):
+        if isinstance(module, nn.Linear):
+            if any(k in name for k in ['in_proj', 'out_proj', 'q_proj', 'k_proj', 'v_proj', 
+                                        'self_attn', 'cross_attn', 'multihead']):
+                in_f, out_f = module.in_features, module.out_features
+                lora = LoRALinear(in_f, out_f, rank=rank, alpha=alpha).to(device)
+                
+                # 存储 lora adapter 到模块列表
+                lora_modules.append(lora)
+                
+                # 包装 forward（使用闭包捕获正确的 lora 引用）
+                original_forward = module.forward
+                def make_forward(orig_fwd, lora_adapter):
+                    def new_fwd(x):
+                        return orig_fwd(x) + lora_adapter(x)
+                    return new_fwd
+                module.forward = make_forward(original_forward, lora)
+                
+                lora_count += 1
+                print(f"  [LoRA] Added to {name}")
+    
+    # 将 LoRA 模块列表注册到 decoder，确保参数能被追踪
+    decoder.decoder_lora_modules = lora_modules
+    
+    # 解冻 query_embed（非常重要！）
+    if hasattr(decoder, 'query_embed'):
+        if isinstance(decoder.query_embed, nn.Parameter):
+            decoder.query_embed.requires_grad = True
+            print("[INFO] Unfroze query_embed (Parameter)")
+        elif hasattr(decoder.query_embed, 'weight'):
+            decoder.query_embed.weight.requires_grad = True
+            print("[INFO] Unfroze query_embed.weight")
+    
+    print(f"[INFO] Applied LoRA (rank={rank}) to {lora_count} decoder modules")
+    
+    # 打印 LoRA 参数数量
+    lora_params = sum(p.numel() for lora in lora_modules for p in lora.parameters())
+    print(f"[INFO] Total LoRA parameters in decoder: {lora_params:,}")
+    
+    return lora_count
+
+
+def unfreeze_decoder_selectively(model, mode="last_layer"):
+    """选择性解冻 decoder 层"""
+    decoder = None
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'decoder'):
+        decoder = model.transformer.decoder
+    elif hasattr(model, 'module') and hasattr(model.module, 'transformer'):
+        decoder = model.module.transformer.decoder
+    
+    if decoder is None:
+        print("[WARN] Cannot find decoder")
+        return
+    
+    # 首先冻结所有 decoder 参数
+    for p in decoder.parameters():
+        p.requires_grad = False
+    
+    if mode == "all":
+        for p in decoder.parameters():
+            p.requires_grad = True
+    elif mode == "last_layer":
+        if hasattr(decoder, 'layers') and len(decoder.layers) > 0:
+            for p in decoder.layers[-1].parameters():
+                p.requires_grad = True
+    elif mode == "last_2_layers":
+        if hasattr(decoder, 'layers') and len(decoder.layers) >= 2:
+            for layer in decoder.layers[-2:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+    elif mode == "cross_attn":
+        for name, param in decoder.named_parameters():
+            if 'cross_attn' in name.lower() or 'multihead_attn' in name.lower():
+                param.requires_grad = True
+    
+    # 解冻 query_embed
+    if hasattr(decoder, 'query_embed'):
+        if isinstance(decoder.query_embed, nn.Parameter):
+            decoder.query_embed.requires_grad = True
+        elif hasattr(decoder.query_embed, 'weight'):
+            decoder.query_embed.weight.requires_grad = True
+    
+    trainable = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in decoder.parameters())
+    print(f"[INFO] Decoder unfroze ({mode}): {trainable:,} / {total:,} params")
+
+
 def get_prompt_group_labels(prompt_lists, class_names, device):
     """
-    根据 (class_name, prompt_tuple) 生成分组标签。
-    同一类别+同一组 prompt 的样本会获得相同的 label。
+    改进的分组策略：只按 prompt 内容分组，忽略 class_name。
+    
+    原问题: 使用 (class_name, prompt_tuple) 导致每个类别形成独立组
+    例如 batch=8 来自 8 个类别 -> 8 个组各 1 个样本 -> 无多正样本对!
+    
+    改进: 只用 prompt 内容分组
+    - "crack" 在 bottle 和 tile 中语义相同，应该是正样本对
+    - 相同的缺陷描述形成一组
     """
     group_to_id = {}
     labels = []
-    for cls, prompts in zip(class_names, prompt_lists):
-        # 用 (类名, 排序后的prompt元组) 作为 key
-        key = (cls, tuple(sorted(prompts)) if prompts else ())
+    
+    for prompts in prompt_lists:
+        # 只用 prompt 内容作为 key（忽略 class_name）
+        # 这样不同类别的相同缺陷类型可以形成正样本对
+        key = tuple(sorted(prompts)) if prompts else ("__normal__",)
+        
         if key not in group_to_id:
             group_to_id[key] = len(group_to_id)
         labels.append(group_to_id[key])
+    
+    return torch.tensor(labels, dtype=torch.long, device=device)
+
+
+def get_prompt_group_labels_by_anomaly(prompt_lists, is_anomaly, device):
+    """
+    更简单的分组策略：按异常/正常二分类分组
+    - 所有异常样本 label = 1
+    - 所有正常样本 label = 0
+    
+    优点: 保证批次内总有正样本对（只要有多个异常或多个正常样本）
+    """
+    labels = [1 if anom else 0 for anom in is_anomaly]
     return torch.tensor(labels, dtype=torch.long, device=device)
 
 
@@ -273,12 +416,15 @@ def supervised_contrastive_loss(
     v: torch.Tensor,      # (B, D) visual embeddings
     t: torch.Tensor,      # (B, D) text/prompt embeddings  
     labels: torch.Tensor, # (B,) 每个样本的类别/组ID
-    temp: float = 0.07
+    temp: float = 0.1     # 增大温度以稳定训练（原 0.07 太尖锐）
 ):
     """
-    Multi-positive supervised contrastive loss.
-    同一 label 的样本互为正样本，不同 label 的样本为负样本。
-    解决了原始 InfoNCE 把语义相同的 prompt 当负样本的问题。
+    改进的 Multi-positive Supervised Contrastive Loss.
+    
+    关键改进:
+    1. 使用更大的温度 (0.1 而非 0.07) - 软化相似度分布
+    2. 使用向量化实现替代循环 - 更稳定的梯度
+    3. 添加诊断信息打印
     """
     B = v.shape[0]
     device = v.device
@@ -301,65 +447,75 @@ def supervised_contrastive_loss(
     pos_mask_no_self = positive_mask * (1 - eye_mask)
     
     # 检查是否有正样本（排除只有自己一个的情况）
-    has_positives = pos_mask_no_self.sum(dim=1) > 0
+    num_positives_per_sample = pos_mask_no_self.sum(dim=1)
+    has_positives = num_positives_per_sample > 0
+    
+    # 打印诊断信息（每 100 step 打印一次，通过外部控制）
+    n_with_pos = has_positives.sum().item()
+    n_unique_groups = len(torch.unique(labels))
     
     if has_positives.sum() == 0:
         # 退化到标准 InfoNCE（每个样本只有自己是正样本）
+        # 这种情况下 loss ≈ log(B)
         labels_diag = torch.arange(B, device=device)
         loss_v2t = F.cross_entropy(sim_v2t, labels_diag)
         loss_t2v = F.cross_entropy(sim_t2v, labels_diag)
         return 0.5 * (loss_v2t + loss_t2v)
     
-    # SupCon loss: 对每个正样本对单独计算 loss
-    loss = torch.tensor(0.0, device=device)
-    count = 0
+    # 向量化的 SupCon loss 实现（比循环更稳定）
+    # 对于每个样本 i，loss = -log(sum_j∈P(i) exp(s_ij) / sum_k exp(s_ik))
     
-    for i in range(B):
-        pos_indices = torch.where(positive_mask[i] > 0)[0]  # 包含自身
-        
-        for j in pos_indices:
-            numerator = sim_v2t[i, j]
-            denominator = torch.logsumexp(sim_v2t[i], dim=0)
-            loss = loss - (numerator - denominator)
-            count += 1
+    # exp(sim) for all pairs
+    exp_sim_v2t = torch.exp(sim_v2t)  # (B, B)
     
-    loss = loss / max(count, 1)
+    # 分子：正样本对的 exp(sim) 之和（包含自身）
+    pos_exp_sum = (exp_sim_v2t * positive_mask).sum(dim=1)  # (B,)
+    
+    # 分母：所有样本对的 exp(sim) 之和
+    all_exp_sum = exp_sim_v2t.sum(dim=1)  # (B,)
+    
+    # 避免 log(0) 和数值不稳定
+    eps = 1e-8
+    loss_v2t = -torch.log(pos_exp_sum / (all_exp_sum + eps) + eps).mean()
     
     # 对称方向 t->v
-    loss_t2v = torch.tensor(0.0, device=device)
-    count_t2v = 0
-    for i in range(B):
-        pos_indices = torch.where(positive_mask[i] > 0)[0]
-        for j in pos_indices:
-            numerator = sim_t2v[i, j]
-            denominator = torch.logsumexp(sim_t2v[i], dim=0)
-            loss_t2v = loss_t2v - (numerator - denominator)
-            count_t2v += 1
+    exp_sim_t2v = torch.exp(sim_t2v)
+    pos_exp_sum_t2v = (exp_sim_t2v * positive_mask).sum(dim=1)
+    all_exp_sum_t2v = exp_sim_t2v.sum(dim=1)
+    loss_t2v = -torch.log(pos_exp_sum_t2v / (all_exp_sum_t2v + eps) + eps).mean()
     
-    loss_t2v = loss_t2v / max(count_t2v, 1)
-    
-    return 0.5 * (loss + loss_t2v)
+    return 0.5 * (loss_v2t + loss_t2v)
 
 
 def query_text_alignment_loss(
     decoder_hs: torch.Tensor,      
     prompt_proto: torch.Tensor,    
     indices: list,                 
-    temp: float = 0.07,
-    selection_weight: float = 0.1  # 新增：降低 selection loss 权重
+    temp: float = 0.2,             # 增大温度！原 0.07 太尖锐
+    selection_weight: float = 0.0, # 禁用不稳定的 selection loss
+    top_k: int = 64                # 只在 top-k 相似的 query 中竞争
 ):
+    """
+    改进的 Query-Text Alignment Loss.
+    
+    关键改进:
+    1. 温度从 0.07 增大到 0.2（软化分布，避免 log(Q) 下界）
+    2. 使用 top-k 采样减少负样本数量（Q=900 -> top_k=64）
+    3. 移除不稳定的 selection loss
+    4. 添加 stop-gradient 稳定训练
+    
+    原问题: Q=900, temp=0.07 时 loss 下界 ≈ log(900) ≈ 6.8
+    改进后: top_k=64, temp=0.2 时 loss 下界 ≈ log(64) ≈ 4.2，且更易收敛
+    """
     B, Q, D = decoder_hs.shape
     device = decoder_hs.device
     
+    # 归一化
     hs_norm = F.normalize(decoder_hs, dim=-1)
     p_norm = F.normalize(prompt_proto, dim=-1)
     
-    loss_contrastive = torch.tensor(0.0, device=device)
-    loss_selection = torch.tensor(0.0, device=device)
+    loss = torch.tensor(0.0, device=device)
     valid_count = 0
-    
-    # 使用更大的温度来软化 selection
-    selection_temp = 0.2  # 比 contrastive temp 更大
     
     for b in range(B):
         src_q, tgt_q = indices[b]
@@ -367,37 +523,52 @@ def query_text_alignment_loss(
         if src_q.numel() == 0:
             continue
         
+        # 取第一个匹配的 query
         matched_q_idx = int(src_q[0].item())
         if matched_q_idx >= Q:
             continue
         
-        h_matched = hs_norm[b, matched_q_idx]
-        p = p_norm[b]
+        h_matched = hs_norm[b, matched_q_idx]  # (D,)
+        p = p_norm[b]  # (D,)
         
-        # Contrastive: 使用原温度
-        pos_sim = (h_matched * p).sum() / temp
-        all_sim_contrastive = (hs_norm[b] @ p) / temp
-        loss_contrastive = loss_contrastive - (pos_sim - torch.logsumexp(all_sim_contrastive, dim=0))
+        # 计算所有 query 与 prompt 的相似度
+        all_sim = (hs_norm[b] @ p) / temp  # (Q,)
         
-        # Selection: 使用更大温度 + Label Smoothing
-        all_sim_selection = (hs_norm[b] @ p) / selection_temp
-        target = torch.tensor([matched_q_idx], device=device)
+        # Top-k 负采样：只在最相似的 top_k 个 query 中计算 softmax
+        # 这大大减少了负样本数量，使 loss 更容易下降
+        effective_k = min(top_k, Q)
         
-        # Label smoothing 防止过度自信
-        loss_selection = loss_selection + F.cross_entropy(
-            all_sim_selection.unsqueeze(0), 
-            target,
-            label_smoothing=0.1  # 软化目标
-        )
+        if Q > effective_k:
+            # 使用 detach 防止 top-k 选择过程产生梯度
+            _, top_indices = torch.topk(all_sim.detach(), k=effective_k)
+            
+            # 确保匹配的 query 在 top_k 中
+            if matched_q_idx not in top_indices:
+                # 把 matched query 加进去，移除最后一个
+                top_indices = torch.cat([
+                    torch.tensor([matched_q_idx], device=device),
+                    top_indices[:-1]
+                ])
+            
+            # 在 top_k 中找到 matched_q_idx 的位置
+            target_in_topk = (top_indices == matched_q_idx).nonzero(as_tuple=True)[0]
+            
+            # 只取 top_k 的相似度
+            sim_topk = all_sim[top_indices]  # (top_k,)
+            
+            # 计算 cross entropy
+            loss = loss + F.cross_entropy(sim_topk.unsqueeze(0), target_in_topk)
+        else:
+            # Q <= top_k，使用全部
+            target = torch.tensor([matched_q_idx], device=device)
+            loss = loss + F.cross_entropy(all_sim.unsqueeze(0), target)
         
         valid_count += 1
     
     if valid_count > 0:
-        loss_contrastive = loss_contrastive / valid_count
-        loss_selection = loss_selection / valid_count
+        loss = loss / valid_count
     
-    # 降低 selection loss 的贡献
-    return loss_contrastive + selection_weight * loss_selection
+    return loss
 
 def compute_visual_embedding_with_background(
     decoder_features,    # (B, C, H, W) 或 (B, Q, D)
@@ -471,13 +642,18 @@ def align_loss_with_background_margin(
     visual_embed: torch.Tensor,     # (B, D)
     is_background: torch.Tensor,    # (B,) bool
     group_labels: torch.Tensor,     # (B,) 分组标签
-    temp: float = 0.07,
-    margin: float = 0.5
+    temp: float = 0.1,              # 增大温度（原 0.07）
+    margin: float = 0.3             # 降低 margin（原 0.5）
 ):
     """
     改进的对齐损失：
-    1. 同类对齐：supervised contrastive
+    1. 同类对齐：supervised contrastive（使用改进版）
     2. Margin 约束：defect prompt 应该远离 background embedding
+    
+    关键改进:
+    1. 使用更大的温度 0.1
+    2. 降低 margin 到 0.3 避免过度惩罚
+    3. margin loss 权重从 0.5 降低到 0.2
     """
     B = prompt_proto.shape[0]
     device = prompt_proto.device
@@ -485,7 +661,7 @@ def align_loss_with_background_margin(
     p_norm = F.normalize(prompt_proto, dim=-1)
     v_norm = F.normalize(visual_embed, dim=-1)
     
-    # 1. Supervised contrastive loss（同类对齐）
+    # 1. Supervised contrastive loss（同类对齐）- 使用改进后的温度
     loss_align = supervised_contrastive_loss(v_norm, p_norm, group_labels, temp)
     
     # 2. Margin loss: defect prompts 应该远离 background embeddings
@@ -493,22 +669,20 @@ def align_loss_with_background_margin(
     normal_indices = torch.where(is_background)[0]
     
     loss_margin = torch.tensor(0.0, device=device)
-    margin_count = 0
     
     if len(anomaly_indices) > 0 and len(normal_indices) > 0:
-        for ai in anomaly_indices:
-            p_anom = p_norm[ai]
-            for ni in normal_indices:
-                v_bg = v_norm[ni]
-                sim = (p_anom * v_bg).sum()
-                # hinge loss: max(0, sim + margin)
-                loss_margin = loss_margin + F.relu(sim + margin)
-                margin_count += 1
+        # 批量计算而非循环（更高效）
+        p_anom = p_norm[anomaly_indices]  # (Na, D)
+        v_bg = v_norm[normal_indices]     # (Nn, D)
+        
+        # 计算所有异常 prompt 与正常 visual 的相似度
+        sim_matrix = p_anom @ v_bg.t()  # (Na, Nn)
+        
+        # Hinge loss: max(0, sim + margin)
+        loss_margin = F.relu(sim_matrix + margin).mean()
     
-    if margin_count > 0:
-        loss_margin = loss_margin / margin_count
-    
-    return loss_align + 0.5 * loss_margin
+    # 降低 margin loss 权重（原 0.5，改为 0.2）
+    return loss_align + 0.2 * loss_margin
 
 # ==================== 新增函数结束 ====================
 
@@ -855,17 +1029,32 @@ def main(args: argparse.Namespace):
         else:
             p.requires_grad = False
 
+    # === 新增：Decoder 解冻/LoRA 配置 ===
+    # 获取实际的 model_core（处理 DDP 包装的情况）
+    model_for_decoder = model.module if hasattr(model, 'module') else model
+    
+    if getattr(args, 'unfreeze_decoder', 'none') != 'none':
+        print(f"[INFO] Unfreezing decoder with mode: {args.unfreeze_decoder}")
+        unfreeze_decoder_selectively(model_for_decoder, mode=args.unfreeze_decoder)
+    
+    if getattr(args, 'decoder_lora', False):
+        print(f"[INFO] Applying LoRA to decoder (rank={args.decoder_lora_rank}, alpha={args.decoder_lora_alpha})")
+        apply_lora_to_decoder(model_for_decoder, rank=args.decoder_lora_rank, alpha=args.decoder_lora_alpha)
+
     prompt_and_lora: List[torch.nn.Parameter] = []
     other_params: List[torch.nn.Parameter] = []
+    decoder_params: List[torch.nn.Parameter] = []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
         nl = n.lower()
         if ("lora" in nl) or ("prompt" in nl) or ("template" in nl) or ("out_adapter" in nl):
             prompt_and_lora.append(p)
+        elif "decoder" in nl:
+            decoder_params.append(p)
         else:
             other_params.append(p)
-    print(f"[INFO] trainable params: prompt/LoRA={len(prompt_and_lora)}, others={len(other_params)}")
+    print(f"[INFO] trainable params: prompt/LoRA={len(prompt_and_lora)}, decoder={len(decoder_params)}, others={len(other_params)}")
     # Print prompt-related parameters and requires_grad for diagnosis
     print("[INFO] Prompt-related params (name, requires_grad, shape):")
     for n, p in model.named_parameters():
@@ -891,11 +1080,18 @@ def main(args: argparse.Namespace):
     else:
         learnable_log_vars = []
 
-    # Build optimizer with separate group for learnable log vars to avoid weight decay
+    # Build optimizer with separate groups for different learning rates
     param_groups = [
         {"params": prompt_and_lora, "lr": args.lr_prompt},
         {"params": other_params, "lr": args.lr_main},
     ]
+    
+    # 新增：为 decoder 参数添加单独的参数组（使用较小的学习率）
+    if len(decoder_params) > 0:
+        decoder_lr = args.lr_main * 0.5  # decoder 使用更小的学习率以稳定训练
+        param_groups.append({"params": decoder_params, "lr": decoder_lr})
+        print(f"[INFO] Added {len(decoder_params)} decoder params with lr={decoder_lr}")
+    
     if len(learnable_log_vars) > 0:
         param_groups.append({"params": learnable_log_vars, "lr": args.lr_main, "weight_decay": 0.0})
 
@@ -1533,11 +1729,26 @@ def main(args: argparse.Namespace):
 
                     # ===== Step 4: 计算改进的 align loss =====
                     if prompt_proto is not None:
-                        # 构建分组标签（同类 defect 互为正样本）
-                        group_labels = get_prompt_group_labels(prompt_lists, class_names, device)
+                        # 选择分组策略
+                        if getattr(args, 'use_anomaly_grouping', False):
+                            # 简单策略：按异常/正常分组（保证有正样本对）
+                            group_labels = get_prompt_group_labels_by_anomaly(prompt_lists, is_anomaly, device)
+                            grouping_method = "anomaly"
+                        else:
+                            # 默认：按 prompt 内容分组
+                            group_labels = get_prompt_group_labels(prompt_lists, class_names, device)
+                            grouping_method = "prompt"
+                        
+                        # 诊断信息：检查分组效果
+                        n_unique_groups = len(torch.unique(group_labels))
+                        n_samples = len(group_labels)
+                        if step % 100 == 0:
+                            print(f"[ALIGN-GROUP] step={step} method={grouping_method} "
+                                  f"n_samples={n_samples} n_unique_groups={n_unique_groups} "
+                                  f"has_multi_positive={n_unique_groups < n_samples}")
                         
                         # 使用带 margin 的 supervised contrastive loss
-                        align_margin = getattr(args, 'align_margin', 0.5)
+                        align_margin = getattr(args, 'align_margin', 0.3)  # 降低默认 margin
                         align_loss = align_loss_with_background_margin(
                             prompt_proto=prompt_proto,
                             visual_embed=visual_embed,
@@ -1559,12 +1770,13 @@ def main(args: argparse.Namespace):
                                     if decoder_hs.shape[0] == Q and decoder_hs.shape[1] == B:
                                         decoder_hs = decoder_hs.permute(1, 0, 2).contiguous()
                                 
-                                # 计算 query-level alignment loss
+                                # 计算 query-level alignment loss（使用改进的参数）
                                 query_align_loss = query_text_alignment_loss(
                                     decoder_hs=decoder_hs,
                                     prompt_proto=prompt_proto,
                                     indices=indices,
-                                    temp=args.align_temp
+                                    temp=getattr(args, 'query_align_temp', 0.2),  # 使用更大的温度
+                                    top_k=getattr(args, 'query_align_top_k', 64)   # 使用 top-k 采样
                                 )
 
                         # ===== Diagnostics =====
@@ -1725,6 +1937,17 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=float, default=None)
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
+    
+    # === Decoder 解冻/LoRA 配置 ===
+    parser.add_argument("--unfreeze_decoder", type=str, default="none",
+                        choices=["none", "last_layer", "last_2_layers", "cross_attn", "all"],
+                        help="Decoder unfreezing mode: none|last_layer|last_2_layers|cross_attn|all")
+    parser.add_argument("--decoder_lora", action="store_true",
+                        help="Apply LoRA to decoder (memory-efficient alternative to unfreezing)")
+    parser.add_argument("--decoder_lora_rank", type=int, default=8,
+                        help="LoRA rank for decoder (higher = more capacity, more memory)")
+    parser.add_argument("--decoder_lora_alpha", type=float, default=16.0,
+                        help="LoRA alpha scaling for decoder")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard base log directory.")
     parser.add_argument("--save_dir", type=str, default="./ckpt", help="Base directory to save checkpoints.")
@@ -1733,7 +1956,7 @@ if __name__ == "__main__":
     parser.add_argument("--balance", action="store_true", help="Enable anomaly/non-anomaly weighted sampler.")
     parser.add_argument("--neg_samples_per_image", type=int, default=50, help="Max negative (unmatched) queries to sample per image for background loss")
     parser.add_argument("--lambda_align", type=float, default=0.1, help="weight for contrastive alignment loss (InfoNCE)")
-    parser.add_argument("--align_temp", type=float, default=0.07, help="temperature for contrastive alignment")
+    parser.add_argument("--align_temp", type=float, default=0.1, help="temperature for contrastive alignment (increased from 0.07 for stability)")
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
     parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
@@ -1745,6 +1968,14 @@ if __name__ == "__main__":
     parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
     parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
     parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
+    
+    # === 新增: align loss 相关参数 ===
+    parser.add_argument("--use_anomaly_grouping", action="store_true", 
+                        help="Use simpler anomaly/normal grouping instead of prompt-based grouping for align loss")
+    parser.add_argument("--query_align_top_k", type=int, default=64, 
+                        help="Top-k queries to compete in query alignment loss (reduces from Q=900 to top_k)")
+    parser.add_argument("--query_align_temp", type=float, default=0.2,
+                        help="Temperature for query alignment loss (higher = softer, easier to learn)")
 
 
     #--------------- Diagnostic logging args ---------------
