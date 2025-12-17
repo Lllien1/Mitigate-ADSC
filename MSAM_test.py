@@ -1,5 +1,12 @@
 # MSAM_test.py (fixed, confidence-head ranking)
 # encoding: utf-8
+# 
+# 改进版本：
+# 1. 分割指标（Dice/IoU/Precision/Recall/F1）仅在 anomaly 样本上计算
+# 2. 假阳性指标（FPR/平均面积）仅在 normal/good 样本上计算
+# 3. 添加 Image-AUC, Pixel-AUC, mIoU, mBIoU 等指标
+# 4. 支持宏平均（macro）和微平均（micro）
+
 import os, sys
 
 PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus/sam3"
@@ -10,7 +17,8 @@ import argparse
 import inspect
 import json
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
+from collections import defaultdict
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter
@@ -23,6 +31,14 @@ from tqdm import tqdm
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
 
+# Optional: sklearn for AUC computation
+try:
+    from sklearn.metrics import roc_auc_score
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    print("[WARN] sklearn not found, AUC metrics will be skipped")
+
 
 # ---------- visualization helpers ----------
 def get_color_map(palette: List[Tuple[int, int, int]], key: str) -> Tuple[int, int, int]:
@@ -33,24 +49,18 @@ def get_color_map(palette: List[Tuple[int, int, int]], key: str) -> Tuple[int, i
 
 
 def _alpha_map_from_mask(mask: np.ndarray, alpha_center: float, alpha_edge: float, power: float = 1.0, blur_sigma: float = 0.8) -> np.ndarray:
-    """Create an alpha map where the interior is more transparent and edges are more opaque.
-    mask: (H,W) bool
-    returns: (H,W) float32 in [0,1]
-    """
+    """Create an alpha map where the interior is more transparent and edges are more opaque."""
     if mask.sum() == 0:
         return np.zeros(mask.shape, dtype=np.float32)
 
-    # distance inside the mask to the nearest background pixel (0 at boundary, larger towards center)
     dist = distance_transform_edt(mask.astype(np.uint8)).astype(np.float32)
     dmax = float(dist.max())
     if dmax <= 1e-6:
-        # very thin mask -> treat as edge
         alpha = np.zeros_like(dist, dtype=np.float32)
         alpha[mask] = float(alpha_edge)
         return alpha
 
-    dist_n = dist / dmax  # 0..1 (boundary..center)
-    # edges deep (high alpha), center shallow (low alpha)
+    dist_n = dist / dmax
     alpha_in = float(alpha_center) + (float(alpha_edge) - float(alpha_center)) * ((1.0 - dist_n) ** float(power))
     alpha = np.zeros_like(dist, dtype=np.float32)
     alpha[mask] = alpha_in[mask]
@@ -70,12 +80,7 @@ def draw_masks_to_frame(
     power: float = 1.0,
     blur_sigma: float = 0.8,
 ) -> np.ndarray:
-    """
-    frame: (H,W,3) uint8
-    masks: (N,H,W) bool
-    colors: (N,3) uint8
-    Produces a "center-light, edge-dark" overlay by varying alpha inside each mask.
-    """
+    """Draw masks with center-light, edge-dark overlay."""
     if masks is None or len(masks) == 0:
         return frame
     out = frame.astype(np.float32)
@@ -88,39 +93,363 @@ def draw_masks_to_frame(
         a = _alpha_map_from_mask(m, alpha_center=alpha_center, alpha_edge=alpha_edge, power=power, blur_sigma=blur_sigma)
         if a.max() <= 0:
             continue
-        # blend with per-pixel alpha
         out = out * (1.0 - a[..., None]) + col[None, None, :] * a[..., None]
 
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+# ---------- Metrics Computation ----------
 def safe_binary_metrics(pred_bin: torch.Tensor, gt_bin: torch.Tensor, eps: float = 1e-6):
     """
-    pred_bin, gt_bin : tensors of shape (H,W) or (N,H,W) with values 0/1
-    Returns per-sample TP, FP, FN, IoU, Dice, Precision, Recall, F1
+    Compute per-sample binary metrics.
+    Returns TP, FP, FN, TN and derived metrics.
     """
     if pred_bin.dim() == 2:
         pred_bin = pred_bin.unsqueeze(0)
         gt_bin = gt_bin.unsqueeze(0)
+    
+    pred_bin = pred_bin.float()
+    gt_bin = gt_bin.float()
+    
     TP = (pred_bin * gt_bin).sum(dim=(1, 2)).float()
     FP = ((pred_bin == 1) & (gt_bin == 0)).sum(dim=(1, 2)).float()
     FN = ((pred_bin == 0) & (gt_bin == 1)).sum(dim=(1, 2)).float()
+    TN = ((pred_bin == 0) & (gt_bin == 0)).sum(dim=(1, 2)).float()
+    
     union = TP + FP + FN
     iou = (TP / (union + eps)).cpu().numpy()
     dice = (2 * TP / (2 * TP + FP + FN + eps)).cpu().numpy()
     precision = (TP / (TP + FP + eps)).cpu().numpy()
     recall = (TP / (TP + FN + eps)).cpu().numpy()
     f1 = (2 * precision * recall / (precision + recall + 1e-12))
+    
+    # Total pixels
+    total_pixels = (pred_bin.shape[1] * pred_bin.shape[2])
+    pred_area_ratio = ((TP + FP) / total_pixels).cpu().numpy()  # predicted mask area ratio
+    
     return {
         "TP": TP.cpu().numpy(),
         "FP": FP.cpu().numpy(),
         "FN": FN.cpu().numpy(),
+        "TN": TN.cpu().numpy(),
         "iou": iou,
         "dice": dice,
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "pred_area_ratio": pred_area_ratio,
     }
+
+
+def compute_biou(pred_bin: torch.Tensor, gt_bin: torch.Tensor, boundary_width: int = 2, eps: float = 1e-6):
+    """
+    Compute Boundary IoU (BIoU).
+    Only considers pixels within `boundary_width` of the mask boundary.
+    """
+    if pred_bin.dim() == 2:
+        pred_bin = pred_bin.unsqueeze(0)
+        gt_bin = gt_bin.unsqueeze(0)
+    
+    B = pred_bin.shape[0]
+    biou_list = []
+    
+    for b in range(B):
+        pred = pred_bin[b].cpu().numpy().astype(np.uint8)
+        gt = gt_bin[b].cpu().numpy().astype(np.uint8)
+        
+        # If both are empty, BIoU = 1.0
+        if pred.sum() == 0 and gt.sum() == 0:
+            biou_list.append(1.0)
+            continue
+        
+        # If only one is empty, BIoU = 0.0
+        if pred.sum() == 0 or gt.sum() == 0:
+            biou_list.append(0.0)
+            continue
+        
+        # Extract boundaries using distance transform
+        pred_dist = distance_transform_edt(pred)
+        pred_boundary = (pred_dist > 0) & (pred_dist <= boundary_width)
+        
+        gt_dist = distance_transform_edt(gt)
+        gt_boundary = (gt_dist > 0) & (gt_dist <= boundary_width)
+        
+        # Also include outer boundary
+        pred_outer_dist = distance_transform_edt(1 - pred)
+        pred_boundary |= (pred_outer_dist > 0) & (pred_outer_dist <= boundary_width) & (pred == 1)
+        
+        gt_outer_dist = distance_transform_edt(1 - gt)
+        gt_boundary |= (gt_outer_dist > 0) & (gt_outer_dist <= boundary_width) & (gt == 1)
+        
+        # Union of boundaries
+        boundary_region = pred_boundary | gt_boundary
+        
+        if boundary_region.sum() == 0:
+            biou_list.append(0.0)
+            continue
+        
+        # Compute IoU only on boundary region
+        pred_on_boundary = pred[boundary_region]
+        gt_on_boundary = gt[boundary_region]
+        
+        intersection = (pred_on_boundary & gt_on_boundary).sum()
+        union = (pred_on_boundary | gt_on_boundary).sum()
+        
+        biou = intersection / (union + eps)
+        biou_list.append(float(biou))
+    
+    return np.array(biou_list)
+
+
+class MetricsAccumulator:
+    """
+    Accumulator for computing metrics with proper separation of anomaly/normal samples.
+    
+    指标说明:
+    =========
+    1. 分割指标 (仅 anomaly 样本):
+       - Dice, IoU, Precision, Recall, F1
+       - mIoU: mean IoU across classes (macro average)
+       - mBIoU: mean Boundary IoU
+       - Micro average: 累加 TP/FP/FN 后计算
+       - Macro average: 每个样本算指标后平均
+    
+    2. 假阳性指标 (仅 normal 样本):
+       - FPR: 预测为异常的 normal 样本比例 (image-level)
+       - Pixel FPR: normal 样本中被预测为异常的像素比例
+       - Mean pred area: normal 样本上预测 mask 的平均面积
+    
+    3. 图像级指标 (全集):
+       - Image-AUC: 基于 anomaly score 的图像级 AUC
+       - Pixel-AUC: 基于像素级预测的 AUC
+    """
+    
+    def __init__(self):
+        # === Anomaly-only segmentation metrics ===
+        self.anomaly_stats = {
+            "TP_sum": 0.0, "FP_sum": 0.0, "FN_sum": 0.0,
+            "iou_sum": 0.0, "dice_sum": 0.0, 
+            "prec_sum": 0.0, "rec_sum": 0.0, "f1_sum": 0.0,
+            "biou_sum": 0.0,
+            "count": 0,
+        }
+        
+        # Per-class stats for anomaly samples (for mIoU)
+        self.anomaly_per_class = defaultdict(lambda: {
+            "TP_sum": 0.0, "FP_sum": 0.0, "FN_sum": 0.0,
+            "iou_sum": 0.0, "dice_sum": 0.0, 
+            "prec_sum": 0.0, "rec_sum": 0.0, "f1_sum": 0.0,
+            "biou_sum": 0.0,
+            "count": 0,
+        })
+        
+        # === Normal-only FPR metrics ===
+        self.normal_stats = {
+            "total_pixels": 0,
+            "fp_pixels": 0,  # pixels incorrectly predicted as defect
+            "images_with_fp": 0,  # images with any FP prediction
+            "pred_area_sum": 0.0,  # sum of predicted mask area ratios
+            "count": 0,
+        }
+        
+        self.normal_per_class = defaultdict(lambda: {
+            "total_pixels": 0,
+            "fp_pixels": 0,
+            "images_with_fp": 0,
+            "pred_area_sum": 0.0,
+            "count": 0,
+        })
+        
+        # === Image-level AUC data ===
+        self.image_labels = []  # 1 for anomaly, 0 for normal
+        self.image_scores = []  # anomaly scores
+        
+        # === Pixel-level AUC data ===
+        self.pixel_preds = []  # flattened predictions (subsample for memory)
+        self.pixel_labels = []  # flattened GT labels
+        self.pixel_subsample_rate = 0.01  # subsample to avoid OOM
+        
+    def update_anomaly(self, metrics: dict, biou: np.ndarray, cls_name: str, 
+                       anomaly_score: float = None):
+        """Update stats for an anomaly sample."""
+        n = len(metrics["iou"])
+        for i in range(n):
+            # Global stats
+            self.anomaly_stats["TP_sum"] += metrics["TP"][i]
+            self.anomaly_stats["FP_sum"] += metrics["FP"][i]
+            self.anomaly_stats["FN_sum"] += metrics["FN"][i]
+            self.anomaly_stats["iou_sum"] += metrics["iou"][i]
+            self.anomaly_stats["dice_sum"] += metrics["dice"][i]
+            self.anomaly_stats["prec_sum"] += metrics["precision"][i]
+            self.anomaly_stats["rec_sum"] += metrics["recall"][i]
+            self.anomaly_stats["f1_sum"] += metrics["f1"][i]
+            self.anomaly_stats["biou_sum"] += biou[i] if i < len(biou) else 0.0
+            self.anomaly_stats["count"] += 1
+            
+            # Per-class stats
+            cls_stats = self.anomaly_per_class[cls_name]
+            cls_stats["TP_sum"] += metrics["TP"][i]
+            cls_stats["FP_sum"] += metrics["FP"][i]
+            cls_stats["FN_sum"] += metrics["FN"][i]
+            cls_stats["iou_sum"] += metrics["iou"][i]
+            cls_stats["dice_sum"] += metrics["dice"][i]
+            cls_stats["prec_sum"] += metrics["precision"][i]
+            cls_stats["rec_sum"] += metrics["recall"][i]
+            cls_stats["f1_sum"] += metrics["f1"][i]
+            cls_stats["biou_sum"] += biou[i] if i < len(biou) else 0.0
+            cls_stats["count"] += 1
+        
+        # Image-level AUC
+        if anomaly_score is not None:
+            self.image_labels.append(1)
+            self.image_scores.append(anomaly_score)
+    
+    def update_normal(self, metrics: dict, cls_name: str, total_pixels: int,
+                      anomaly_score: float = None):
+        """Update stats for a normal/good sample."""
+        n = len(metrics["FP"])
+        for i in range(n):
+            fp = metrics["FP"][i]
+            pred_area = metrics["pred_area_ratio"][i]
+            
+            # Global stats
+            self.normal_stats["total_pixels"] += total_pixels
+            self.normal_stats["fp_pixels"] += fp
+            self.normal_stats["pred_area_sum"] += pred_area
+            if fp > 0:
+                self.normal_stats["images_with_fp"] += 1
+            self.normal_stats["count"] += 1
+            
+            # Per-class stats
+            cls_stats = self.normal_per_class[cls_name]
+            cls_stats["total_pixels"] += total_pixels
+            cls_stats["fp_pixels"] += fp
+            cls_stats["pred_area_sum"] += pred_area
+            if fp > 0:
+                cls_stats["images_with_fp"] += 1
+            cls_stats["count"] += 1
+        
+        # Image-level AUC
+        if anomaly_score is not None:
+            self.image_labels.append(0)
+            self.image_scores.append(anomaly_score)
+    
+    def update_pixel_auc(self, pred_probs: np.ndarray, gt_mask: np.ndarray):
+        """Update pixel-level AUC data with subsampling."""
+        pred_flat = pred_probs.flatten()
+        gt_flat = gt_mask.flatten()
+        
+        # Subsample to avoid memory issues
+        n = len(pred_flat)
+        n_sample = max(1, int(n * self.pixel_subsample_rate))
+        indices = np.random.choice(n, n_sample, replace=False)
+        
+        self.pixel_preds.extend(pred_flat[indices].tolist())
+        self.pixel_labels.extend(gt_flat[indices].tolist())
+    
+    def compute_summary(self) -> dict:
+        """Compute final summary metrics."""
+        results = {}
+        eps = 1e-6
+        
+        # ========== Anomaly-only metrics ==========
+        anom = self.anomaly_stats
+        anom_count = max(anom["count"], 1)
+        
+        # Macro average (mean of per-sample metrics)
+        results["anomaly_macro"] = {
+            "dice": anom["dice_sum"] / anom_count,
+            "iou": anom["iou_sum"] / anom_count,
+            "precision": anom["prec_sum"] / anom_count,
+            "recall": anom["rec_sum"] / anom_count,
+            "f1": anom["f1_sum"] / anom_count,
+            "biou": anom["biou_sum"] / anom_count,
+            "count": anom["count"],
+        }
+        
+        # Micro average (compute from accumulated TP/FP/FN)
+        TP, FP, FN = anom["TP_sum"], anom["FP_sum"], anom["FN_sum"]
+        results["anomaly_micro"] = {
+            "dice": (2 * TP) / (2 * TP + FP + FN + eps),
+            "iou": TP / (TP + FP + FN + eps),
+            "precision": TP / (TP + FP + eps),
+            "recall": TP / (TP + FN + eps),
+        }
+        results["anomaly_micro"]["f1"] = (
+            2 * results["anomaly_micro"]["precision"] * results["anomaly_micro"]["recall"] /
+            (results["anomaly_micro"]["precision"] + results["anomaly_micro"]["recall"] + eps)
+        )
+        
+        # mIoU: mean IoU across classes
+        class_ious = []
+        class_bious = []
+        for cls_name, cls_stats in self.anomaly_per_class.items():
+            if cls_stats["count"] > 0:
+                class_ious.append(cls_stats["iou_sum"] / cls_stats["count"])
+                class_bious.append(cls_stats["biou_sum"] / cls_stats["count"])
+        
+        results["anomaly_macro"]["mIoU"] = np.mean(class_ious) if class_ious else 0.0
+        results["anomaly_macro"]["mBIoU"] = np.mean(class_bious) if class_bious else 0.0
+        
+        # Per-class anomaly results
+        results["anomaly_per_class"] = {}
+        for cls_name, cls_stats in self.anomaly_per_class.items():
+            cnt = max(cls_stats["count"], 1)
+            results["anomaly_per_class"][cls_name] = {
+                "dice": cls_stats["dice_sum"] / cnt,
+                "iou": cls_stats["iou_sum"] / cnt,
+                "precision": cls_stats["prec_sum"] / cnt,
+                "recall": cls_stats["rec_sum"] / cnt,
+                "f1": cls_stats["f1_sum"] / cnt,
+                "biou": cls_stats["biou_sum"] / cnt,
+                "count": cls_stats["count"],
+            }
+        
+        # ========== Normal-only FPR metrics ==========
+        norm = self.normal_stats
+        norm_count = max(norm["count"], 1)
+        
+        results["normal_fpr"] = {
+            "image_fpr": norm["images_with_fp"] / norm_count,  # % of normal images with any FP
+            "pixel_fpr": norm["fp_pixels"] / max(norm["total_pixels"], 1),  # % of FP pixels
+            "mean_pred_area": norm["pred_area_sum"] / norm_count,  # mean predicted area ratio
+            "count": norm["count"],
+        }
+        
+        # Per-class normal FPR
+        results["normal_per_class"] = {}
+        for cls_name, cls_stats in self.normal_per_class.items():
+            cnt = max(cls_stats["count"], 1)
+            results["normal_per_class"][cls_name] = {
+                "image_fpr": cls_stats["images_with_fp"] / cnt,
+                "pixel_fpr": cls_stats["fp_pixels"] / max(cls_stats["total_pixels"], 1),
+                "mean_pred_area": cls_stats["pred_area_sum"] / cnt,
+                "count": cls_stats["count"],
+            }
+        
+        # ========== AUC metrics ==========
+        if HAS_SKLEARN and len(self.image_labels) > 1:
+            labels = np.array(self.image_labels)
+            scores = np.array(self.image_scores)
+            # Need both positive and negative samples for AUC
+            if len(np.unique(labels)) == 2:
+                results["image_auc"] = roc_auc_score(labels, scores)
+            else:
+                results["image_auc"] = float("nan")
+        else:
+            results["image_auc"] = float("nan")
+        
+        if HAS_SKLEARN and len(self.pixel_labels) > 1:
+            labels = np.array(self.pixel_labels)
+            preds = np.array(self.pixel_preds)
+            if len(np.unique(labels)) == 2:
+                results["pixel_auc"] = roc_auc_score(labels, preds)
+            else:
+                results["pixel_auc"] = float("nan")
+        else:
+            results["pixel_auc"] = float("nan")
+        
+        return results
 
 
 # ---------- model/dataloader helpers ----------
@@ -130,10 +459,6 @@ def _filter_kwargs_for_callable(func, kwargs: dict):
 
 
 def _infer_class_list(meta: dict) -> List[str]:
-    """
-    Support typical meta.json for MVTec:
-      meta['train'][cls] / meta['test'][cls] are lists.
-    """
     if not isinstance(meta, dict):
         return []
     if "train" in meta or "test" in meta:
@@ -202,7 +527,6 @@ def _normalize_bq(x: Optional[torch.Tensor], B: int, Q: int, device: torch.devic
         x = torch.as_tensor(x)
     x = x.to(device)
 
-    # common: (L,B,Q,1) or (B,L,Q,1) or (B,Q,1) or (B,Q)
     if x.dim() == 5:
         x = x[-1]
     if x.dim() == 4:
@@ -259,22 +583,19 @@ def load_model(args, device: torch.device):
         meta = json.load(f)
     class_list = _infer_class_list(meta)
     if not class_list:
-        raise ValueError("Could not infer class_list from meta.json. Expected keys: train/test -> class dicts.")
+        raise ValueError("Could not infer class_list from meta.json.")
     args.class_list = class_list
 
     Constructor = FineTuneSAM3Official if args.use_official else FineTuneSAM3
     ctor_kwargs = _filter_kwargs_for_callable(Constructor, common_kwargs)
-    ctor_kwargs.update(
-        {
-            "class_list": args.class_list,
-            "prompt_learner_type": getattr(args, "prompt_learner_type", "perclass"),
-            "num_templates": getattr(args, "num_templates", 4),
-            "n_ctx": getattr(args, "n_ctx", 4),
-        }
-    )
+    ctor_kwargs.update({
+        "class_list": args.class_list,
+        "prompt_learner_type": getattr(args, "prompt_learner_type", "perclass"),
+        "num_templates": getattr(args, "num_templates", 4),
+        "n_ctx": getattr(args, "n_ctx", 4),
+    })
     model = Constructor(**ctor_kwargs).to(device).eval()
 
-    # optionally load fine-tuned weights
     if args.ckpt and os.path.exists(args.ckpt):
         print(f"[INFO] Loading fine-tuned checkpoint {args.ckpt} ...")
         ckpt = torch.load(args.ckpt, map_location=device)
@@ -285,13 +606,13 @@ def load_model(args, device: torch.device):
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"[INFO] Loaded fine-tuned weights. missing={len(missing)} unexpected={len(unexpected)}")
     else:
-        print("[INFO] No fine-tuned checkpoint provided (or path not found). Using base SAM3 weights.")
+        print("[INFO] No fine-tuned checkpoint provided. Using base SAM3 weights.")
 
     return model
 
 
 def _get_sample_id_from_meta(ds, global_idx: int, fallback_cls: str, fallback_specie: str):
-    """Try to recover the meta.json entry used by the dataset, then derive {specie}_{cls}_{index}.{ext}."""
+    """Try to recover the meta.json entry for naming."""
     meta_entry = None
     for attr in ("items", "meta_list", "data_list", "samples", "records", "metas", "data"):
         v = getattr(ds, attr, None)
@@ -316,12 +637,12 @@ def _get_sample_id_from_meta(ds, global_idx: int, fallback_cls: str, fallback_sp
             if ext2:
                 ext = ext2
 
-    # final sanitize (avoid empty)
     if not specie_name:
         specie_name = "unknown"
     if not cls_name:
         cls_name = "unknown"
     return specie_name, cls_name, stem, ext
+
 
 # ---------- main inference ----------
 @torch.no_grad()
@@ -339,7 +660,7 @@ def run_inference(args):
         save_dir=getattr(args, "save_dir", None),
     )
     model = load_model(args, device)
-    # If you only pass --save_dir (as in the original repo scripts), place visual outputs under that run folder.
+    
     if getattr(args, "save_dir", None) and (not getattr(args, "output_dir", None) or args.output_dir == "./outputs"):
         args.output_dir = os.path.join(args.save_dir, "outputs")
 
@@ -357,17 +678,23 @@ def run_inference(args):
 
     to_pil = transforms.ToPILImage()
 
-    global_stats = dict(iou_sum=0.0, dice_sum=0.0, prec_sum=0.0, rec_sum=0.0, f1_sum=0.0, img_count=0)
-    per_class_stats = {}
-    per_class_counts = {}
+    # Initialize metrics accumulator
+    metrics_acc = MetricsAccumulator()
 
     dataset_len = len(loader.dataset) if hasattr(loader, "dataset") else 0
-    pbar = tqdm(total=dataset_len, desc="Inference", unit="img", leave=True)
+    pbar = tqdm(
+        total=dataset_len,
+        desc="Inference",
+        unit="img",
+        leave=False,          # ⭐ 关键：不保留历史行
+        dynamic_ncols=True,   # ⭐ 自动适配终端宽度
+        mininterval=0.2,      # ⭐ 最少 0.2s 才刷新一次
+    )
+
 
     total_time = 0.0
     total_imgs = 0
-    idx = 0
-    dataset_pos = 0  # global index into dataset (shuffle=False)
+    dataset_pos = 0
 
     for images, masks, prompt_lists, is_anomaly, class_names, specie_names in loader:
         images = images.to(device)
@@ -396,7 +723,6 @@ def run_inference(args):
         total_imgs += batch_imgs
 
         pred_masks = out["pred_masks"]
-        # official can return (L,B,Q,H,W)
         if pred_masks.dim() == 5:
             pred_masks = pred_masks[-1]
         pred_masks = torch.sigmoid(pred_masks)
@@ -404,12 +730,13 @@ def run_inference(args):
         if pred_masks.shape[-2:] != masks.shape[-2:]:
             pred_masks = F.interpolate(pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False)
 
-        # --- (C) ranking: confidence heads ---
+        # --- ranking: confidence heads ---
         B, Q = pred_masks.shape[0], pred_masks.shape[1]
         presence_bq = _normalize_bq(out.get("presence_logit", None), B, Q, device=device)
         iou_bq = _normalize_bq(out.get("iou_predictions", None), B, Q, device=device)
         presence_prob = _to_prob(presence_bq)
         iou_prob = _to_prob(iou_bq)
+        
         if presence_prob is not None and iou_prob is not None:
             query_scores = presence_prob * iou_prob
         elif presence_prob is not None:
@@ -417,24 +744,20 @@ def run_inference(args):
         elif iou_prob is not None:
             query_scores = iou_prob
         else:
-            query_scores = None  # fallback to mean-mask
+            query_scores = None
 
         gt = (masks > 0.5).float().to(device)
 
         for b in range(batch_imgs):
             cls_name = class_names[b]
-            if cls_name not in per_class_stats:
-                per_class_stats[cls_name] = dict(iou_sum=0.0, dice_sum=0.0, prec_sum=0.0, rec_sum=0.0, f1_sum=0.0)
-                per_class_counts[cls_name] = 0
-
+            is_anom = is_anomaly[b]
+            
             prompts_b = prompt_lists[b] if prompt_lists else []
-            prompts_b = prompts_b if isinstance(prompts_b, list) else [prompts_b]
-            base_prompt = prompts_b[0] if prompts_b else cls_name
+            base_prompt = prompts_b[0] if prompts_b else "defect"
+            pm = pred_masks[b]  # (Q, H, W)
+            gm = gt[b].squeeze(0) if gt[b].dim() == 3 else gt[b]  # (H, W)
 
-            pm = pred_masks[b]  # (Q,H,W)
-            gm = gt[b].squeeze(0).float()  # (H,W)
-
-            # candidates
+            # candidates selection
             conf_thresh = float(getattr(args, "conf_thresh", 0.3))
             top_k = int(getattr(args, "top_k", 5))
 
@@ -454,7 +777,8 @@ def run_inference(args):
                 else:
                     s_q = float(np.mean(m_q))
                 scores.append(s_q)
-                labels.append(f"q{q}:{base_prompt}")
+                # 只使用 prompt 作为标签，不再显示 query 索引
+                labels.append(base_prompt)
 
             cand = [(s, m, lab) for s, m, lab in zip(scores, masks_list, labels) if s >= conf_thresh]
             cand.sort(key=lambda x: x[0], reverse=True)
@@ -463,36 +787,52 @@ def run_inference(args):
             if cand:
                 masks_stack = np.stack([(c[1] > 0.5) for c in cand]).astype(bool)
                 pm_comb = torch.from_numpy(masks_stack.max(axis=0).astype(np.float32)).to(device)
+                max_score = cand[0][0]  # highest confidence as anomaly score
             else:
                 masks_stack = None
                 pm_comb = torch.zeros_like(gm).to(device)
+                max_score = 0.0
 
+            # Compute metrics
             metrics = safe_binary_metrics(pm_comb, gm)
-            iou = float(metrics["iou"][0])
-            dice = float(metrics["dice"][0])
-            prec = float(metrics["precision"][0])
-            rec = float(metrics["recall"][0])
-            f1 = float(metrics["f1"][0])
+            biou = compute_biou(pm_comb, gm)
+            
+            total_pixels = int(gm.numel())
+            
+            # ========== Key change: separate anomaly vs normal ==========
+            if is_anom:
+                # Anomaly sample: compute segmentation metrics
+                metrics_acc.update_anomaly(metrics, biou, cls_name, anomaly_score=max_score)
+            else:
+                # Normal sample: compute FPR metrics only
+                metrics_acc.update_normal(metrics, cls_name, total_pixels, anomaly_score=max_score)
+            
+            # Update pixel-level AUC data (for both anomaly and normal)
+            if cand:
+                pred_prob_map = masks_stack.max(axis=0).astype(np.float32)
+            else:
+                pred_prob_map = np.zeros(gm.shape, dtype=np.float32)
+            gt_map = gm.cpu().numpy()
+            metrics_acc.update_pixel_auc(pred_prob_map, gt_map)
 
-            global_stats["iou_sum"] += iou
-            global_stats["dice_sum"] += dice
-            global_stats["prec_sum"] += prec
-            global_stats["rec_sum"] += rec
-            global_stats["f1_sum"] += f1
-            global_stats["img_count"] += 1
-
-            per_class_stats[cls_name]["iou_sum"] += iou
-            per_class_stats[cls_name]["dice_sum"] += dice
-            per_class_stats[cls_name]["prec_sum"] += prec
-            per_class_stats[cls_name]["rec_sum"] += rec
-            per_class_stats[cls_name]["f1_sum"] += f1
-            per_class_counts[cls_name] += 1
-
-            # visualization
+            # ========== Visualization ==========
             img_pil = to_pil(images[b].cpu())
             frame = np.array(img_pil.convert("RGB"), dtype=np.uint8)
 
-            if cand and masks_stack is not None:
+            # For NORMAL samples: don't show predicted masks (they are false positives)
+            # Only show masks for ANOMALY samples
+            if not is_anom:
+                # Normal sample - show clean image with "NORMAL" label
+                overlay_pil = Image.fromarray(frame)
+                draw = ImageDraw.Draw(overlay_pil)
+                # Show info about false positive predictions (if any)
+                if cand:
+                    fp_info = f"NORMAL (FP: {len(cand)} queries, max={max_score:.2f})"
+                    draw.text((5, 5), fp_info, font=font, fill=(255, 165, 0))  # orange for warning
+                else:
+                    draw.text((5, 5), "NORMAL (clean)", font=font, fill=(0, 255, 0))  # green
+            elif cand and masks_stack is not None:
+                # Anomaly sample with predictions - show masks
                 prompts_for_color = [c[2] for c in cand]
                 scores_for_prompt = [c[0] for c in cand]
                 colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
@@ -525,12 +865,12 @@ def run_inference(args):
                     draw.rectangle([x0 + pad, y, x0 + pad + box_w, y + box_w], fill=col)
                     draw.text((x0 + pad + box_w + 4, y - 1), txt, font=font, fill=(255, 255, 255))
             else:
+                # Anomaly sample but no predictions above threshold
                 overlay_pil = Image.fromarray(frame)
                 draw = ImageDraw.Draw(overlay_pil)
-                draw.text((5, 5), f"no mask >= {conf_thresh:.2f}", font=font, fill=(255, 0, 0))
+                draw.text((5, 5), f"ANOMALY (no mask >= {conf_thresh:.2f})", font=font, fill=(255, 0, 0))
 
             # save
-            # save (follow meta.json naming: {specie_name}_{cls_name}_{index}.png)
             sample_dir = os.path.join(args.output_dir, cls_name)
             os.makedirs(sample_dir, exist_ok=True)
 
@@ -546,33 +886,109 @@ def run_inference(args):
         dataset_pos += batch_imgs
         pbar.update(batch_imgs)
         fps = (total_imgs / total_time) if total_time > 0 else 0.0
-        pbar.set_postfix({"imgs": int(total_imgs), "fps": f"{fps:.2f}"})
+        pbar.set_postfix(
+            {"imgs": int(total_imgs), "fps": f"{fps:.2f}"},
+            refresh=False   # ⭐ 不要每次都强制 redraw
+        )
+
 
     pbar.close()
 
-    # summary
-    final_img_count = int(global_stats.get("img_count", 0))
+    # ========== Compute and print summary ==========
+    results = metrics_acc.compute_summary()
+    
+    print("\n" + "=" * 70)
+    print("                         EVALUATION RESULTS")
+    print("=" * 70)
+    
+    # --- Anomaly-only metrics ---
+    print("\n[1] ANOMALY SAMPLES - Segmentation Metrics")
+    print("-" * 50)
+    anom_macro = results["anomaly_macro"]
+    anom_micro = results["anomaly_micro"]
+    
+    print(f"  Sample count: {anom_macro['count']}")
+    print(f"\n  Macro Average (mean of per-sample metrics):")
+    print(f"    Dice:      {anom_macro['dice']:.4f}")
+    print(f"    IoU:       {anom_macro['iou']:.4f}")
+    print(f"    Precision: {anom_macro['precision']:.4f}")
+    print(f"    Recall:    {anom_macro['recall']:.4f}")
+    print(f"    F1:        {anom_macro['f1']:.4f}")
+    print(f"    BIoU:      {anom_macro['biou']:.4f}")
+    print(f"    mIoU:      {anom_macro['mIoU']:.4f}")
+    print(f"    mBIoU:     {anom_macro['mBIoU']:.4f}")
+    
+    print(f"\n  Micro Average (from accumulated TP/FP/FN):")
+    print(f"    Dice:      {anom_micro['dice']:.4f}")
+    print(f"    IoU:       {anom_micro['iou']:.4f}")
+    print(f"    Precision: {anom_micro['precision']:.4f}")
+    print(f"    Recall:    {anom_micro['recall']:.4f}")
+    print(f"    F1:        {anom_micro['f1']:.4f}")
+    
+    # Per-class anomaly metrics
+    print("\n  Per-Class Anomaly Metrics:")
+    for cls_name in sorted(results["anomaly_per_class"].keys()):
+        cls_res = results["anomaly_per_class"][cls_name]
+        if cls_res["count"] > 0:
+            print(f"    {cls_name}: n={cls_res['count']}, "
+                  f"Dice={cls_res['dice']:.4f}, IoU={cls_res['iou']:.4f}, "
+                  f"P={cls_res['precision']:.4f}, R={cls_res['recall']:.4f}")
+    
+    # --- Normal-only FPR metrics ---
+    print("\n[2] NORMAL SAMPLES - False Positive Metrics")
+    print("-" * 50)
+    norm_fpr = results["normal_fpr"]
+    print(f"  Sample count: {norm_fpr['count']}")
+    print(f"  Image-level FPR: {norm_fpr['image_fpr']:.4f} ({norm_fpr['image_fpr']*100:.2f}% have false positives)")
+    print(f"  Pixel-level FPR: {norm_fpr['pixel_fpr']:.6f} ({norm_fpr['pixel_fpr']*100:.4f}% pixels)")
+    print(f"  Mean pred area:  {norm_fpr['mean_pred_area']:.6f} ({norm_fpr['mean_pred_area']*100:.4f}% of image)")
+    
+    # Per-class normal FPR
+    print("\n  Per-Class Normal FPR:")
+    for cls_name in sorted(results["normal_per_class"].keys()):
+        cls_res = results["normal_per_class"][cls_name]
+        if cls_res["count"] > 0:
+            print(f"    {cls_name}: n={cls_res['count']}, "
+                  f"img_fpr={cls_res['image_fpr']:.4f}, "
+                  f"px_fpr={cls_res['pixel_fpr']:.6f}, "
+                  f"area={cls_res['mean_pred_area']:.6f}")
+    
+    # --- AUC metrics ---
+    print("\n[3] IMAGE & PIXEL LEVEL AUC")
+    print("-" * 50)
+    print(f"  Image-AUC: {results['image_auc']:.4f}" if not np.isnan(results['image_auc']) else "  Image-AUC: N/A (need both pos/neg samples)")
+    print(f"  Pixel-AUC: {results['pixel_auc']:.4f}" if not np.isnan(results['pixel_auc']) else "  Pixel-AUC: N/A (need both pos/neg samples)")
+    
+    # --- Summary ---
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
     final_speed = (total_imgs / total_time) if total_time > 0 else 0.0
-    final_dice = (global_stats["dice_sum"] / final_img_count) if final_img_count > 0 else 0.0
-    final_iou = (global_stats["iou_sum"] / final_img_count) if final_img_count > 0 else 0.0
-    final_prec = (global_stats["prec_sum"] / final_img_count) if final_img_count > 0 else 0.0
-    final_rec = (global_stats["rec_sum"] / final_img_count) if final_img_count > 0 else 0.0
-    final_f1 = (global_stats["f1_sum"] / final_img_count) if final_img_count > 0 else 0.0
-
-    print("\n========== Global Summary ==========")
-    print(f"images={final_img_count}, fps={final_speed:.2f}")
-    print(f"dice={final_dice:.4f}, iou={final_iou:.4f}, prec={final_prec:.4f}, rec={final_rec:.4f}, f1={final_f1:.4f}")
-
-    print("\n========== Per-Class Summary ==========")
-    for cls, cnt in sorted(per_class_counts.items(), key=lambda x: x[0]):
-        if cnt <= 0:
-            continue
-        iou = per_class_stats[cls]["iou_sum"] / cnt
-        dice = per_class_stats[cls]["dice_sum"] / cnt
-        prec = per_class_stats[cls]["prec_sum"] / cnt
-        rec = per_class_stats[cls]["rec_sum"] / cnt
-        f1 = per_class_stats[cls]["f1_sum"] / cnt
-        print(f"  {cls}: n={cnt}, dice={dice:.4f}, iou={iou:.4f}, prec={prec:.4f}, rec={rec:.4f}, f1={f1:.4f}")
+    print(f"  Total images: {total_imgs}, Speed: {final_speed:.2f} fps")
+    print(f"  Anomaly samples: {anom_macro['count']}, Normal samples: {norm_fpr['count']}")
+    print(f"\n  Key Metrics (anomaly-only):")
+    print(f"    mIoU:  {anom_macro['mIoU']:.4f}")
+    print(f"    mBIoU: {anom_macro['mBIoU']:.4f}")
+    print(f"    Dice:  {anom_macro['dice']:.4f}")
+    print(f"\n  Key Metrics (normal-only):")
+    print(f"    Image FPR: {norm_fpr['image_fpr']:.4f}")
+    print(f"    Pixel FPR: {norm_fpr['pixel_fpr']:.6f}")
+    print("=" * 70)
+    
+    # Save results to JSON
+    results_path = os.path.join(args.output_dir, "evaluation_results.json")
+    with open(results_path, "w") as f:
+        # Convert numpy types to Python types for JSON serialization
+        def convert(obj):
+            if isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            return obj
+        json.dump(convert(results), f, indent=2)
+    print(f"\nResults saved to: {results_path}")
 
 
 if __name__ == "__main__":
@@ -596,7 +1012,7 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
 
-    # prompt learner config (kept compatible)
+    # prompt learner config
     parser.add_argument("--prompt_learner_type", type=str, default="perclass")
     parser.add_argument("--num_templates", type=int, default=4)
     parser.add_argument("--n_ctx", type=int, default=4)
@@ -605,7 +1021,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_from_test", action="store_true")
     parser.add_argument("--specie_split_ratio", type=float, default=0.8)
     parser.add_argument("--specie_split_seed", type=int, default=42)
-    parser.add_argument("--save_dir", type=str, default=None, help="run folder to read/write per-specie splits")
+    parser.add_argument("--save_dir", type=str, default=None)
 
     # parallel lora args
     parser.add_argument("--enable_parallel_lora", action="store_true")
@@ -613,14 +1029,14 @@ if __name__ == "__main__":
     parser.add_argument("--parallel_lora_alpha", type=float, default=None)
 
     # ranking thresholds
-    parser.add_argument("--conf_thresh", type=float, default=0.6, help="confidence threshold on (presence*iou)")
-    parser.add_argument("--top_k", type=int, default=5, help="keep top-k queries per image")
+    parser.add_argument("--conf_thresh", type=float, default=0.6)
+    parser.add_argument("--top_k", type=int, default=5)
 
-    # visualization (center-light, edge-dark mask overlay)
-    parser.add_argument("--mask_alpha_center", type=float, default=0.1, help="alpha at mask center (more transparent)")
-    parser.add_argument("--mask_alpha_edge", type=float, default=0.9, help="alpha at mask boundary (more opaque)")
-    parser.add_argument("--mask_alpha_power", type=float, default=1.0, help="alpha falloff power from edge to center")
-    parser.add_argument("--mask_alpha_blur", type=float, default=0.8, help="gaussian blur sigma for alpha map")
+    # visualization
+    parser.add_argument("--mask_alpha_center", type=float, default=0.1)
+    parser.add_argument("--mask_alpha_edge", type=float, default=0.9)
+    parser.add_argument("--mask_alpha_power", type=float, default=1.0)
+    parser.add_argument("--mask_alpha_blur", type=float, default=0.8)
 
     args = parser.parse_args()
     run_inference(args)
