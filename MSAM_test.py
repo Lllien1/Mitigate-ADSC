@@ -13,6 +13,7 @@ import time
 from typing import List, Optional, Tuple
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
@@ -31,21 +32,65 @@ def get_color_map(palette: List[Tuple[int, int, int]], key: str) -> Tuple[int, i
     return palette[idx]
 
 
-def draw_masks_to_frame(frame: np.ndarray, masks: np.ndarray, colors: np.ndarray, alpha: float = 0.55) -> np.ndarray:
+def _alpha_map_from_mask(mask: np.ndarray, alpha_center: float, alpha_edge: float, power: float = 1.0, blur_sigma: float = 0.8) -> np.ndarray:
+    """Create an alpha map where the interior is more transparent and edges are more opaque.
+    mask: (H,W) bool
+    returns: (H,W) float32 in [0,1]
+    """
+    if mask.sum() == 0:
+        return np.zeros(mask.shape, dtype=np.float32)
+
+    # distance inside the mask to the nearest background pixel (0 at boundary, larger towards center)
+    dist = distance_transform_edt(mask.astype(np.uint8)).astype(np.float32)
+    dmax = float(dist.max())
+    if dmax <= 1e-6:
+        # very thin mask -> treat as edge
+        alpha = np.zeros_like(dist, dtype=np.float32)
+        alpha[mask] = float(alpha_edge)
+        return alpha
+
+    dist_n = dist / dmax  # 0..1 (boundary..center)
+    # edges deep (high alpha), center shallow (low alpha)
+    alpha_in = float(alpha_center) + (float(alpha_edge) - float(alpha_center)) * ((1.0 - dist_n) ** float(power))
+    alpha = np.zeros_like(dist, dtype=np.float32)
+    alpha[mask] = alpha_in[mask]
+
+    if blur_sigma and blur_sigma > 0:
+        alpha = gaussian_filter(alpha, sigma=float(blur_sigma))
+        alpha = np.clip(alpha, 0.0, 1.0)
+    return alpha.astype(np.float32)
+
+
+def draw_masks_to_frame(
+    frame: np.ndarray,
+    masks: np.ndarray,
+    colors: np.ndarray,
+    alpha_center: float = 0.25,
+    alpha_edge: float = 0.80,
+    power: float = 1.0,
+    blur_sigma: float = 0.8,
+) -> np.ndarray:
     """
     frame: (H,W,3) uint8
     masks: (N,H,W) bool
     colors: (N,3) uint8
+    Produces a "center-light, edge-dark" overlay by varying alpha inside each mask.
     """
     if masks is None or len(masks) == 0:
         return frame
     out = frame.astype(np.float32)
+
     for i in range(masks.shape[0]):
-        m = masks[i]
+        m = masks[i].astype(bool)
         if m.sum() == 0:
             continue
         col = colors[i].astype(np.float32)
-        out[m] = out[m] * (1 - alpha) + col * alpha
+        a = _alpha_map_from_mask(m, alpha_center=alpha_center, alpha_edge=alpha_edge, power=power, blur_sigma=blur_sigma)
+        if a.max() <= 0:
+            continue
+        # blend with per-pixel alpha
+        out = out * (1.0 - a[..., None]) + col[None, None, :] * a[..., None]
+
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -245,6 +290,39 @@ def load_model(args, device: torch.device):
     return model
 
 
+def _get_sample_id_from_meta(ds, global_idx: int, fallback_cls: str, fallback_specie: str):
+    """Try to recover the meta.json entry used by the dataset, then derive {specie}_{cls}_{index}.{ext}."""
+    meta_entry = None
+    for attr in ("items", "meta_list", "data_list", "samples", "records", "metas", "data"):
+        v = getattr(ds, attr, None)
+        if isinstance(v, list) and global_idx < len(v):
+            meta_entry = v[global_idx]
+            break
+
+    cls_name = fallback_cls
+    specie_name = fallback_specie
+    stem = f"{global_idx:03d}"
+    ext = ".png"
+
+    if isinstance(meta_entry, dict):
+        cls_name = meta_entry.get("cls_name", cls_name)
+        specie_name = meta_entry.get("specie_name", specie_name)
+        img_path = meta_entry.get("img_path") or meta_entry.get("image_path") or meta_entry.get("img")
+        if isinstance(img_path, str) and img_path:
+            base = os.path.basename(img_path)
+            stem2, ext2 = os.path.splitext(base)
+            if stem2:
+                stem = stem2
+            if ext2:
+                ext = ext2
+
+    # final sanitize (avoid empty)
+    if not specie_name:
+        specie_name = "unknown"
+    if not cls_name:
+        cls_name = "unknown"
+    return specie_name, cls_name, stem, ext
+
 # ---------- main inference ----------
 @torch.no_grad()
 def run_inference(args):
@@ -289,6 +367,7 @@ def run_inference(args):
     total_time = 0.0
     total_imgs = 0
     idx = 0
+    dataset_pos = 0  # global index into dataset (shuffle=False)
 
     for images, masks, prompt_lists, is_anomaly, class_names, specie_names in loader:
         images = images.to(device)
@@ -417,7 +496,13 @@ def run_inference(args):
                 prompts_for_color = [c[2] for c in cand]
                 scores_for_prompt = [c[0] for c in cand]
                 colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
-                frame = draw_masks_to_frame(frame, masks_stack, colors)
+                frame = draw_masks_to_frame(
+                    frame, masks_stack, colors,
+                    alpha_center=float(getattr(args, 'mask_alpha_center', 0.25)),
+                    alpha_edge=float(getattr(args, 'mask_alpha_edge', 0.80)),
+                    power=float(getattr(args, 'mask_alpha_power', 1.0)),
+                    blur_sigma=float(getattr(args, 'mask_alpha_blur', 0.8)),
+                )
                 overlay_pil = Image.fromarray(frame)
 
                 draw = ImageDraw.Draw(overlay_pil)
@@ -445,13 +530,20 @@ def run_inference(args):
                 draw.text((5, 5), f"no mask >= {conf_thresh:.2f}", font=font, fill=(255, 0, 0))
 
             # save
+            # save (follow meta.json naming: {specie_name}_{cls_name}_{index}.png)
             sample_dir = os.path.join(args.output_dir, cls_name)
             os.makedirs(sample_dir, exist_ok=True)
-            filename = f"{idx:06d}_dice{dice:.3f}_iou{iou:.3f}.png"
+
+            global_i = dataset_pos + b
+            specie_n = specie_names[b] if specie_names else ""
+            cls_n = cls_name
+            specie_n, cls_n, stem, ext = _get_sample_id_from_meta(loader.dataset, global_i, cls_n, specie_n)
+
+            filename = f"{specie_n}_{cls_n}_{stem}{ext}"
             overlay_path = os.path.join(sample_dir, filename)
             overlay_pil.save(overlay_path)
-            idx += 1
 
+        dataset_pos += batch_imgs
         pbar.update(batch_imgs)
         fps = (total_imgs / total_time) if total_time > 0 else 0.0
         pbar.set_postfix({"imgs": int(total_imgs), "fps": f"{fps:.2f}"})
@@ -523,6 +615,12 @@ if __name__ == "__main__":
     # ranking thresholds
     parser.add_argument("--conf_thresh", type=float, default=0.6, help="confidence threshold on (presence*iou)")
     parser.add_argument("--top_k", type=int, default=5, help="keep top-k queries per image")
+
+    # visualization (center-light, edge-dark mask overlay)
+    parser.add_argument("--mask_alpha_center", type=float, default=0.1, help="alpha at mask center (more transparent)")
+    parser.add_argument("--mask_alpha_edge", type=float, default=0.9, help="alpha at mask boundary (more opaque)")
+    parser.add_argument("--mask_alpha_power", type=float, default=1.0, help="alpha falloff power from edge to center")
+    parser.add_argument("--mask_alpha_blur", type=float, default=0.8, help="gaussian blur sigma for alpha map")
 
     args = parser.parse_args()
     run_inference(args)
