@@ -1035,18 +1035,42 @@ def main(args: argparse.Namespace):
         meta = json.load(f)
     
     # ==================== 修复：正确解析 meta.json 获取类别列表 ====================
-    # meta.json 结构通常是: {"train": {"bottle": [...], ...}, "test": {"bottle": [...], ...}}
-    # 需要从 train/test 的子key中提取真正的类别名
+    # 问题：旧代码使用 meta.keys() 导致 class_list = ["train", "test"]（2类）
+    # 修复：从 meta["train"]/meta["test"] 的子字典中提取真正的类别名
+    
+    print("=" * 80)
+    print("[CLASS LIST DIAGNOSTIC] 类别解析诊断开始")
+    print("=" * 80)
+    print(f"[DIAG] meta.json 路径: {args.meta_path}")
+    print(f"[DIAG] meta 类型: {type(meta)}")
+    print(f"[DIAG] meta 顶层 keys: {list(meta.keys()) if isinstance(meta, dict) else 'N/A'}")
+    
+    # 打印每个顶层key的结构
+    if isinstance(meta, dict):
+        for top_key in list(meta.keys())[:5]:  # 最多打印5个
+            val = meta[top_key]
+            if isinstance(val, dict):
+                print(f"[DIAG]   meta['{top_key}'] 是 dict，子keys: {list(val.keys())[:10]}... (共{len(val)}个)")
+            elif isinstance(val, list):
+                print(f"[DIAG]   meta['{top_key}'] 是 list，长度: {len(val)}")
+            else:
+                print(f"[DIAG]   meta['{top_key}'] 类型: {type(val)}")
+    
     def _infer_class_list_from_meta(meta_dict):
         """从 meta.json 正确推断类别列表"""
         if not isinstance(meta_dict, dict):
+            print("[DIAG] meta 不是 dict，返回空列表")
             return []
         
         # 情况1: meta 直接有 "classes" 或 "class_list" key
         if "classes" in meta_dict and isinstance(meta_dict["classes"], list):
-            return sorted(list(meta_dict["classes"]))
+            result = sorted(list(meta_dict["classes"]))
+            print(f"[DIAG] 使用 meta['classes'] 提取类别: {result}")
+            return result
         if "class_list" in meta_dict and isinstance(meta_dict["class_list"], list):
-            return sorted(list(meta_dict["class_list"]))
+            result = sorted(list(meta_dict["class_list"]))
+            print(f"[DIAG] 使用 meta['class_list'] 提取类别: {result}")
+            return result
         
         # 情况2: meta 结构是 {"train": {cls: [...]}, "test": {cls: [...]}}
         # 需要从 train/test 的子字典中提取类别名
@@ -1055,31 +1079,66 @@ def main(args: argparse.Namespace):
             test_keys = []
             if isinstance(meta_dict.get("train"), dict):
                 train_keys = list(meta_dict["train"].keys())
+                print(f"[DIAG]   从 meta['train'] 提取: {train_keys}")
             if isinstance(meta_dict.get("test"), dict):
                 test_keys = list(meta_dict["test"].keys())
+                print(f"[DIAG]   从 meta['test'] 提取: {test_keys}")
             combined = set(train_keys + test_keys)
             if combined:
-                return sorted(list(combined))
+                result = sorted(list(combined))
+                print(f"[DIAG] 使用 train/test 子keys 合并提取类别")
+                return result
         
         # 情况3: fallback - 但要排除 "train", "test" 这种顶层key
         all_keys = list(meta_dict.keys())
-        # 过滤掉可能的 split 名称
         filtered_keys = [k for k in all_keys if k not in ("train", "test", "val", "validation")]
         if filtered_keys:
+            print(f"[DIAG] 使用 fallback (过滤后的顶层keys): {filtered_keys}")
             return sorted(filtered_keys)
         
+        print(f"[WARN] 使用最终 fallback (所有顶层keys): {all_keys}")
         return sorted(all_keys)
     
     class_list = _infer_class_list_from_meta(meta)
-    print(f"[INFO] Inferred class_list from meta.json: {class_list} (total: {len(class_list)} classes)")
     
+    print("-" * 80)
+    print(f"[RESULT] 最终 class_list: {class_list}")
+    print(f"[RESULT] 类别总数: {len(class_list)}")
+    print("-" * 80)
+    
+    # 安全检查：如果 class_list 看起来像 split 名称而不是类别名称
     if len(class_list) <= 2 and set(class_list).issubset({"train", "test", "val", "validation"}):
-        raise ValueError(
-            f"[ERROR] class_list={class_list} looks like split names, not class names!\n"
-            f"Please check your meta.json structure. Expected format:\n"
-            f'  {{"train": {{"bottle": [...], "cable": [...]}}, "test": {{...}}}}\n'
-            f"Got top-level keys: {list(meta.keys())}"
+        error_msg = (
+            f"\n{'='*80}\n"
+            f"[CRITICAL ERROR] class_list={class_list} 看起来像 split 名称，不是类别名称!\n\n"
+            f"这会导致 PerClassTemplatePromptLearner 只有 {len(class_list)} 个类别模板，\n"
+            f"而不是期望的 15 个类别。checkpoint 加载时会报 shape mismatch 错误！\n\n"
+            f"请检查 meta.json 结构。期望格式:\n"
+            f'  {{"train": {{"bottle": [...], "cable": [...]}}, "test": {{...}}}}\n\n'
+            f"实际顶层 keys: {list(meta.keys())}\n"
+            f"{'='*80}"
         )
+        print(error_msg)
+        raise ValueError(error_msg)
+    
+    # 额外诊断：打印前5个类别的详细信息
+    print(f"[DIAG] 前5个类别详情:")
+    for i, cls_name in enumerate(class_list[:5]):
+        # 尝试获取该类别的样本数量
+        train_count = 0
+        test_count = 0
+        if isinstance(meta.get("train"), dict) and cls_name in meta["train"]:
+            train_count = len(meta["train"][cls_name]) if isinstance(meta["train"][cls_name], list) else 0
+        if isinstance(meta.get("test"), dict) and cls_name in meta["test"]:
+            test_count = len(meta["test"][cls_name]) if isinstance(meta["test"][cls_name], list) else 0
+        print(f"[DIAG]   {i+1}. '{cls_name}': train={train_count} samples, test={test_count} samples")
+    
+    if len(class_list) > 5:
+        print(f"[DIAG]   ... 还有 {len(class_list) - 5} 个类别")
+    
+    print("=" * 80)
+    print("[CLASS LIST DIAGNOSTIC] 类别解析诊断结束")
+    print("=" * 80)
     
     args.class_list = class_list
     # ==============================================================================

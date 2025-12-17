@@ -2,7 +2,7 @@
 # encoding: utf-8
 import os, sys
 
-PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus"
+PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus/sam3"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
