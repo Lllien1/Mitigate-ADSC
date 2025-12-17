@@ -1,6 +1,6 @@
 import os, sys
 
-PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus"
+PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus/sam3"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -1033,11 +1033,56 @@ def main(args: argparse.Namespace):
 
     with open(args.meta_path, 'r') as f:
         meta = json.load(f)
-    if isinstance(meta, dict):
-        class_list = sorted(list(meta.get('classes', meta.get('class_list', meta.keys()))))
-    else:
-        class_list = list(meta)
+    
+    # ==================== 修复：正确解析 meta.json 获取类别列表 ====================
+    # meta.json 结构通常是: {"train": {"bottle": [...], ...}, "test": {"bottle": [...], ...}}
+    # 需要从 train/test 的子key中提取真正的类别名
+    def _infer_class_list_from_meta(meta_dict):
+        """从 meta.json 正确推断类别列表"""
+        if not isinstance(meta_dict, dict):
+            return []
+        
+        # 情况1: meta 直接有 "classes" 或 "class_list" key
+        if "classes" in meta_dict and isinstance(meta_dict["classes"], list):
+            return sorted(list(meta_dict["classes"]))
+        if "class_list" in meta_dict and isinstance(meta_dict["class_list"], list):
+            return sorted(list(meta_dict["class_list"]))
+        
+        # 情况2: meta 结构是 {"train": {cls: [...]}, "test": {cls: [...]}}
+        # 需要从 train/test 的子字典中提取类别名
+        if "train" in meta_dict or "test" in meta_dict:
+            train_keys = []
+            test_keys = []
+            if isinstance(meta_dict.get("train"), dict):
+                train_keys = list(meta_dict["train"].keys())
+            if isinstance(meta_dict.get("test"), dict):
+                test_keys = list(meta_dict["test"].keys())
+            combined = set(train_keys + test_keys)
+            if combined:
+                return sorted(list(combined))
+        
+        # 情况3: fallback - 但要排除 "train", "test" 这种顶层key
+        all_keys = list(meta_dict.keys())
+        # 过滤掉可能的 split 名称
+        filtered_keys = [k for k in all_keys if k not in ("train", "test", "val", "validation")]
+        if filtered_keys:
+            return sorted(filtered_keys)
+        
+        return sorted(all_keys)
+    
+    class_list = _infer_class_list_from_meta(meta)
+    print(f"[INFO] Inferred class_list from meta.json: {class_list} (total: {len(class_list)} classes)")
+    
+    if len(class_list) <= 2 and set(class_list).issubset({"train", "test", "val", "validation"}):
+        raise ValueError(
+            f"[ERROR] class_list={class_list} looks like split names, not class names!\n"
+            f"Please check your meta.json structure. Expected format:\n"
+            f'  {{"train": {{"bottle": [...], "cable": [...]}}, "test": {{...}}}}\n'
+            f"Got top-level keys: {list(meta.keys())}"
+        )
+    
     args.class_list = class_list
+    # ==============================================================================
 
     if args.use_official:
         model = FineTuneSAM3Official(
