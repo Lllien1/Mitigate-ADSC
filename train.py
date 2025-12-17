@@ -1,11 +1,15 @@
+import os, sys
+
+PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus"
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import argparse
-import os
 import math
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-import sys
 from datetime import datetime
 from typing import List, Optional
 
