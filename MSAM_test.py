@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple, Dict
 from collections import defaultdict
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter,binary_erosion, binary_dilation
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
@@ -141,64 +141,44 @@ def safe_binary_metrics(pred_bin: torch.Tensor, gt_bin: torch.Tensor, eps: float
     }
 
 
-def compute_biou(pred_bin: torch.Tensor, gt_bin: torch.Tensor, boundary_width: int = 2, eps: float = 1e-6):
+def compute_biou(pred, gt, dilation_ratio=0.02, eps=1e-6):
     """
-    Compute Boundary IoU (BIoU).
-    Only considers pixels within `boundary_width` of the mask boundary.
+    Boundary IoU (mBIoU).
+    pred, gt: torch.Tensor or np.ndarray, shape (H, W)
     """
-    if pred_bin.dim() == 2:
-        pred_bin = pred_bin.unsqueeze(0)
-        gt_bin = gt_bin.unsqueeze(0)
-    
-    B = pred_bin.shape[0]
-    biou_list = []
-    
-    for b in range(B):
-        pred = pred_bin[b].cpu().numpy().astype(np.uint8)
-        gt = gt_bin[b].cpu().numpy().astype(np.uint8)
-        
-        # If both are empty, BIoU = 1.0
-        if pred.sum() == 0 and gt.sum() == 0:
-            biou_list.append(1.0)
-            continue
-        
-        # If only one is empty, BIoU = 0.0
-        if pred.sum() == 0 or gt.sum() == 0:
-            biou_list.append(0.0)
-            continue
-        
-        # Extract boundaries using distance transform
-        pred_dist = distance_transform_edt(pred)
-        pred_boundary = (pred_dist > 0) & (pred_dist <= boundary_width)
-        
-        gt_dist = distance_transform_edt(gt)
-        gt_boundary = (gt_dist > 0) & (gt_dist <= boundary_width)
-        
-        # Also include outer boundary
-        pred_outer_dist = distance_transform_edt(1 - pred)
-        pred_boundary |= (pred_outer_dist > 0) & (pred_outer_dist <= boundary_width) & (pred == 1)
-        
-        gt_outer_dist = distance_transform_edt(1 - gt)
-        gt_boundary |= (gt_outer_dist > 0) & (gt_outer_dist <= boundary_width) & (gt == 1)
-        
-        # Union of boundaries
-        boundary_region = pred_boundary | gt_boundary
-        
-        if boundary_region.sum() == 0:
-            biou_list.append(0.0)
-            continue
-        
-        # Compute IoU only on boundary region
-        pred_on_boundary = pred[boundary_region]
-        gt_on_boundary = gt[boundary_region]
-        
-        intersection = (pred_on_boundary & gt_on_boundary).sum()
-        union = (pred_on_boundary | gt_on_boundary).sum()
-        
-        biou = intersection / (union + eps)
-        biou_list.append(float(biou))
-    
-    return np.array(biou_list)
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(gt, torch.Tensor):
+        gt = gt.detach().cpu().numpy()
+
+    pred = pred > 0
+    gt = gt > 0
+
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 1.0
+    if pred.sum() == 0 or gt.sum() == 0:
+        return 0.0
+
+    h, w = pred.shape
+    diag = np.sqrt(h * h + w * w)
+    r = max(1, int(round(dilation_ratio * diag)))
+
+    # boundary = mask XOR eroded(mask)
+    struct = np.ones((3, 3), dtype=bool)
+    pred_er = binary_erosion(pred, structure=struct, iterations=r)
+    gt_er = binary_erosion(gt, structure=struct, iterations=r)
+
+    pred_b = pred ^ pred_er
+    gt_b = gt ^ gt_er
+
+    # tolerant boundary band
+    pred_band = binary_dilation(pred_b, structure=struct, iterations=r)
+    gt_band = binary_dilation(gt_b, structure=struct, iterations=r)
+
+    inter = np.logical_and(pred_band, gt_band).sum()
+    union = np.logical_or(pred_band, gt_band).sum()
+
+    return float(inter) / (float(union) + eps)
 
 
 class MetricsAccumulator:
@@ -269,8 +249,7 @@ class MetricsAccumulator:
         self.pixel_labels = []  # flattened GT labels
         self.pixel_subsample_rate = 0.01  # subsample to avoid OOM
         
-    def update_anomaly(self, metrics: dict, biou: np.ndarray, cls_name: str, 
-                       anomaly_score: float = None):
+    def update_anomaly(self, metrics: dict, biou: float, cls_name: str, anomaly_score: float = None):
         """Update stats for an anomaly sample."""
         n = len(metrics["iou"])
         for i in range(n):
@@ -283,7 +262,7 @@ class MetricsAccumulator:
             self.anomaly_stats["prec_sum"] += metrics["precision"][i]
             self.anomaly_stats["rec_sum"] += metrics["recall"][i]
             self.anomaly_stats["f1_sum"] += metrics["f1"][i]
-            self.anomaly_stats["biou_sum"] += biou[i] if i < len(biou) else 0.0
+            self.anomaly_stats["biou_sum"] += float(biou)
             self.anomaly_stats["count"] += 1
             
             # Per-class stats
@@ -296,7 +275,7 @@ class MetricsAccumulator:
             cls_stats["prec_sum"] += metrics["precision"][i]
             cls_stats["rec_sum"] += metrics["recall"][i]
             cls_stats["f1_sum"] += metrics["f1"][i]
-            cls_stats["biou_sum"] += biou[i] if i < len(biou) else 0.0
+            cls_stats["biou_sum"] += float(biou)
             cls_stats["count"] += 1
         
         # Image-level AUC
@@ -564,6 +543,72 @@ def _to_prob(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.clamp(0.0, 1.0)
 
 
+def _forward_once(model, images: torch.Tensor, prompt_lists: List[List[str]], class_names: List[str],
+                  masks_size: Tuple[int,int], device: torch.device, upsample: bool = True):
+    """Run one forward pass and return (pred_masks_prob[B,Q,H,W], query_scores[B,Q], raw_out)."""
+    out = model(images, prompt_lists, class_names)
+
+    pred_masks = out["pred_masks"]
+    if pred_masks.dim() == 5:
+        pred_masks = pred_masks[-1]
+    pred_masks = torch.sigmoid(pred_masks)
+
+    if upsample and pred_masks.shape[-2:] != masks_size:
+        pred_masks = F.interpolate(pred_masks, size=masks_size, mode="bilinear", align_corners=False)
+
+    B, Q = pred_masks.shape[0], pred_masks.shape[1]
+    presence_bq = _normalize_bq(out.get("presence_logit", None), B, Q, device=device)
+    iou_bq = _normalize_bq(out.get("iou_predictions", None), B, Q, device=device)
+    presence_prob = _to_prob(presence_bq)
+    iou_prob = _to_prob(iou_bq)
+
+    if presence_prob is not None and iou_prob is not None:
+        query_scores = presence_prob * iou_prob
+    elif presence_prob is not None:
+        query_scores = presence_prob
+    elif iou_prob is not None:
+        query_scores = iou_prob
+    else:
+        query_scores = None
+
+    return pred_masks, query_scores, out
+
+
+def _select_candidates(pm_b: torch.Tensor, scores_vec: Optional[torch.Tensor], prompt_text: str,
+                      conf_thresh: float, top_k: int):
+    """Select top-k candidate masks for ONE image under ONE prompt."""
+    Q = pm_b.shape[0]
+    masks_list = []
+    scores = []
+
+    for q in range(Q):
+        m_q = pm_b[q].detach().cpu().numpy().astype(np.float32)
+        masks_list.append(m_q)
+        if scores_vec is not None and q < scores_vec.numel():
+            s_q = float(scores_vec[q].detach().cpu().item())
+        else:
+            s_q = float(np.mean(m_q))
+        scores.append(s_q)
+
+    cand = [(s, m, prompt_text) for s, m in zip(scores, masks_list) if s >= conf_thresh]
+    cand.sort(key=lambda x: x[0], reverse=True)
+    if top_k > 0:
+        cand = cand[:top_k]
+
+    if cand:
+        masks_stack = np.stack([(c[1] > 0.5) for c in cand]).astype(bool)
+        pm_comb = torch.from_numpy(masks_stack.max(axis=0).astype(np.float32)).to(pm_b.device)
+        pred_prob_map = np.maximum.reduce([c[1] for c in cand]).astype(np.float32)
+        max_score = float(cand[0][0])
+    else:
+        H, W = pm_b.shape[-2], pm_b.shape[-1]
+        pm_comb = torch.zeros((H, W), dtype=torch.float32, device=pm_b.device)
+        pred_prob_map = np.zeros((H, W), dtype=np.float32)
+        max_score = 0.0
+
+    return cand, pm_comb, pred_prob_map, max_score
+
+
 def load_model(args, device: torch.device):
     common_kwargs = {
         "bpe_path": getattr(args, "bpe_path", None),
@@ -711,7 +756,24 @@ def run_inference(args):
             torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        out = model(images, prompt_lists, class_names)
+        # --- forward passes ---
+        # PROMPT-driven inference: run two prompts per image and pick the prompt that yields
+        # the highest anomaly score (max query score), similar to reverse-prompt evaluation.
+        if custom_prompt:
+            pred_masks_1, query_scores_1, _ = _forward_once(
+                model, images, prompt_lists, class_names, masks_size=masks.shape[-2:], device=device
+            )
+            pred_masks_2, query_scores_2 = None, None
+        else:
+            damage_lists = [[f"damage {class_names[i]}"] for i in range(len(class_names))]
+            specie_lists = [[str(specie_names[i]).strip() if str(specie_names[i]).strip() else f"damage {class_names[i]}"] for i in range(len(class_names))]
+
+            pred_masks_1, query_scores_1, _ = _forward_once(
+                model, images, damage_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False
+            )
+            pred_masks_2, query_scores_2, _ = _forward_once(
+                model, images, specie_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False
+            )
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -722,76 +784,72 @@ def run_inference(args):
         batch_imgs = images.size(0)
         total_imgs += batch_imgs
 
-        pred_masks = out["pred_masks"]
-        if pred_masks.dim() == 5:
-            pred_masks = pred_masks[-1]
-        pred_masks = torch.sigmoid(pred_masks)
-
-        if pred_masks.shape[-2:] != masks.shape[-2:]:
-            pred_masks = F.interpolate(pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-
-        # --- ranking: confidence heads ---
-        B, Q = pred_masks.shape[0], pred_masks.shape[1]
-        presence_bq = _normalize_bq(out.get("presence_logit", None), B, Q, device=device)
-        iou_bq = _normalize_bq(out.get("iou_predictions", None), B, Q, device=device)
-        presence_prob = _to_prob(presence_bq)
-        iou_prob = _to_prob(iou_bq)
-        
-        if presence_prob is not None and iou_prob is not None:
-            query_scores = presence_prob * iou_prob
-        elif presence_prob is not None:
-            query_scores = presence_prob
-        elif iou_prob is not None:
-            query_scores = iou_prob
-        else:
-            query_scores = None
-
         gt = (masks > 0.5).float().to(device)
 
         for b in range(batch_imgs):
             cls_name = class_names[b]
             is_anom = is_anomaly[b]
-            
-            prompts_b = prompt_lists[b] if prompt_lists else []
-            base_prompt = prompts_b[0] if prompts_b else "defect"
-            pm = pred_masks[b]  # (Q, H, W)
-            gm = gt[b].squeeze(0) if gt[b].dim() == 3 else gt[b]  # (H, W)
 
-            # candidates selection
+            gm = gt[b].squeeze(0)
+
+            # ---------------- PROMPT-driven candidates selection (UPSAMPLE ONLY WINNER) ----------------
             conf_thresh = float(getattr(args, "conf_thresh", 0.3))
             top_k = int(getattr(args, "top_k", 5))
-
-            masks_list = []
-            labels = []
-            scores = []
-
-            scores_vec = None
-            if query_scores is not None:
-                scores_vec = query_scores[b].view(-1)
-
-            for q in range(pm.shape[0]):
-                m_q = pm[q].detach().cpu().numpy()
-                masks_list.append(m_q)
-                if scores_vec is not None and q < scores_vec.numel():
-                    s_q = float(scores_vec[q].detach().cpu().item())
-                else:
-                    s_q = float(np.mean(m_q))
-                scores.append(s_q)
-                # 只使用 prompt 作为标签，不再显示 query 索引
-                labels.append(base_prompt)
-
-            cand = [(s, m, lab) for s, m, lab in zip(scores, masks_list, labels) if s >= conf_thresh]
-            cand.sort(key=lambda x: x[0], reverse=True)
-            cand = cand[:top_k] if top_k > 0 else cand
-
-            if cand:
-                masks_stack = np.stack([(c[1] > 0.5) for c in cand]).astype(bool)
-                pm_comb = torch.from_numpy(masks_stack.max(axis=0).astype(np.float32)).to(device)
-                max_score = cand[0][0]  # highest confidence as anomaly score
+            
+            # 目标尺寸：用 GT mask 的空间尺寸最稳（gm 必须是 (H,W)，即 gm = gt[b].squeeze(0)）
+            masks_size = tuple(gm.shape[-2:])  # (H, W)
+            
+            def _max_prompt_score(pm_low: torch.Tensor, scores_vec: Optional[torch.Tensor]) -> float:
+                """
+                pm_low: (Q, h, w) 低分辨率 masks
+                scores_vec: (Q,) 或 None
+                选择 winner prompt 时，只需要一个标量分数：max query score
+                """
+                if scores_vec is not None:
+                    return float(scores_vec.view(-1).max().item())
+                # fallback: 没有 query_scores 才用 mask 均值近似
+                return float(pm_low.mean(dim=(1, 2)).max().item())
+            
+            if custom_prompt:
+                chosen_prompt = ",".join(custom_prompt)
+            
+                pm_low = pred_masks_1[b]  # (Q, h, w)
+                sv = query_scores_1[b].view(-1) if query_scores_1 is not None else None
+            
+                max_score = _max_prompt_score(pm_low, sv)
+                alt_prompt, alt_score = "", 0.0
+            
             else:
-                masks_stack = None
-                pm_comb = torch.zeros_like(gm).to(device)
-                max_score = 0.0
+                p1 = f"damage {cls_name}"
+                p2 = str(specie_names[b]).strip() if str(specie_names[b]).strip() else p1
+            
+                pm1_low = pred_masks_1[b]  # (Q, h, w)
+                pm2_low = pred_masks_2[b]  # (Q, h, w)
+            
+                sv1 = query_scores_1[b].view(-1) if query_scores_1 is not None else None
+                sv2 = query_scores_2[b].view(-1) if query_scores_2 is not None else None
+            
+                max_score1 = _max_prompt_score(pm1_low, sv1)
+                max_score2 = _max_prompt_score(pm2_low, sv2)
+            
+                # winner prompt：只看 max query score
+                if max_score2 > max_score1:
+                    chosen_prompt, alt_prompt = p2, p1
+                    max_score, alt_score = max_score2, max_score1
+                    pm_low, sv = pm2_low, sv2
+                else:
+                    chosen_prompt, alt_prompt = p1, p2
+                    max_score, alt_score = max_score1, max_score2
+                    pm_low, sv = pm1_low, sv1
+            
+            # 只对 winner 的这一张图做高分辨率插值： (Q,h,w) -> (Q,H,W)
+            pm = pm_low
+            if pm.shape[-2:] != masks_size:
+                pm = F.interpolate(pm.unsqueeze(0), size=masks_size, mode="bilinear", align_corners=False).squeeze(0)
+            
+            # 用 winner 的高分辨率 masks 生成候选与 union mask
+            cand, pm_comb, pred_prob_map, _ = _select_candidates(pm, sv, chosen_prompt, conf_thresh, top_k)
+            # ------------------------------------------------------------------------------------------
 
             # Compute metrics
             metrics = safe_binary_metrics(pm_comb, gm)
@@ -808,10 +866,6 @@ def run_inference(args):
                 metrics_acc.update_normal(metrics, cls_name, total_pixels, anomaly_score=max_score)
             
             # Update pixel-level AUC data (for both anomaly and normal)
-            if cand:
-                pred_prob_map = masks_stack.max(axis=0).astype(np.float32)
-            else:
-                pred_prob_map = np.zeros(gm.shape, dtype=np.float32)
             gt_map = gm.cpu().numpy()
             metrics_acc.update_pixel_auc(pred_prob_map, gt_map)
 
@@ -819,20 +873,11 @@ def run_inference(args):
             img_pil = to_pil(images[b].cpu())
             frame = np.array(img_pil.convert("RGB"), dtype=np.uint8)
 
-            # For NORMAL samples: don't show predicted masks (they are false positives)
-            # Only show masks for ANOMALY samples
-            if not is_anom:
-                # Normal sample - show clean image with "NORMAL" label
-                overlay_pil = Image.fromarray(frame)
-                draw = ImageDraw.Draw(overlay_pil)
-                # Show info about false positive predictions (if any)
-                if cand:
-                    fp_info = f"NORMAL (FP: {len(cand)} queries, max={max_score:.2f})"
-                    draw.text((5, 5), fp_info, font=font, fill=(255, 165, 0))  # orange for warning
-                else:
-                    draw.text((5, 5), "NORMAL (clean)", font=font, fill=(0, 255, 0))  # green
-            elif cand and masks_stack is not None:
+            # 统一处理 normal 和 anomaly 样本的可视化
+            # 区别仅在于标签颜色和文字
+            if cand:
                 # Anomaly sample with predictions - show masks
+                masks_stack = np.stack([(c[1] > 0.5) for c in cand]).astype(bool)
                 prompts_for_color = [c[2] for c in cand]
                 scores_for_prompt = [c[0] for c in cand]
                 colors = np.array([get_color_map(palette, p) for p in prompts_for_color], dtype=np.uint8)
@@ -846,6 +891,11 @@ def run_inference(args):
                 overlay_pil = Image.fromarray(frame)
 
                 draw = ImageDraw.Draw(overlay_pil)
+                # 根据样本类型显示不同颜色和前缀
+                sample_type = "ANOMALY" if is_anom else "NORMAL"
+                label_color = (255, 255, 255) if is_anom else (255, 165, 0)  # 白色/橙色
+                header_text = f"[{sample_type}] top: {chosen_prompt} ({max_score:.2f})" + (f" | alt: {alt_prompt} ({alt_score:.2f})" if alt_prompt else "")
+                draw.text((5, 5), header_text, font=font, fill=label_color)
                 row_h, box_w, pad = 12, 10, 4
                 legend_items = []
                 max_w = 0
@@ -857,7 +907,7 @@ def run_inference(args):
                     legend_items.append(txt)
                 legend_h = row_h * len(legend_items) + pad * 2
                 legend_w = box_w + 4 + max_w + pad * 2
-                x0, y0 = 5, 5
+                x0, y0 = 5, 20
                 draw.rectangle([x0, y0, x0 + legend_w, y0 + legend_h], fill=(0, 0, 0, 160))
                 for i_row, txt in enumerate(legend_items):
                     y = y0 + pad + i_row * row_h
@@ -865,10 +915,13 @@ def run_inference(args):
                     draw.rectangle([x0 + pad, y, x0 + pad + box_w, y + box_w], fill=col)
                     draw.text((x0 + pad + box_w + 4, y - 1), txt, font=font, fill=(255, 255, 255))
             else:
-                # Anomaly sample but no predictions above threshold
+                # No predictions above threshold
                 overlay_pil = Image.fromarray(frame)
                 draw = ImageDraw.Draw(overlay_pil)
-                draw.text((5, 5), f"ANOMALY (no mask >= {conf_thresh:.2f})", font=font, fill=(255, 0, 0))
+                sample_type = "ANOMALY" if is_anom else "NORMAL"
+                label_color = (255, 0, 0) if is_anom else (0, 255, 0)  # 红色(漏检)/绿色(正确)
+                no_mask_text = f"[{sample_type}] no mask >= {conf_thresh:.2f}, top={chosen_prompt}:{max_score:.2f}" + (f" alt={alt_prompt}:{alt_score:.2f}" if alt_prompt else "")
+                draw.text((5, 5), no_mask_text, font=font, fill=label_color)
 
             # save
             sample_dir = os.path.join(args.output_dir, cls_name)
