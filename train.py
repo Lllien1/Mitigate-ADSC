@@ -1,5 +1,6 @@
 import argparse
 import os
+import math
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,6 +32,71 @@ import matplotlib.pyplot as plt
 import json
 
 
+# ==================== 新增：学习率调度器 ====================
+
+class WarmupCosineScheduler:
+    """
+    Warmup + Cosine Annealing 学习率调度器
+    
+    训练过程：
+    1. Warmup阶段：LR从0线性增加到base_lr
+    2. Cosine阶段：LR从base_lr余弦衰减到min_lr
+    """
+    def __init__(
+        self, 
+        optimizer, 
+        warmup_steps: int, 
+        total_steps: int,
+        min_lr_ratio: float = 0.01,
+    ):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr_ratio = min_lr_ratio
+        self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+        self.current_step = 0
+    
+    def step(self):
+        self.current_step += 1
+        lr_mult = self._get_lr_mult()
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            pg['lr'] = base_lr * lr_mult
+    
+    def _get_lr_mult(self) -> float:
+        if self.current_step < self.warmup_steps:
+            return self.current_step / max(1, self.warmup_steps)
+        else:
+            progress = (self.current_step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            return self.min_lr_ratio + 0.5 * (1 - self.min_lr_ratio) * (1 + math.cos(math.pi * progress))
+    
+    def get_lr(self):
+        return [pg['lr'] for pg in self.optimizer.param_groups]
+
+
+# ==================== 新增：梯度累积器 ====================
+
+class GradientAccumulator:
+    """
+    梯度累积，增大有效batch size
+    """
+    def __init__(self, accumulation_steps: int = 1):
+        self.accumulation_steps = accumulation_steps
+        self.current_step = 0
+    
+    def scale_loss(self, loss):
+        """缩放loss以正确累积梯度"""
+        return loss / self.accumulation_steps
+    
+    def should_step(self) -> bool:
+        """是否应该执行优化器更新"""
+        self.current_step += 1
+        return self.current_step >= self.accumulation_steps
+    
+    def reset(self):
+        """重置累积计数"""
+        self.current_step = 0
+
+
 def setup_distributed(args):
     """
     初始化分布式（在使用 torch.distributed.run 启动时，环境变量会提供 LOCAL_RANK, RANK, WORLD_SIZE）
@@ -53,10 +119,10 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 def collate_fn(batch):
-    imgs, masks, prompts, anomalies, classes = zip(*batch)
+    imgs, masks, prompts, anomalies, classes, specie_names = zip(*batch)
     imgs = torch.stack(imgs, dim=0)
     masks = torch.stack(masks, dim=0)
-    return imgs, masks, list(prompts), list(anomalies), list(classes)
+    return imgs, masks, list(prompts), list(anomalies), list(classes), list(specie_names)
 
 def chk(name, x):
     if x is None: 
@@ -413,7 +479,8 @@ def get_prompt_group_labels(prompt_lists, class_names, device):
     for prompts in prompt_lists:
         # 只用 prompt 内容作为 key（忽略 class_name）
         # 这样不同类别的相同缺陷类型可以形成正样本对
-        key = tuple(sorted(prompts)) if prompts else ("__normal__",)
+        key_prompts = prompts[1:] if (prompts is not None and len(prompts) > 1) else []
+        key = tuple(sorted(key_prompts)) if key_prompts else ("__normal__",)
         
         if key not in group_to_id:
             group_to_id[key] = len(group_to_id)
@@ -1130,8 +1197,35 @@ def main(args: argparse.Namespace):
 
     matcher = BinaryHungarianMatcher(cost_class=1.0, cost_bbox=1.0, cost_giou=1.0)
 
+    # ==================== 新增：学习率调度器和梯度累积器 ====================
+    steps_per_epoch = len(dataloader)
+    total_steps = args.epochs * steps_per_epoch // args.gradient_accumulation
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        min_lr_ratio=args.min_lr_ratio
+    )
+    
+    grad_accum = GradientAccumulator(args.gradient_accumulation)
+    
+    print("=" * 60)
+    print("训练配置:")
+    print(f"  总epoch数: {args.epochs}")
+    print(f"  每epoch步数: {steps_per_epoch}")
+    print(f"  梯度累积: {args.gradient_accumulation}")
+    print(f"  有效batch size: {args.batch_size * args.gradient_accumulation}")
+    print(f"  总优化步数: {total_steps}")
+    print(f"  Warmup步数: {warmup_steps} ({args.warmup_ratio*100:.0f}%)")
+    print(f"  最终LR比例: {args.min_lr_ratio}")
+    print("=" * 60)
+
     model.train()
     best_loss = float("inf")
+    global_optim_step = 0  # 优化器更新计数（用于调度器）
+    
     for epoch in range(args.epochs):
         if args.distributed:
             dataloader.sampler.set_epoch(epoch)
@@ -1141,8 +1235,12 @@ def main(args: argparse.Namespace):
             pbar = dataloader  # 无进度条，仅迭代
         running_loss = 0.0
         running_steps = 0
+        
+        # 每个epoch开始时清零梯度
+        optimizer.zero_grad(set_to_none=True)
+        
         for step, batch in enumerate(pbar):
-            images, masks, prompt_lists, is_anomaly, class_names = batch
+            images, masks, prompt_lists, is_anomaly, class_names, specie_names = batch
             images = images.to(device)
             masks = masks.to(device)
 
@@ -1891,8 +1989,9 @@ def main(args: argparse.Namespace):
                             n_anom = (~is_background).sum().item()
                             print(f"[BG/ANOM] n_background={n_bg}, n_anomaly={n_anom}")
 
-                            # TSNE
-                            if (step % getattr(args, "tsne_freq", 500)) == 0 and B >= 4:
+                            # TSNE: 改为每个epoch保存一次（在最后一个step时保存）
+                            is_last_step = (step == len(dataloader) - 1)
+                            if is_last_step and B >= 4:
                                 ns = min(getattr(args, "tsne_samples", 64), B)
                                 sel = np.random.choice(B, ns, replace=False)
                                 p_sample = p_norm[sel].detach().cpu().numpy()
@@ -1901,19 +2000,22 @@ def main(args: argparse.Namespace):
                                 X = np.concatenate([p_sample, m_sample], axis=0)
                                 try:
                                     Z = TSNE(n_components=2, perplexity=min(30, ns-1), init='pca').fit_transform(X)
-                                    plt.figure(figsize=(6, 6))
+                                    plt.figure(figsize=(8, 8))
                                     # prompt embeddings
                                     scatter1 = plt.scatter(Z[:ns, 0], Z[:ns, 1], c=labels_sample, 
-                                                          cmap='tab10', marker='o', alpha=0.8, label='prompt')
+                                                          cmap='tab10', marker='o', alpha=0.8, s=50, label='prompt')
                                     # visual embeddings
                                     scatter2 = plt.scatter(Z[ns:, 0], Z[ns:, 1], c=labels_sample, 
-                                                          cmap='tab10', marker='x', alpha=0.8, label='visual')
-                                    plt.legend()
-                                    plt.title(f"t-SNE step{step} (color=group)")
+                                                          cmap='tab10', marker='x', alpha=0.8, s=50, label='visual')
+                                    plt.legend(fontsize=12)
+                                    plt.title(f"t-SNE Epoch {epoch+1} (color=group)", fontsize=14)
+                                    plt.xlabel("Dimension 1", fontsize=12)
+                                    plt.ylabel("Dimension 2", fontsize=12)
                                     tsne_out_dir = os.path.join(args.log_dir, "tsne")
                                     os.makedirs(tsne_out_dir, exist_ok=True)
-                                    plt.savefig(os.path.join(tsne_out_dir, f"tsne_step{step}.png"), dpi=150)
+                                    plt.savefig(os.path.join(tsne_out_dir, f"tsne_epoch{epoch+1:02d}.png"), dpi=150, bbox_inches='tight')
                                     plt.close()
+                                    print(f"[INFO] Saved t-SNE visualization for epoch {epoch+1}")
                                 except Exception as e:
                                     print("[WARN] TSNE failed:", e)
                 else:
@@ -1944,8 +2046,6 @@ def main(args: argparse.Namespace):
                 print(f"[WARN] Skip batch with non-finite loss (loss={loss.item()}, focal={loss_focal.item()}, dice={loss_dice.item()}, iou={loss_iou.item()})")
                 continue
 
-            optimizer.zero_grad()
-
             # 在 loss.backward() 之前
             chk("loss_total", loss)
 
@@ -1958,51 +2058,65 @@ def main(args: argparse.Namespace):
 
             # 变量名应为 loss_presence
             chk("presence_loss", loss_presence)
-            # 使用 GradScaler 做 backward + step
-            scaler.scale(loss).backward()
+            
+            # ==================== 梯度累积逻辑 ====================
+            # 缩放loss用于梯度累积
+            scaled_loss = grad_accum.scale_loss(loss)
+            scaler.scale(scaled_loss).backward()
 
-            # 1) 先 unscale 再检查/clip
-            scaler.unscale_(optimizer)
+            # 只有在累积完成后才更新参数
+            if grad_accum.should_step():
+                # 1) 先 unscale 再检查/clip
+                scaler.unscale_(optimizer)
 
-            # 2) clip（先用 1.0 或 0.5 都行，先把 nan 压住）
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                max_norm=1.0
-            )
+                # 2) clip（先用 1.0 或 0.5 都行，先把 nan 压住）
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_norm=1.0
+                )
 
-            # 3) 再做有限性检查（更可信）
-            ok = grad_finite_check(model, "transformer.decoder")
-            if not ok:
-                print("[WARN] non-finite grads -> skip step, scaler downscale")
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update()
-                continue
+                # 3) 再做有限性检查（更可信）
+                ok = grad_finite_check(model, "transformer.decoder")
+                if not ok:
+                    print("[WARN] non-finite grads -> skip step, scaler downscale")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    grad_accum.reset()
+                    continue
 
-            # --- Diagnostic: grad norms for prompt-related params ---
-            grad_finite_check(model, "transformer.decoder")
-            if step == 0:
-                for n, p in model.named_parameters():
+                # --- Diagnostic: grad norms for prompt-related params ---
+                grad_finite_check(model, "transformer.decoder")
+                if step == 0:
+                    for n, p in model.named_parameters():
+                        nl = n.lower()
+                        if "transformer.decoder" in nl and p.requires_grad:
+                            print("[GRAD CHECK]", n, "grad_is_none=", (p.grad is None),
+                                  "grad_norm=", (p.grad.norm().item() if p.grad is not None else None))
+                            break
+                grad_norms = []
+                for n,p in model.named_parameters():
                     nl = n.lower()
-                    if "transformer.decoder" in nl and p.requires_grad:
-                        print("[GRAD CHECK]", n, "grad_is_none=", (p.grad is None),
-                              "grad_norm=", (p.grad.norm().item() if p.grad is not None else None))
-                        break
-            grad_norms = []
-            for n,p in model.named_parameters():
-                nl = n.lower()
-                if p.grad is not None and (("prompt" in nl) or ("template" in nl) or ("kweight" in nl) or ("lora" in nl)):
-                    grad_norms.append((n, float(p.grad.norm().item())))
-            if len(grad_norms) > 0 and (step % getattr(args, "log_freq", 100) == 0):
-                # print few entries (avoid overwhelming)
-                print("[GRADS] sample prompt-related grad norms (top 10):")
-                for name, gn in grad_norms[:20]:
-                    print(f"  {name}: {gn:.4e}")
-                vals = np.array([v for (_, v) in grad_norms])
-                print(f"[GRADS] mean={vals.mean():.4e}, std={vals.std():.4e}, max={vals.max():.4e}")
-            # --- Diagnostic: grad norms for prompt-related params ---
+                    if p.grad is not None and (("prompt" in nl) or ("template" in nl) or ("kweight" in nl) or ("lora" in nl)):
+                        grad_norms.append((n, float(p.grad.norm().item())))
+                if len(grad_norms) > 0 and (step % getattr(args, "log_freq", 100) == 0):
+                    # print few entries (avoid overwhelming)
+                    print("[GRADS] sample prompt-related grad norms (top 10):")
+                    for name, gn in grad_norms[:20]:
+                        print(f"  {name}: {gn:.4e}")
+                    vals = np.array([v for (_, v) in grad_norms])
+                    print(f"[GRADS] mean={vals.mean():.4e}, std={vals.std():.4e}, max={vals.max():.4e}")
+                # --- Diagnostic: grad norms for prompt-related params ---
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                
+                # 更新学习率调度器
+                scheduler.step()
+                global_optim_step += 1
+                
+                grad_accum.reset()
+            # ==================== 梯度累积逻辑结束 ====================
 
             if is_main_process:
                 pbar.set_postfix(
@@ -2026,6 +2140,12 @@ def main(args: argparse.Namespace):
                 writer.add_scalar("loss/align", align_loss.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
+            # 记录当前学习率
+            if is_main_process and writer is not None:
+                current_lrs = scheduler.get_lr()
+                writer.add_scalar("lr/prompt", current_lrs[0], global_step)
+                if len(current_lrs) > 1:
+                    writer.add_scalar("lr/main", current_lrs[1], global_step)
             
 
             running_loss += loss.item()
@@ -2115,6 +2235,14 @@ if __name__ == "__main__":
     
     parser.add_argument("--align_margin", type=float, default=0.5,help="Margin for pushing defect prompts away from background embeddings")
     parser.add_argument("--lambda_query_align", type=float, default=0.5,help="Weight for query-level alignment loss (让 prompt 选中正确的 query)")
+
+    # ==================== 新增：训练优化参数 ====================
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup步数占总步数的比例 (默认0.1即10%)")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.01,
+                        help="最终学习率与初始学习率的比值 (默认0.01)")
+    parser.add_argument("--gradient_accumulation", type=int, default=1,
+                        help="梯度累积步数 (默认1即不累积，设为2则有效batch=batch_size*2)")
 
     args = parser.parse_args()
     main(args)

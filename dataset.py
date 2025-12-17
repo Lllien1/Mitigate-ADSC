@@ -184,6 +184,19 @@ class MVTecMetaDataset(Dataset):
                         class_train.extend(train_items)
                         class_test.extend(test_items)
                     
+                    # Add normal (anomaly==0) samples from train to balance class_train with defect samples
+                    total_defects = sum(len(items) for items in specie_map.values())
+                    defect_types_count = len(specie_map)
+                    if defect_types_count > 0:
+                        avg_n = total_defects // defect_types_count
+                        train_meta_for_cls = meta_info.get("train", {}).get(cls, [])
+                        normal_train_images = [d for d in train_meta_for_cls if int(d.get("anomaly", 0)) == 0]
+                        if normal_train_images:
+                            # 使用与 specie_split_seed 相同的 rng 确保随机抽样可复现
+                            normal_sampled = normal_train_images.copy() if len(normal_train_images) <= avg_n \
+                                            else rng.sample(normal_train_images, avg_n)
+                            class_train.extend(normal_sampled)
+                    
                     goods_from_test = [d for d in test_meta_for_cls if int(d.get("anomaly", 0)) == 0]
                     if goods_from_test:
                         # avoid duplicates by (img_path, mask_path)
@@ -193,7 +206,7 @@ class MVTecMetaDataset(Dataset):
                             if key not in seen_keys:
                                 class_test.append(gd)
                                 seen_keys.add(key)
-
+                    
                     chosen = class_train.copy() if mode == "train" else class_test.copy()
 
                     # save splits for reproducibility
@@ -362,38 +375,63 @@ class MVTecMetaDataset(Dataset):
             print(f"[WARN] Skip corrupted sample idx={idx} img={img_path} mask={mask_path} err={e}")
             # fallback to next sample to avoid worker crash on truncated images
             return self.__getitem__((idx + 1) % len(self.entries))
+        specie_name = getattr(data, "specie_name", "") or ""
 
-        # Build prompt list
-        if is_anomaly:
-            # Try to fetch defect descriptions from prompt_dict.
-            # Be permissive with key format: try exact cls_name, then lower(), then
-            # underscore->space normalized form so that keys like "metal nut" match.
-            prompts = None
+        # Build prompt list (dual-template style)
+        # - first element is ALWAYS a short state+cls template (keeps SAM3 prompt style)
+        # - remaining elements are class-agnostic defect descriptors (used for grouping / contrastive)
+        def _norm(s: str) -> str:
+            return (s or "").strip().lower().replace("_", " ")
+
+        def _select_defect_keywords(cls_name: str, specie_name: str):
+            """Pick a small set of defect keywords for this sample.
+            Priority:
+              1) specie_name words (from meta.json)
+              2) prompt_dict[cls_name] filtered by specie_name words (if available)
+              3) fallback to a small generic set
+            """
+            kws = []
+            sp = _norm(specie_name)
+            if sp and sp not in ("good", "normal", "ok"):
+                kws.append(sp)
+
+            # pull candidates from prompt_dict (usually class->list[str])
+            candidates = None
             if self.prompt_dict is not None:
-                # try exact
-                prompts = self.prompt_dict.get(cls_name, None)
-                # try lower-case
-                if prompts is None:
-                    prompts = self.prompt_dict.get(cls_name.lower(), None)
-                # try underscore -> space
-                if prompts is None:
-                    prompts = self.prompt_dict.get(cls_name.replace("_", " "), None)
-                # try lower-case underscore->space
-                if prompts is None:
-                    prompts = self.prompt_dict.get(cls_name.replace("_", " ").lower(), None)
+                candidates = (
+                    self.prompt_dict.get(cls_name)
+                    or self.prompt_dict.get(cls_name.lower())
+                    or self.prompt_dict.get(cls_name.replace("_", " "))
+                    or self.prompt_dict.get(cls_name.replace("_", " ").lower())
+                )
+            if isinstance(candidates, str):
+                candidates = [w.strip() for w in candidates.split(",") if w.strip()]
+            if candidates:
+                # if we have specie_name, try to filter
+                if sp:
+                    sp_words = [w for w in sp.split(" ") if w]
+                    filtered = [c for c in candidates if any(w in _norm(c) for w in sp_words)]
+                    if filtered:
+                        candidates = filtered
+                # add a few candidates
+                for c in candidates:
+                    c2 = _norm(c)
+                    if c2 and c2 not in kws:
+                        kws.append(c2)
+                    if len(kws) >= 4:
+                        break
 
-            # If we found prompt descriptors, use them; otherwise fall back to generic "anomaly"
-            if prompts:
-                # ensure it's a list of strings (prompt_dict might store a comma-separated string)
-                if isinstance(prompts, str):
-                    prompt_list = [w.strip() for w in prompts.split(",") if w.strip()]
-                else:
-                    prompt_list = list(prompts)
-            else:
-                # fallback (no class name included)
-                prompt_list = ["anomaly", "defect", "flaw", "imperfection"]
+            if not kws:
+                kws = ["defect", "flaw", "crack", "broken"]
+
+            return kws[:4]
+
+        if is_anomaly:
+            # positive: damaged template + defect descriptors (specie_name / keywords)
+            prompt_list = [f"damaged {cls_name}"]
+            prompt_list.extend(_select_defect_keywords(cls_name, specie_name))
         else:
-            # Good images: only normal/clean descriptors, do NOT include cls_name
-            prompt_list = ["normal", "clean","perfect"]
+            # positive: normal template (keep short)
+            prompt_list = [f"normal {cls_name}", "clean", "intact"]
 
-        return img, img_mask, prompt_list, is_anomaly, cls_name
+        return img, img_mask, prompt_list, is_anomaly, cls_name, specie_name
