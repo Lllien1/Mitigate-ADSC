@@ -184,19 +184,19 @@ class MVTecMetaDataset(Dataset):
                         class_train.extend(train_items)
                         class_test.extend(test_items)
                     
-                    # Add normal (anomaly==0) samples from train to balance class_train with defect samples
-                    total_defects = sum(len(items) for items in specie_map.values())
-                    defect_types_count = len(specie_map)
-                    if defect_types_count > 0:
-                        avg_n = total_defects // defect_types_count
+                    # Add normal (anomaly==0) samples from TRAIN split, capped by the number of defect samples in this class.
+                    # Rule: if this cls has n defect samples assigned to training (after specie split),
+                    # we sample at most n normal samples for training (prefer train folder), for a ~1:1 balance.
+                    n_def_train = len(class_train)
+                    if n_def_train > 0:
                         train_meta_for_cls = meta_info.get("train", {}).get(cls, [])
                         normal_train_images = [d for d in train_meta_for_cls if int(d.get("anomaly", 0)) == 0]
                         if normal_train_images:
+                            k = min(len(normal_train_images), n_def_train)
                             # 使用与 specie_split_seed 相同的 rng 确保随机抽样可复现
-                            normal_sampled = normal_train_images.copy() if len(normal_train_images) <= avg_n \
-                                            else rng.sample(normal_train_images, avg_n)
+                            normal_sampled = normal_train_images.copy() if len(normal_train_images) <= k else rng.sample(normal_train_images, k)
                             class_train.extend(normal_sampled)
-                    
+
                     goods_from_test = [d for d in test_meta_for_cls if int(d.get("anomaly", 0)) == 0]
                     if goods_from_test:
                         # avoid duplicates by (img_path, mask_path)

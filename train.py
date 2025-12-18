@@ -1,5 +1,4 @@
-import os, sys
-
+import os, sys, random
 PROJECT_ROOT = "/root/autodl-tmp/FiLo_plus/sam3"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -910,6 +909,113 @@ def match_one_image(preds_logits: torch.Tensor, gt_masks: torch.Tensor):
     return row_ind.astype(np.int64), col_ind.astype(np.int64)
 
 
+
+class MinNormalBatchSampler(torch.utils.data.Sampler):
+    """Batch sampler that enforces at least `min_normals` normal samples per batch.
+
+    - Draws `min_normals` indices from normal pool each batch (with cycling).
+    - Fills the remaining slots with anomaly indices (with cycling).
+    - If a pool is empty, it falls back to sampling from the other pool.
+    """
+    def __init__(self, dataset, batch_size: int, min_normals: int = 2, drop_last: bool = False, seed: int = 42):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.min_normals = int(min_normals)
+        self.drop_last = drop_last
+        self.seed = int(seed)
+        self._epoch = 0
+
+        # Build index pools (dataset is expected to expose .entries or yield objects with .anomaly)
+        entries = getattr(dataset, "entries", None)
+        if entries is None:
+            # fallback: materialize anomalies by iterating (may be slow but ok for MVTEC)
+            entries = list(dataset)
+
+        self.norm_idx = []
+        self.anom_idx = []
+        for i, e in enumerate(entries):
+            a = int(getattr(e, "anomaly", 0))
+            (self.anom_idx if a == 1 else self.norm_idx).append(i)
+
+    def __len__(self):
+        n = len(self.dataset)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        self._epoch += 1
+        rng = random.Random(self.seed + self._epoch)
+    
+        norm = self.norm_idx.copy()
+        anom = self.anom_idx.copy()
+        rng.shuffle(norm)
+        rng.shuffle(anom)
+    
+        ni, ai = 0, 0
+    
+        def _next_from(pool, idx_ptr):
+            if not pool:
+                return None, idx_ptr
+            if idx_ptr >= len(pool):
+                rng.shuffle(pool)
+                idx_ptr = 0
+            out = pool[idx_ptr]
+            return out, idx_ptr + 1
+    
+        n_batches = len(self)
+    
+        for _ in range(n_batches):
+            batch = []
+    
+            # -------- decide how many normals in THIS batch (randomized) --------
+            if norm and anom:
+                # you要求：每个batch负样本数量在 [2, batch_size-2]，保证至少2个anomaly
+                min_norm = max(1, int(self.min_normals))              # 你一般会设为2
+                min_anom = 2 if self.batch_size >= 4 else 1
+                max_norm = max(0, self.batch_size - min_anom)
+    
+                # 保护：batch_size太小/参数不合法时退化
+                if max_norm < min_norm:
+                    n_norm = max_norm
+                else:
+                    n_norm = rng.randint(min_norm, max_norm)
+            elif norm:
+                # 没有anomaly时只能全normal（不建议出现，但保证不崩）
+                n_norm = min(self.batch_size, max(1, int(self.min_normals)))
+            else:
+                # 没有normal
+                n_norm = 0
+    
+            # -------- take normals --------
+            for _k in range(n_norm):
+                v, ni = _next_from(norm, ni)
+                if v is not None:
+                    batch.append(v)
+    
+            # -------- fill the rest with anomalies (fallback to normals if needed) --------
+            while len(batch) < self.batch_size:
+                if anom:
+                    v, ai = _next_from(anom, ai)
+                    if v is not None:
+                        batch.append(v)
+                        continue
+                    
+                # fallback: no anomalies, try normals
+                v, ni = _next_from(norm, ni)
+                if v is not None:
+                    batch.append(v)
+                else:
+                    break
+                
+            # ★关键：打乱batch内部顺序，避免负样本永远在前面
+            rng.shuffle(batch)
+    
+            if len(batch) == self.batch_size or (len(batch) > 0 and not self.drop_last):
+                yield batch
+
+
+
 def build_dataloaders(
     root: str,
     meta_path: str,
@@ -928,6 +1034,7 @@ def build_dataloaders(
     specie_split_ratio: float = 0.8,
     specie_split_seed: int = 42,
     splits_save_dir: Optional[str] = None,
+    min_normals_per_batch: int = 0,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -982,15 +1089,42 @@ def build_dataloaders(
         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=shuffle)
         shuffle = False
 
-    dataloader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=4,
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
+    # Optional: enforce at least N normal samples per batch (single-process only).
+    batch_sampler = None
+    if (not distributed) and (int(min_normals_per_batch) > 0) and (mode in ("train", "train_all")):
+        try:
+            labels = [int(e.anomaly) for e in ds.entries]
+        except Exception:
+            labels = [int(getattr(e, "anomaly", 0)) for e in ds]
+        has_norm = any(l == 0 for l in labels)
+        has_anom = any(l == 1 for l in labels)
+        if has_norm and has_anom:
+            batch_sampler = MinNormalBatchSampler(
+                ds,
+                batch_size=batch_size,
+                min_normals=int(min_normals_per_batch),
+                drop_last=False,
+                seed=int(specie_split_seed),
+            )
+
+    if batch_sampler is not None:
+        dataloader = DataLoader(
+            ds,
+            batch_sampler=batch_sampler,
+            num_workers=4,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+    else:
+        dataloader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            num_workers=4,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
     return dataloader
 
 
@@ -1213,6 +1347,7 @@ def main(args: argparse.Namespace):
         specie_split_ratio=args.specie_split_ratio,
         specie_split_seed=args.specie_split_seed,
         splits_save_dir=save_dir,   # pass run-specific save_dir to dataset
+        min_normals_per_batch=getattr(args, 'min_normals_per_batch', 0),
     )
 
 
@@ -2351,6 +2486,9 @@ if __name__ == "__main__":
                         help="最终学习率与初始学习率的比值 (默认0.01)")
     parser.add_argument("--gradient_accumulation", type=int, default=1,
                         help="梯度累积步数 (默认1即不累积，设为2则有效batch=batch_size*2)")
+    parser.add_argument("--min_normals_per_batch", type=int, default=2,
+                        help="在训练 batch 中至少包含多少个 normal/good 样本（用于压制假阳性；单卡时生效）")
+
 
     args = parser.parse_args()
     main(args)
