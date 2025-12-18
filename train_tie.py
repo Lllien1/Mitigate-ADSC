@@ -27,12 +27,187 @@ from torch.cuda.amp import autocast, GradScaler
 
 from dataset import MVTecMetaDataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
+from spurious_mitigation import TIEModule, TIELoss
 
 import numpy as np
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
 import json
+
+# ==================== TIE (Text-guided Image Embedding Translation) integration ====================
+class SegmentationHeadWithTIE(nn.Module):
+    """Wrap SAM3 segmentation head: translate obj_queries (decoder queries) with TIE before mask prediction.
+
+    The training loop sets `self._is_anomaly` each step via `set_is_anomaly`.
+    """
+
+    def __init__(self, seg_head: nn.Module, tie_module: nn.Module, apply_to_features: bool = False):
+        super().__init__()
+        self.seg_head = seg_head
+        self.tie_module = tie_module  # registered ONCE (inside segmentation_head wrapper)
+        self.apply_to_features = bool(apply_to_features)
+        self._is_anomaly: Optional[torch.Tensor] = None  # (B,) bool
+
+    def set_is_anomaly(self, is_anomaly: Optional[torch.Tensor]):
+        self._is_anomaly = is_anomaly
+
+    def forward(self, backbone_feats, obj_queries, **kwargs):
+        is_anomaly = self._is_anomaly
+        oq = obj_queries
+        bf = backbone_feats
+
+        # Optional: translate one backbone feature map (only if feature_tie exists and shapes match)
+        if self.apply_to_features and getattr(self.tie_module, "feature_tie", None) is not None:
+            try:
+                if isinstance(backbone_feats, (list, tuple)) and len(backbone_feats) > 0 and isinstance(backbone_feats[0], torch.Tensor):
+                    vf = backbone_feats[0]
+                    tie_out_feat = self.tie_module(visual_features=vf, is_anomaly=is_anomaly, return_diagnostics=False)
+                    if tie_out_feat.get("translated_features", None) is not None:
+                        bf = list(backbone_feats)
+                        bf[0] = tie_out_feat["translated_features"]
+            except Exception:
+                bf = backbone_feats
+
+        # Translate queries (only if query_tie exists)
+        if getattr(self.tie_module, "query_tie", None) is not None and oq is not None:
+            try:
+                if oq.dim() == 4:
+                    oq2 = oq.clone()
+                    last = oq2[-1]  # (B,Q,D)
+                    tie_out = self.tie_module(decoder_hs=last, is_anomaly=is_anomaly, return_diagnostics=False)
+                    if tie_out.get("translated_queries", None) is not None:
+                        oq2[-1] = tie_out["translated_queries"]
+                    oq = oq2
+                elif oq.dim() == 3:
+                    tie_out = self.tie_module(decoder_hs=oq, is_anomaly=is_anomaly, return_diagnostics=False)
+                    if tie_out.get("translated_queries", None) is not None:
+                        oq = tie_out["translated_queries"]
+            except Exception:
+                pass
+
+        return self.seg_head(backbone_feats=bf, obj_queries=oq, **kwargs)
+
+
+def _build_tie_module(args: argparse.Namespace, model_core: nn.Module, device: torch.device) -> Optional[nn.Module]:
+    """Create a TIE module. Registration strategy:
+    - loss_only: attach to model_core as `model_core.tie_module`
+    - in_forward: put it inside SegmentationHeadWithTIE wrapper (avoid double registration)
+    """
+    tie_mode = getattr(args, "tie_mode", "none")
+    if tie_mode == "none" and getattr(args, "enable_tie", False):
+        tie_mode = "loss_only"
+        args.tie_mode = tie_mode
+
+    if tie_mode == "none":
+        return None
+
+    embed_dim = int(getattr(getattr(model_core, "transformer", None), "d_model", 256))
+    num_vec = int(getattr(args, "tie_num_vectors", 4))
+    spurious_source = getattr(args, "tie_source", "learnable")
+    
+    # 处理布尔参数：默认启用 queries 和 adaptive_scale，除非显式禁用
+    # 逻辑：如果 --no_xxx 被指定，则禁用；否则如果 --xxx 被指定或者默认情况下启用
+    no_queries = getattr(args, "no_tie_apply_to_queries", False)
+    yes_queries = getattr(args, "tie_apply_to_queries", False)
+    apply_to_queries = not no_queries and (yes_queries or True)  # 默认 True，除非显式 --no_xxx
+    
+    no_adaptive = getattr(args, "no_tie_adaptive_scale", False)
+    yes_adaptive = getattr(args, "tie_adaptive_scale", False)
+    adaptive_scale = not no_adaptive and (yes_adaptive or True)  # 默认 True，除非显式 --no_xxx
+    
+    apply_to_features = bool(getattr(args, "tie_apply_to_features", False))  # 默认 False
+
+    text_encoder = getattr(model_core, "text_encoder", None)
+    if spurious_source in ("text", "hybrid") and text_encoder is None:
+        print("[WARN] tie_source requires text_encoder, but model_core.text_encoder is None. Fallback to learnable.")
+        spurious_source = "learnable"
+
+    default_spurious_prompts = [
+        "a photo with normal texture",
+        "a photo of regular surface",
+        "a photo without defects",
+        "an image of undamaged material",
+    ]
+    spurious_prompts = getattr(args, "tie_spurious_prompts", None) or default_spurious_prompts
+
+    tie_module = nn.Module()  # container
+    if apply_to_queries:
+        tie_module.query_tie = TIEModule(
+            embed_dim=embed_dim,
+            spurious_source=spurious_source,
+            num_spurious_vectors=num_vec,
+            text_encoder=text_encoder,
+            spurious_prompts=spurious_prompts,
+            adaptive_scale=adaptive_scale,
+        )
+    else:
+        tie_module.query_tie = None
+
+    if apply_to_features:
+        tie_module.feature_tie = TIEModule(
+            embed_dim=embed_dim,
+            spurious_source=spurious_source,
+            num_spurious_vectors=num_vec,
+            text_encoder=text_encoder,
+            spurious_prompts=spurious_prompts,
+            adaptive_scale=adaptive_scale,
+        )
+    else:
+        tie_module.feature_tie = None
+
+    def _tie_forward(decoder_hs=None, visual_features=None, is_anomaly=None, return_diagnostics=False):
+        outputs = {}
+        if decoder_hs is not None and tie_module.query_tie is not None:
+            hs = decoder_hs[-1] if (isinstance(decoder_hs, torch.Tensor) and decoder_hs.dim() == 4) else decoder_hs
+            if return_diagnostics:
+                translated, diag = tie_module.query_tie(hs, is_anomaly=is_anomaly, return_diagnostics=True)
+                outputs["diagnostics_query"] = diag
+            else:
+                translated = tie_module.query_tie(hs, is_anomaly=is_anomaly, return_diagnostics=False)
+            outputs["translated_queries"] = translated
+        if visual_features is not None and tie_module.feature_tie is not None:
+            if return_diagnostics:
+                translated, diag = tie_module.feature_tie(visual_features, is_anomaly=is_anomaly, return_diagnostics=True)
+                outputs["diagnostics_feat"] = diag
+            else:
+                translated = tie_module.feature_tie(visual_features, is_anomaly=is_anomaly, return_diagnostics=False)
+            outputs["translated_features"] = translated
+        return outputs
+
+    tie_module.forward = _tie_forward  # type: ignore
+    tie_module.to(device)
+
+    print(f"[INFO] TIE enabled: mode={tie_mode}, source={spurious_source}, "
+          f"num_vectors={num_vec}, apply_to_queries={apply_to_queries}, apply_to_features={apply_to_features}, "
+          f"adaptive_scale={adaptive_scale}")
+    return tie_module
+
+
+def _resolve_tie_module(model_core: nn.Module) -> Optional[nn.Module]:
+    tm = getattr(model_core, "tie_module", None)
+    if tm is not None:
+        return tm
+    sh = getattr(model_core, "segmentation_head", None)
+    if sh is not None:
+        tm2 = getattr(sh, "tie_module", None)
+        if tm2 is not None:
+            return tm2
+    return None
+
+
+def _build_tie_loss(args: argparse.Namespace) -> Optional[TIELoss]:
+    tie_mode = getattr(args, "tie_mode", "none")
+    if tie_mode == "none" and getattr(args, "enable_tie", False):
+        tie_mode = "loss_only"
+    if tie_mode == "none":
+        return None
+    return TIELoss(
+        orthogonality_weight=float(getattr(args, "tie_orth_weight", 0.1)),
+        discrimination_weight=float(getattr(args, "tie_disc_weight", 1.0)),
+        margin=float(getattr(args, "tie_margin", 0.3)),
+    )
+# ==================== End TIE integration ====================
 
 
 # ==================== 新增：学习率调度器 ====================
@@ -1391,6 +1566,31 @@ def main(args: argparse.Namespace):
 
     model.to(device)
 
+    # ---- TIE: build module and integrate (loss_only / in_forward) ----
+    tie_loss_fn = None
+    if getattr(args, "tie_mode", "none") != "none" or getattr(args, "enable_tie", False):
+        tie_module = _build_tie_module(args, model, device)
+        tie_loss_fn = _build_tie_loss(args)
+        if tie_module is not None:
+            if getattr(args, "tie_mode", "none") == "in_forward":
+                # Wrap segmentation head so TIE translation participates in mask prediction.
+                try:
+                    model.segmentation_head = SegmentationHeadWithTIE(
+                        seg_head=model.segmentation_head,
+                        tie_module=tie_module,
+                        apply_to_features=bool(getattr(args, "tie_apply_to_features", False)),
+                    ).to(device)
+                    print("[INFO] segmentation_head wrapped with TIE (in_forward mode).")
+                except Exception as e:
+                    print(f"[WARN] Failed to wrap segmentation_head with TIE: {e}. Falling back to loss_only.")
+                    args.tie_mode = "loss_only"
+                    model.tie_module = tie_module
+            else:
+                # loss_only: register module on the model for optimization + checkpoint
+                model.tie_module = tie_module
+    # ---- end TIE ----
+
+
     if args.distributed:
         model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
 
@@ -1456,6 +1656,7 @@ def main(args: argparse.Namespace):
         apply_lora_to_decoder(model_for_decoder, rank=args.decoder_lora_rank, alpha=args.decoder_lora_alpha)
 
     prompt_and_lora: List[torch.nn.Parameter] = []
+    tie_params: List[torch.nn.Parameter] = []
     other_params: List[torch.nn.Parameter] = []
     decoder_params: List[torch.nn.Parameter] = []
     for n, p in model.named_parameters():
@@ -1464,6 +1665,8 @@ def main(args: argparse.Namespace):
         nl = n.lower()
         if ("lora" in nl) or ("prompt" in nl) or ("template" in nl) or ("out_adapter" in nl):
             prompt_and_lora.append(p)
+        elif "tie_module" in nl or ("tie_" in nl) or ("tie" in nl):
+            tie_params.append(p)
         elif "decoder" in nl:
             decoder_params.append(p)
         else:
@@ -1499,6 +1702,12 @@ def main(args: argparse.Namespace):
         {"params": prompt_and_lora, "lr": args.lr_prompt},
         {"params": other_params, "lr": args.lr_main},
     ]
+
+    # TIE params (optional separate LR)
+    if len(tie_params) > 0:
+        lr_tie = float(args.lr_prompt if getattr(args, "lr_tie", None) is None else args.lr_tie)
+        param_groups.append({"params": tie_params, "lr": lr_tie})
+        print(f"[INFO] Added {len(tie_params)} TIE params with lr={lr_tie}")
     
     # 新增：为 decoder 参数添加单独的参数组（使用较小的学习率）
     if len(decoder_params) > 0:
@@ -1592,6 +1801,15 @@ def main(args: argparse.Namespace):
                 current_lambda_query_align = lambda_scheduler.get_lambda()
             else:
                 current_lambda_query_align = getattr(args, 'lambda_query_align', 0.5)
+
+            # ==================== TIE in_forward 模式：设置 is_anomaly ====================
+            # 如果使用 in_forward 模式，需要在 forward 之前告诉 SegmentationHeadWithTIE 当前 batch 的 anomaly 标签
+            is_anomaly_tensor = torch.tensor(is_anomaly, dtype=torch.bool, device=device)
+            if getattr(args, "tie_mode", "none") == "in_forward":
+                seg_head = getattr(model_core, "segmentation_head", None)
+                if seg_head is not None and hasattr(seg_head, "set_is_anomaly"):
+                    seg_head.set_is_anomaly(is_anomaly_tensor)
+            # ==================== End TIE in_forward setup ====================
 
             # ===== AMP autocast: forward + loss 计算都放在半精度上下文 =====
             with autocast(enabled=(device.type == "cuda")):
@@ -2401,26 +2619,38 @@ def main(args: argparse.Namespace):
                                     ax3.set_xlabel("Cosine Similarity")
                                     ax3.set_ylabel("Count")
                                     
-                                    # ===== Panel 4: 统计信息 =====
+                                    # ===== Panel 4: TIE 投影效果或统计信息 =====
                                     ax4 = axes[1, 1]
-                                    stats_text = f"""Epoch {epoch+1} Statistics                                    
-                                        Alignment Loss:
-                                          align_loss: {align_loss.item():.4f}
-                                          query_align: {query_align_loss.item():.4f}
+                                    # 显示训练统计
+                                    stats_text = f"""Epoch {epoch+1} Statistics
+                                    
+Alignment Loss:
+  align_loss: {align_loss.item():.4f}
+  query_align: {query_align_loss.item():.4f}
 
-                                        Similarity Stats:
-                                          pos_sim (same group): {pos_sim:.4f}
-                                          neg_sim (diff group): {neg_sim:.4f}
-                                          separation: {pos_sim - neg_sim:.4f}
+Similarity Stats:
+  pos_sim (same group): {pos_sim:.4f}
+  neg_sim (diff group): {neg_sim:.4f}
+  separation: {pos_sim - neg_sim:.4f}
 
-                                        Sample Distribution:
-                                          Normal: {n_bg}
-                                          Anomaly: {n_anom}
-                                          Total: {B}
+Sample Distribution:
+  Normal: {n_bg}
+  Anomaly: {n_anom}
+  Total: {B}
 
-                                        Prompt-Visual Sim:
-                                          Mean: {diag_sim.mean():.4f}
-                                          Std: {diag_sim.std():.4f}"""
+Prompt-Visual Sim:
+  Mean: {diag_sim.mean():.4f}
+  Std: {diag_sim.std():.4f}"""
+                                    
+                                    # 如果TIE启用，添加TIE统计
+                                    if lambda_tie > 0:
+                                        stats_text += f"""
+
+TIE Effect:
+  loss_tie: {loss_tie.item():.4f}
+  normal_proj: {tie_normal_proj:.4f}
+  anomaly_proj: {tie_anomaly_proj:.4f}
+  separation: {tie_normal_proj - tie_anomaly_proj:.4f}"""
                                     
                                     ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=10,
                                             verticalalignment='top', fontfamily='monospace',
@@ -2444,7 +2674,46 @@ def main(args: argparse.Namespace):
                 # -------------------------
 
 
-                # Combine losses: 包含新的 query_align_loss
+                
+                # ==================== TIE loss (reduce false positives via spurious translation) ====================
+                loss_tie = torch.tensor(0.0, device=device)
+                tie_orth_loss = torch.tensor(0.0, device=device)  # 正交性损失
+                tie_disc_loss = torch.tensor(0.0, device=device)  # 区分性损失
+                tie_normal_proj = 0.0  # 正常样本投影长度
+                tie_anomaly_proj = 0.0  # 异常样本投影长度
+                
+                lambda_tie = float(getattr(args, "lambda_tie", 0.0))
+                if tie_loss_fn is not None and lambda_tie > 0:
+                    tie_mod = _resolve_tie_module(model_core)
+                    decoder_hs = out.get("decoder_hs", None)
+                    if tie_mod is not None and decoder_hs is not None and getattr(tie_mod, "query_tie", None) is not None:
+                        hs_for_tie = decoder_hs[-1] if decoder_hs.dim() == 4 else decoder_hs  # (B,Q,D)
+                        spurious_vectors = tie_mod.query_tie.get_spurious_vectors(device)
+                        tie_loss_dict = tie_loss_fn(
+                            spurious_vectors=spurious_vectors,
+                            embeddings=hs_for_tie,
+                            is_anomaly=is_anomaly_tensor,
+                        )
+                        loss_tie = tie_loss_dict.get("total", loss_tie)
+                        tie_orth_loss = tie_loss_dict.get("orthogonality", tie_orth_loss)
+                        tie_disc_loss = tie_loss_dict.get("discrimination", tie_disc_loss)
+                        
+                        # 计算投影长度用于可视化
+                        with torch.no_grad():
+                            B_tie, Q_tie, D_tie = hs_for_tie.shape
+                            embeddings_flat = hs_for_tie.view(B_tie, -1, D_tie)
+                            proj_lengths = torch.einsum("bnd,kd->bnk", embeddings_flat, spurious_vectors)
+                            mean_proj = proj_lengths.mean(dim=[1, 2])  # (B,)
+                            
+                            normal_mask = ~is_anomaly_tensor.bool()
+                            anomaly_mask = is_anomaly_tensor.bool()
+                            if normal_mask.sum() > 0:
+                                tie_normal_proj = mean_proj[normal_mask].mean().item()
+                            if anomaly_mask.sum() > 0:
+                                tie_anomaly_proj = mean_proj[anomaly_mask].mean().item()
+                # ==================== End TIE loss ====================
+
+                # Combine losses: 包含新的 query_align_loss 和 TIE loss
                 # current_lambda_query_align 已在 batch 循环开始时初始化
                 
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
@@ -2452,11 +2721,13 @@ def main(args: argparse.Namespace):
                                 (torch.exp(-log_var_dice)  * loss_dice  + log_var_dice) + \
                                 (torch.exp(-log_var_iou)   * loss_iou   + log_var_iou)
                     total_loss = loss_main + args.presence_weight * loss_presence + \
-                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss
+                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
+                                 lambda_tie * loss_tie  # 新增: TIE loss
                 else:
                     total_loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
                     total_loss = total_loss + args.presence_weight * loss_presence + \
-                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss
+                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
+                                 lambda_tie * loss_tie  # 新增: TIE loss
 
                 loss = total_loss
 
@@ -2575,6 +2846,15 @@ def main(args: argparse.Namespace):
                 writer.add_scalar("loss/align", align_loss.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
+                # TIE 损失记录（仅当 TIE 启用时记录详细信息）
+                if lambda_tie > 0:
+                    writer.add_scalar("loss/tie", loss_tie.item(), global_step)
+                    writer.add_scalar("tie/orthogonality", tie_orth_loss.item() if isinstance(tie_orth_loss, torch.Tensor) else tie_orth_loss, global_step)
+                    writer.add_scalar("tie/discrimination", tie_disc_loss.item() if isinstance(tie_disc_loss, torch.Tensor) else tie_disc_loss, global_step)
+                    writer.add_scalar("tie/normal_proj", tie_normal_proj, global_step)
+                    writer.add_scalar("tie/anomaly_proj", tie_anomaly_proj, global_step)
+                    writer.add_scalar("tie/proj_separation", tie_normal_proj - tie_anomaly_proj, global_step)
+                    writer.add_scalar("lambda/tie", lambda_tie, global_step)
             # 记录当前学习率
             if is_main_process and writer is not None:
                 current_lrs = scheduler.get_lr()
@@ -2647,6 +2927,37 @@ if __name__ == "__main__":
     parser.add_argument("--align_temp", type=float, default=0.1, help="temperature for contrastive alignment (increased from 0.07 for stability)")
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
+
+    # ==================== TIE (spurious correlation mitigation) ====================
+    parser.add_argument("--tie_mode", type=str, default="none",
+                        choices=["none", "loss_only", "in_forward"],
+                        help="TIE integration: none (baseline), loss_only (aux loss), in_forward (translate queries before mask head).")
+    parser.add_argument("--enable_tie", action="store_true",
+                        help="(legacy) Enable TIE; equivalent to --tie_mode loss_only if tie_mode is none.")
+    parser.add_argument("--lambda_tie", type=float, default=0.0, help="Weight for TIE loss.")
+    parser.add_argument("--tie_num_vectors", type=int, default=4, help="Number of spurious vectors.")
+    parser.add_argument("--tie_source", type=str, default="learnable", choices=["learnable", "text", "hybrid"],
+                        help="Spurious vector source for TIE module.")
+    parser.add_argument("--tie_orth_weight", type=float, default=0.1, help="Orthogonality regularization weight inside TIE loss.")
+    parser.add_argument("--tie_disc_weight", type=float, default=1.0, help="Discrimination (margin) weight inside TIE loss.")
+    parser.add_argument("--tie_margin", type=float, default=0.3, help="Margin used by TIE loss.")
+    parser.add_argument("--lr_tie", type=float, default=None, help="Optional LR for TIE params (default: lr_prompt).")
+
+    parser.add_argument("--tie_apply_to_queries", action="store_true", default=False,
+                        help="Apply TIE to decoder queries (recommended for FP reduction)")
+    parser.add_argument("--no_tie_apply_to_queries", action="store_true", default=False,
+                        help="Explicitly disable TIE on queries (for ablation)")
+    parser.add_argument("--tie_apply_to_features", action="store_true", default=False,
+                        help="Apply TIE to visual features (more compute, optional)")
+
+    parser.add_argument("--tie_adaptive_scale", action="store_true", default=False,
+                        help="Use adaptive scale in TIE translation")
+    parser.add_argument("--no_tie_adaptive_scale", action="store_true", default=False,
+                        help="Explicitly disable adaptive scale (for ablation)")
+
+    parser.add_argument("--tie_spurious_prompts", nargs="*", default=None,
+                        help="Optional list of spurious prompts when tie_source is text/hybrid.")
+    # ==================== End TIE args ====================
     parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
     parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
     parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
