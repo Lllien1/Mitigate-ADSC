@@ -100,6 +100,88 @@ class GradientAccumulator:
         self.current_step = 0
 
 
+# ==================== 新增：两阶段 Lambda 调度器 ====================
+
+class TwoStageLambdaScheduler:
+    """
+    两阶段 lambda_query_align 调度器
+    
+    策略：
+    - Stage 1 (前 stage1_ratio 的步数): 使用较低的 lambda 值，让模型先学好 segmentation
+    - Stage 2 (剩余步数): 逐渐提升 lambda 值，增强 query-text alignment
+    
+    过渡方式：
+    - 'step': 阶跃切换（在 stage1 结束时突然切换到 stage2 值）
+    - 'linear': 线性过渡（在 stage1 结束后线性增加到 stage2 值）
+    - 'cosine': 余弦过渡（更平滑的过渡曲线）
+    """
+    
+    def __init__(
+        self,
+        total_steps: int,
+        stage1_ratio: float = 0.35,        # Stage 1 占总步数的比例 (默认35%)
+        stage1_lambda: float = 0.08,       # Stage 1 的 lambda 值 (低)
+        stage2_lambda: float = 0.20,       # Stage 2 的 lambda 值 (高)
+        transition: str = 'linear',        # 过渡方式: 'step', 'linear', 'cosine'
+        transition_ratio: float = 0.15,    # 过渡期占 stage2 的比例 (仅 linear/cosine 有效)
+    ):
+        self.total_steps = total_steps
+        self.stage1_ratio = stage1_ratio
+        self.stage1_lambda = stage1_lambda
+        self.stage2_lambda = stage2_lambda
+        self.transition = transition
+        self.transition_ratio = transition_ratio
+        
+        # 计算关键步数点
+        self.stage1_end = int(total_steps * stage1_ratio)
+        self.transition_steps = int((total_steps - self.stage1_end) * transition_ratio)
+        self.transition_end = self.stage1_end + self.transition_steps
+        
+        self.current_step = 0
+        
+        print(f"[TwoStageLambdaScheduler] 初始化:")
+        print(f"  总步数: {total_steps}")
+        print(f"  Stage 1: step 0 ~ {self.stage1_end} ({stage1_ratio*100:.0f}%), lambda={stage1_lambda}")
+        print(f"  过渡期: step {self.stage1_end} ~ {self.transition_end} ({transition})")
+        print(f"  Stage 2: step {self.transition_end} ~ {total_steps}, lambda={stage2_lambda}")
+    
+    def step(self):
+        """更新当前步数"""
+        self.current_step += 1
+    
+    def get_lambda(self) -> float:
+        """获取当前步的 lambda 值"""
+        if self.current_step <= self.stage1_end:
+            # Stage 1: 使用低 lambda
+            return self.stage1_lambda
+        
+        elif self.current_step <= self.transition_end and self.transition != 'step':
+            # 过渡期
+            progress = (self.current_step - self.stage1_end) / max(1, self.transition_steps)
+            progress = min(1.0, progress)  # 确保不超过1
+            
+            if self.transition == 'linear':
+                return self.stage1_lambda + (self.stage2_lambda - self.stage1_lambda) * progress
+            elif self.transition == 'cosine':
+                # 使用余弦插值实现更平滑的过渡
+                cosine_factor = 0.5 * (1 - math.cos(math.pi * progress))
+                return self.stage1_lambda + (self.stage2_lambda - self.stage1_lambda) * cosine_factor
+            else:
+                return self.stage2_lambda
+        else:
+            # Stage 2: 使用高 lambda
+            return self.stage2_lambda
+    
+    def get_stage(self) -> str:
+        """获取当前阶段名称"""
+        if self.current_step <= self.stage1_end:
+            return "stage1"
+        elif self.current_step <= self.transition_end:
+            return "transition"
+        else:
+            return "stage2"
+
+
 def setup_distributed(args):
     """
     初始化分布式（在使用 torch.distributed.run 启动时，环境变量会提供 LOCAL_RANK, RANK, WORLD_SIZE）
@@ -1454,6 +1536,18 @@ def main(args: argparse.Namespace):
     
     grad_accum = GradientAccumulator(args.gradient_accumulation)
     
+    # ==================== 新增：两阶段 lambda_query_align 调度器 ====================
+    lambda_scheduler = None
+    if getattr(args, 'enable_two_stage', False):
+        lambda_scheduler = TwoStageLambdaScheduler(
+            total_steps=total_steps,
+            stage1_ratio=getattr(args, 'stage1_ratio', 0.35),
+            stage1_lambda=getattr(args, 'stage1_lambda', 0.08),
+            stage2_lambda=getattr(args, 'stage2_lambda', 0.20),
+            transition=getattr(args, 'lambda_transition', 'linear'),
+            transition_ratio=getattr(args, 'transition_ratio', 0.15),
+        )
+    
     print("=" * 60)
     print("训练配置:")
     print(f"  总epoch数: {args.epochs}")
@@ -1463,6 +1557,12 @@ def main(args: argparse.Namespace):
     print(f"  总优化步数: {total_steps}")
     print(f"  Warmup步数: {warmup_steps} ({args.warmup_ratio*100:.0f}%)")
     print(f"  最终LR比例: {args.min_lr_ratio}")
+    if lambda_scheduler:
+        print(f"  两阶段调度: 已启用")
+        print(f"    Stage 1 (0~{int(total_steps*args.stage1_ratio)}步): lambda={args.stage1_lambda}")
+        print(f"    Stage 2 ({int(total_steps*args.stage1_ratio)}~{total_steps}步): lambda={args.stage2_lambda}")
+    else:
+        print(f"  两阶段调度: 未启用，使用固定 lambda_query_align={args.lambda_query_align}")
     print("=" * 60)
 
     model.train()
@@ -1486,6 +1586,12 @@ def main(args: argparse.Namespace):
             images, masks, prompt_lists, is_anomaly, class_names, specie_names = batch
             images = images.to(device)
             masks = masks.to(device)
+            
+            # 获取当前的 lambda_query_align 值（两阶段调度或固定值）
+            if lambda_scheduler is not None:
+                current_lambda_query_align = lambda_scheduler.get_lambda()
+            else:
+                current_lambda_query_align = getattr(args, 'lambda_query_align', 0.5)
 
             # ===== AMP autocast: forward + loss 计算都放在半精度上下文 =====
             with autocast(enabled=(device.type == "cuda")):
@@ -2192,8 +2298,8 @@ def main(args: argparse.Namespace):
                         )
                         
                         # ===== Step 5: Query-level alignment（关键改进）=====
-                        lambda_query_align = getattr(args, 'lambda_query_align', 0.5)
-                        if lambda_query_align > 0:
+                        # current_lambda_query_align 已在 batch 循环开始时初始化（两阶段调度或固定值）
+                        if current_lambda_query_align > 0:
                             decoder_hs = out.get("decoder_hs", None)
                             if decoder_hs is not None:
                                 # 确保 decoder_hs 是 (B, Q, D) 格式
@@ -2268,18 +2374,18 @@ def main(args: argparse.Namespace):
 
 
                 # Combine losses: 包含新的 query_align_loss
-                lambda_query_align = getattr(args, 'lambda_query_align', 0.5)
+                # current_lambda_query_align 已在 batch 循环开始时初始化
                 
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
                     loss_main = (torch.exp(-log_var_focal) * loss_focal + log_var_focal) + \
                                 (torch.exp(-log_var_dice)  * loss_dice  + log_var_dice) + \
                                 (torch.exp(-log_var_iou)   * loss_iou   + log_var_iou)
                     total_loss = loss_main + args.presence_weight * loss_presence + \
-                                 args.lambda_align * align_loss + lambda_query_align * query_align_loss
+                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss
                 else:
                     total_loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
                     total_loss = total_loss + args.presence_weight * loss_presence + \
-                                 args.lambda_align * align_loss + lambda_query_align * query_align_loss
+                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss
 
                 loss = total_loss
 
@@ -2356,17 +2462,32 @@ def main(args: argparse.Namespace):
                 
                 # 更新学习率调度器
                 scheduler.step()
+                
+                # 更新两阶段 lambda 调度器
+                if lambda_scheduler is not None:
+                    lambda_scheduler.step()
+                
                 global_optim_step += 1
                 
                 grad_accum.reset()
             # ==================== 梯度累积逻辑结束 ====================
 
             if is_main_process:
-                pbar.set_postfix(
-                    loss=loss.item(),
-                    focal=loss_focal.item(),
-                    dice=loss_dice.item(),
-                )
+                # 显示当前 lambda 值（如果使用两阶段调度）
+                if lambda_scheduler is not None:
+                    pbar.set_postfix(
+                        loss=loss.item(),
+                        focal=loss_focal.item(),
+                        dice=loss_dice.item(),
+                        lam_qa=f"{current_lambda_query_align:.3f}",
+                        stage=lambda_scheduler.get_stage()[:2],  # s1/tr/s2
+                    )
+                else:
+                    pbar.set_postfix(
+                        loss=loss.item(),
+                        focal=loss_focal.item(),
+                        dice=loss_dice.item(),
+                    )
 
             global_step = epoch * len(dataloader) + step
             if is_main_process and writer is not None:
@@ -2389,6 +2510,9 @@ def main(args: argparse.Namespace):
                 writer.add_scalar("lr/prompt", current_lrs[0], global_step)
                 if len(current_lrs) > 1:
                     writer.add_scalar("lr/main", current_lrs[1], global_step)
+            # 记录当前 lambda_query_align（如果使用两阶段调度）
+            if is_main_process and writer is not None and lambda_scheduler is not None:
+                writer.add_scalar("lambda/query_align", current_lambda_query_align, global_step)
             
 
             running_loss += loss.item()
@@ -2477,7 +2601,22 @@ if __name__ == "__main__":
     parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
     
     parser.add_argument("--align_margin", type=float, default=0.5,help="Margin for pushing defect prompts away from background embeddings")
-    parser.add_argument("--lambda_query_align", type=float, default=0.5,help="Weight for query-level alignment loss (让 prompt 选中正确的 query)")
+    parser.add_argument("--lambda_query_align", type=float, default=0.5,help="Weight for query-level alignment loss (会被两阶段调度器覆盖)")
+
+    # ==================== 新增：两阶段 query_align 调度参数 ====================
+    parser.add_argument("--enable_two_stage", action="store_true",
+                        help="启用两阶段 lambda_query_align 调度 (推荐开启)")
+    parser.add_argument("--stage1_ratio", type=float, default=0.35,
+                        help="Stage 1 占总步数的比例 (默认0.35即35%)")
+    parser.add_argument("--stage1_lambda", type=float, default=0.08,
+                        help="Stage 1 的 lambda_query_align 值 (低，让模型先学 segmentation)")
+    parser.add_argument("--stage2_lambda", type=float, default=0.20,
+                        help="Stage 2 的 lambda_query_align 值 (高，增强 query-text alignment)")
+    parser.add_argument("--lambda_transition", type=str, default="linear",
+                        choices=["step", "linear", "cosine"],
+                        help="Stage 1 到 Stage 2 的过渡方式 (默认 linear)")
+    parser.add_argument("--transition_ratio", type=float, default=0.15,
+                        help="过渡期占 Stage 2 的比例 (默认0.15，仅 linear/cosine 有效)")
 
     # ==================== 新增：训练优化参数 ====================
     parser.add_argument("--warmup_ratio", type=float, default=0.1,

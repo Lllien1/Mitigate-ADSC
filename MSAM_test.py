@@ -657,9 +657,16 @@ def load_model(args, device: torch.device):
 
 
 def _get_sample_id_from_meta(ds, global_idx: int, fallback_cls: str, fallback_specie: str):
-    """Try to recover the meta.json entry for naming."""
+    """
+    Try to recover the meta.json entry for naming.
+    
+    从 img_path 提取序号，例如：
+    - "zipper/test/fabric_border/006.png" -> stem="006"
+    - 最终文件名: {specie_name}_{cls_name}_{stem}.png
+    """
     meta_entry = None
-    for attr in ("items", "meta_list", "data_list", "samples", "records", "metas", "data"):
+    # 尝试从不同的数据集属性中获取 entry
+    for attr in ("entries", "items", "meta_list", "data_list", "samples", "records", "metas", "data"):
         v = getattr(ds, attr, None)
         if isinstance(v, list) and global_idx < len(v):
             meta_entry = v[global_idx]
@@ -667,16 +674,26 @@ def _get_sample_id_from_meta(ds, global_idx: int, fallback_cls: str, fallback_sp
 
     cls_name = fallback_cls
     specie_name = fallback_specie
-    stem = f"{global_idx:03d}"
+    stem = f"{global_idx:03d}"  # 默认使用全局索引
     ext = ".png"
 
-    if isinstance(meta_entry, dict):
-        cls_name = meta_entry.get("cls_name", cls_name)
-        specie_name = meta_entry.get("specie_name", specie_name)
-        img_path = meta_entry.get("img_path") or meta_entry.get("image_path") or meta_entry.get("img")
+    if meta_entry is not None:
+        # 处理 dict 类型的 entry (来自原始 meta.json)
+        if isinstance(meta_entry, dict):
+            cls_name = meta_entry.get("cls_name", cls_name)
+            specie_name = meta_entry.get("specie_name", specie_name)
+            img_path = meta_entry.get("img_path") or meta_entry.get("image_path") or meta_entry.get("img")
+        # 处理 SampleEntry 或其他对象类型 (来自 MVTecMetaDataset.entries)
+        else:
+            cls_name = getattr(meta_entry, "cls_name", cls_name)
+            specie_name = getattr(meta_entry, "specie_name", specie_name)
+            img_path = getattr(meta_entry, "img_path", None)
+        
+        # 从 img_path 提取文件名序号
+        # 例如: "zipper/test/fabric_border/006.png" -> stem="006", ext=".png"
         if isinstance(img_path, str) and img_path:
-            base = os.path.basename(img_path)
-            stem2, ext2 = os.path.splitext(base)
+            base = os.path.basename(img_path)  # "006.png"
+            stem2, ext2 = os.path.splitext(base)  # stem2="006", ext2=".png"
             if stem2:
                 stem = stem2
             if ext2:
