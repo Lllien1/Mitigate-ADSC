@@ -435,3 +435,119 @@ class MVTecMetaDataset(Dataset):
             prompt_list = [f"normal {cls_name}", "clean", "intact"]
 
         return img, img_mask, prompt_list, is_anomaly, cls_name, specie_name
+
+
+# ==================== VisA Dataset ====================
+
+class VisADataset(Dataset):
+    """Dataset for VisA (Visual Anomaly) benchmark.
+    
+    Reads from CSV file (1cls.csv format) with columns:
+    - object: class name (candle, capsules, etc.)
+    - split: train/test
+    - label: normal/anomaly
+    - image: image path relative to root
+    - mask: mask path relative to root (empty for normal samples)
+    
+    Returns: (image_tensor, mask_tensor, prompt_list, is_anomaly, cls_name, specie_name)
+    """
+    
+    def __init__(
+        self,
+        root: str,
+        csv_path: str,
+        mode: str = "test",  # "train" or "test"
+        obj_name: Optional[str] = None,  # filter by class name
+        image_transform: Optional[Callable] = None,
+        mask_transform: Optional[Callable] = None,
+    ) -> None:
+        super().__init__()
+        self.root = root
+        img_tf, mask_tf = _default_transforms()
+        self.image_transform = image_transform or img_tf
+        self.mask_transform = mask_transform or mask_tf
+        
+        # Parse CSV
+        import csv
+        self.entries: List[SampleEntry] = []
+        
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                obj = row.get("object", "").strip()
+                split = row.get("split", "").strip().lower()
+                label = row.get("label", "").strip().lower()
+                img_path = row.get("image", "").strip()
+                mask_path = row.get("mask", "").strip()
+                
+                # Filter by split
+                if split != mode.lower():
+                    continue
+                    
+                # Filter by class name if specified
+                if obj_name is not None and obj != obj_name:
+                    continue
+                
+                # Determine anomaly status
+                is_anomaly = 1 if label == "anomaly" else 0
+                
+                # specie_name: for VisA, we don't have defect types, use "anomaly" or "normal"
+                specie_name = "anomaly" if is_anomaly else "normal"
+                
+                self.entries.append(SampleEntry(
+                    img_path=img_path,
+                    mask_path=mask_path if mask_path else "",
+                    cls_name=obj,
+                    anomaly=is_anomaly,
+                    specie_name=specie_name,
+                ))
+        
+        print(f"[INFO] VisADataset: loaded {len(self.entries)} samples from {csv_path} (mode={mode})")
+        
+        # Count by class
+        cls_counts = {}
+        for e in self.entries:
+            cls_counts[e.cls_name] = cls_counts.get(e.cls_name, 0) + 1
+        for cls, cnt in sorted(cls_counts.items()):
+            anom_cnt = sum(1 for e in self.entries if e.cls_name == cls and e.anomaly)
+            norm_cnt = cnt - anom_cnt
+            print(f"  {cls}: {cnt} samples (anomaly={anom_cnt}, normal={norm_cnt})")
+    
+    def __len__(self) -> int:
+        return len(self.entries)
+    
+    def __getitem__(self, idx: int):
+        data = self.entries[idx]
+        img_path = os.path.join(self.root, data.img_path)
+        mask_path = os.path.join(self.root, data.mask_path) if data.mask_path else None
+        cls_name = data.cls_name
+        is_anomaly = data.anomaly != 0
+        specie_name = data.specie_name
+        
+        try:
+            img = Image.open(img_path).convert("RGB")
+            
+            if not is_anomaly or mask_path is None or not os.path.exists(mask_path):
+                # Normal sample: empty mask
+                img_mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8), mode="L")
+                is_anomaly = False
+            else:
+                # Anomaly sample: load mask
+                mask_arr = np.array(Image.open(mask_path).convert("L")) > 0
+                img_mask = Image.fromarray(mask_arr.astype(np.uint8) * 255, mode="L")
+            
+            img = self.image_transform(img)
+            img_mask = self.mask_transform(img_mask)
+            
+        except (OSError, ValueError) as e:
+            print(f"[WARN] Skip corrupted sample idx={idx} img={img_path} mask={mask_path} err={e}")
+            return self.__getitem__((idx + 1) % len(self.entries))
+        
+        # Build prompt list for VisA
+        # VisA doesn't have detailed specie_name, so we use simple templates
+        if is_anomaly:
+            prompt_list = [f"damaged {cls_name}", "defect", "flaw", "anomaly"]
+        else:
+            prompt_list = [f"normal {cls_name}", "clean", "intact"]
+        
+        return img, img_mask, prompt_list, is_anomaly, cls_name, specie_name

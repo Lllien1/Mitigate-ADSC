@@ -6,6 +6,7 @@
 # 2. 假阳性指标（FPR/平均面积）仅在 normal/good 样本上计算
 # 3. 添加 Image-AUC, Pixel-AUC, mIoU, mBIoU 等指标
 # 4. 支持宏平均（macro）和微平均（micro）
+# 5. 支持 TIE 模块（Text-guided Image Embedding Translation）进行推理
 
 import os, sys
 
@@ -23,13 +24,22 @@ from collections import defaultdict
 import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter,binary_erosion, binary_dilation
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 from tqdm import tqdm
 
-from dataset import MVTecMetaDataset
+from dataset import MVTecMetaDataset, VisADataset
 from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
+
+# ==================== TIE 模块导入（可选）====================
+try:
+    from spurious_mitigation import TIEModule, TIELoss
+    TIE_AVAILABLE = True
+except ImportError:
+    TIE_AVAILABLE = False
+    print("[WARN] TIE module not available. To enable, ensure spurious_mitigation.py is in the same directory.")
 
 # Optional: sklearn for AUC computation
 try:
@@ -38,6 +48,146 @@ try:
 except ImportError:
     HAS_SKLEARN = False
     print("[WARN] sklearn not found, AUC metrics will be skipped")
+
+
+# ==================== TIE 推理支持 ====================
+
+class SegmentationHeadWithTIE(nn.Module):
+    """Wrap SAM3 segmentation head: translate obj_queries (decoder queries) with TIE before mask prediction.
+    
+    For inference, set `self._is_anomaly` via `set_is_anomaly` before each forward pass.
+    If is_anomaly is None, TIE translation is applied uniformly (assuming potential anomaly).
+    """
+
+    def __init__(self, seg_head: nn.Module, tie_module: nn.Module, apply_to_features: bool = False):
+        super().__init__()
+        self.seg_head = seg_head
+        self.tie_module = tie_module
+        self.apply_to_features = bool(apply_to_features)
+        self._is_anomaly: Optional[torch.Tensor] = None
+
+    def set_is_anomaly(self, is_anomaly: Optional[torch.Tensor]):
+        self._is_anomaly = is_anomaly
+
+    def forward(self, backbone_feats, obj_queries, **kwargs):
+        is_anomaly = self._is_anomaly
+        oq = obj_queries
+        bf = backbone_feats
+
+        # Optional: translate backbone features
+        if self.apply_to_features and getattr(self.tie_module, "feature_tie", None) is not None:
+            try:
+                if isinstance(backbone_feats, (list, tuple)) and len(backbone_feats) > 0:
+                    vf = backbone_feats[0]
+                    tie_out_feat = self.tie_module(visual_features=vf, is_anomaly=is_anomaly, return_diagnostics=False)
+                    if tie_out_feat.get("translated_features", None) is not None:
+                        bf = list(backbone_feats)
+                        bf[0] = tie_out_feat["translated_features"]
+            except Exception:
+                bf = backbone_feats
+
+        # Translate queries
+        if getattr(self.tie_module, "query_tie", None) is not None and oq is not None:
+            try:
+                if oq.dim() == 4:
+                    oq2 = oq.clone()
+                    last = oq2[-1]
+                    tie_out = self.tie_module(decoder_hs=last, is_anomaly=is_anomaly, return_diagnostics=False)
+                    if tie_out.get("translated_queries", None) is not None:
+                        oq2[-1] = tie_out["translated_queries"]
+                    oq = oq2
+                elif oq.dim() == 3:
+                    tie_out = self.tie_module(decoder_hs=oq, is_anomaly=is_anomaly, return_diagnostics=False)
+                    if tie_out.get("translated_queries", None) is not None:
+                        oq = tie_out["translated_queries"]
+            except Exception:
+                pass
+
+        return self.seg_head(backbone_feats=bf, obj_queries=oq, **kwargs)
+
+
+def _build_tie_module_for_inference(args, model_core: nn.Module, device: torch.device) -> Optional[nn.Module]:
+    """Build TIE module for inference. Similar to train_tie.py but simplified."""
+    if not TIE_AVAILABLE:
+        return None
+    
+    tie_mode = getattr(args, "tie_mode", "none")
+    if tie_mode == "none":
+        return None
+
+    embed_dim = int(getattr(getattr(model_core, "transformer", None), "d_model", 256))
+    num_vec = int(getattr(args, "tie_num_vectors", 4))
+    spurious_source = getattr(args, "tie_source", "learnable")
+    
+    # 默认启用 queries，除非显式禁用
+    apply_to_queries = not getattr(args, "no_tie_apply_to_queries", False)
+    adaptive_scale = not getattr(args, "no_tie_adaptive_scale", False)
+    apply_to_features = bool(getattr(args, "tie_apply_to_features", False))
+
+    text_encoder = getattr(model_core, "text_encoder", None)
+    if spurious_source in ("text", "hybrid") and text_encoder is None:
+        spurious_source = "learnable"
+
+    default_spurious_prompts = [
+        "a photo with normal texture",
+        "a photo of regular surface",
+        "a photo without defects",
+        "an image of undamaged material",
+    ]
+    spurious_prompts = getattr(args, "tie_spurious_prompts", None) or default_spurious_prompts
+
+    tie_module = nn.Module()
+    if apply_to_queries:
+        tie_module.query_tie = TIEModule(
+            embed_dim=embed_dim,
+            spurious_source=spurious_source,
+            num_spurious_vectors=num_vec,
+            text_encoder=text_encoder,
+            spurious_prompts=spurious_prompts,
+            adaptive_scale=adaptive_scale,
+        )
+    else:
+        tie_module.query_tie = None
+
+    if apply_to_features:
+        tie_module.feature_tie = TIEModule(
+            embed_dim=embed_dim,
+            spurious_source=spurious_source,
+            num_spurious_vectors=num_vec,
+            text_encoder=text_encoder,
+            spurious_prompts=spurious_prompts,
+            adaptive_scale=adaptive_scale,
+        )
+    else:
+        tie_module.feature_tie = None
+
+    # Define forward method
+    def _tie_forward(decoder_hs=None, visual_features=None, is_anomaly=None, return_diagnostics=False):
+        outputs = {}
+        if decoder_hs is not None and tie_module.query_tie is not None:
+            hs = decoder_hs[-1] if (isinstance(decoder_hs, torch.Tensor) and decoder_hs.dim() == 4) else decoder_hs
+            if return_diagnostics:
+                translated, diag = tie_module.query_tie(hs, is_anomaly=is_anomaly, return_diagnostics=True)
+                outputs["diagnostics_query"] = diag
+            else:
+                translated = tie_module.query_tie(hs, is_anomaly=is_anomaly, return_diagnostics=False)
+            outputs["translated_queries"] = translated
+        if visual_features is not None and tie_module.feature_tie is not None:
+            if return_diagnostics:
+                translated, diag = tie_module.feature_tie(visual_features, is_anomaly=is_anomaly, return_diagnostics=True)
+                outputs["diagnostics_feat"] = diag
+            else:
+                translated = tie_module.feature_tie(visual_features, is_anomaly=is_anomaly, return_diagnostics=False)
+            outputs["translated_features"] = translated
+        return outputs
+
+    tie_module.forward = _tie_forward
+    tie_module.to(device)
+
+    print(f"[INFO] TIE module built for inference: mode={tie_mode}, queries={apply_to_queries}, features={apply_to_features}")
+    return tie_module
+
+# ==================== End TIE 推理支持 ====================
 
 
 # ---------- visualization helpers ----------
@@ -461,20 +611,35 @@ def build_loader(
     specie_split_ratio: float = 0.8,
     specie_split_seed: int = 42,
     save_dir: Optional[str] = None,
+    dataset_type: str = "mvtec",  # "mvtec" or "visa"
+    obj_name: Optional[str] = None,  # filter by class name
 ):
-    ds = MVTecMetaDataset(
-        root=root,
-        meta_path=meta_path,
-        mode=mode,
-        k_shot=0,
-        aug_rate=0.0,
-        include_test_defects=include_test_defects,
-        goods_per_class=None,
-        train_from_test=train_from_test,
-        specie_split_ratio=specie_split_ratio,
-        specie_split_seed=specie_split_seed,
-        save_dir=save_dir,
-    )
+    """Build dataloader for MVTec-AD or VisA dataset."""
+    
+    if dataset_type.lower() == "visa":
+        # VisA dataset: meta_path should be the CSV file (e.g., 1cls.csv)
+        ds = VisADataset(
+            root=root,
+            csv_path=meta_path,
+            mode=mode,
+            obj_name=obj_name,
+        )
+    else:
+        # MVTec-AD dataset: meta_path should be meta.json
+        ds = MVTecMetaDataset(
+            root=root,
+            meta_path=meta_path,
+            mode=mode,
+            k_shot=0,
+            aug_rate=0.0,
+            include_test_defects=include_test_defects,
+            goods_per_class=None,
+            train_from_test=train_from_test,
+            specie_split_ratio=specie_split_ratio,
+            specie_split_seed=specie_split_seed,
+            save_dir=save_dir,
+            obj_name=obj_name,
+        )
 
     def collate_fn(batch):
         n = len(batch[0])
@@ -544,8 +709,22 @@ def _to_prob(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 
 def _forward_once(model, images: torch.Tensor, prompt_lists: List[List[str]], class_names: List[str],
-                  masks_size: Tuple[int,int], device: torch.device, upsample: bool = True):
-    """Run one forward pass and return (pred_masks_prob[B,Q,H,W], query_scores[B,Q], raw_out)."""
+                  masks_size: Tuple[int,int], device: torch.device, upsample: bool = True,
+                  is_anomaly: Optional[torch.Tensor] = None):
+    """Run one forward pass and return (pred_masks_prob[B,Q,H,W], query_scores[B,Q], raw_out).
+    
+    Args:
+        is_anomaly: Optional tensor of shape (B,) indicating which samples are anomalies.
+                   If None and TIE in_forward mode is used, TIE translation is applied uniformly.
+    """
+    # 如果模型使用 TIE in_forward 模式，设置 is_anomaly
+    # 检查是否有 SegmentationHeadWithTIE 包装
+    seg_head = getattr(model, "segmentation_head", None)
+    if seg_head is not None and hasattr(seg_head, "set_is_anomaly"):
+        # 对于推理，我们通常不知道 ground truth，设置为 None 让 TIE 均匀应用
+        # 或者可以传入 is_anomaly 参数
+        seg_head.set_is_anomaly(is_anomaly)
+    
     out = model(images, prompt_lists, class_names)
 
     pred_masks = out["pred_masks"]
@@ -624,12 +803,35 @@ def load_model(args, device: torch.device):
         "parallel_lora_alpha": getattr(args, "parallel_lora_alpha", None),
     }
 
-    with open(args.meta_path, "r") as f:
-        meta = json.load(f)
-    class_list = _infer_class_list(meta)
-    if not class_list:
-        raise ValueError("Could not infer class_list from meta.json.")
+    # 根据数据集类型推断 class_list
+    dataset_type = getattr(args, "dataset", "mvtec").lower()
+    
+    if dataset_type == "visa":
+        # VisA: 从 CSV 文件中提取类名
+        import csv
+        meta_path = args.meta_path or os.path.join(args.data_root, "split_csv", "1cls.csv")
+        class_set = set()
+        with open(meta_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                obj = row.get("object", "").strip()
+                if obj:
+                    class_set.add(obj)
+        class_list = sorted(list(class_set))
+        if not class_list:
+            raise ValueError(f"Could not infer class_list from CSV file: {meta_path}")
+        print(f"[INFO] VisA classes: {class_list}")
+    else:
+        # MVTec-AD: 从 meta.json 中提取类名
+        meta_path = args.meta_path or os.path.join(args.data_root, "meta.json")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        class_list = _infer_class_list(meta)
+        if not class_list:
+            raise ValueError(f"Could not infer class_list from meta.json: {meta_path}")
+    
     args.class_list = class_list
+    args.meta_path = meta_path  # 确保 args.meta_path 被设置
 
     Constructor = FineTuneSAM3Official if args.use_official else FineTuneSAM3
     ctor_kwargs = _filter_kwargs_for_callable(Constructor, common_kwargs)
@@ -641,6 +843,36 @@ def load_model(args, device: torch.device):
     })
     model = Constructor(**ctor_kwargs).to(device).eval()
 
+    # ==================== TIE 模块集成（必须在加载 checkpoint 之前！）====================
+    # 原因：checkpoint 中包含 TIE 权重（前缀为 tie_module.* 或 segmentation_head.tie_module.*）
+    # 如果先加载 checkpoint 再构建 TIE，这些权重会被忽略（报告为 unexpected keys）
+    tie_mode = getattr(args, "tie_mode", "none")
+    if tie_mode != "none" and TIE_AVAILABLE:
+        print(f"[INFO] Building TIE module for inference (mode={tie_mode})...")
+        tie_module = _build_tie_module_for_inference(args, model, device)
+        
+        if tie_module is not None:
+            if tie_mode == "in_forward":
+                # 包装 segmentation_head 以在 forward 中应用 TIE
+                try:
+                    model.segmentation_head = SegmentationHeadWithTIE(
+                        seg_head=model.segmentation_head,
+                        tie_module=tie_module,
+                        apply_to_features=bool(getattr(args, "tie_apply_to_features", False)),
+                    ).to(device)
+                    print("[INFO] Segmentation head wrapped with TIE (in_forward mode)")
+                except Exception as e:
+                    print(f"[WARN] Failed to wrap segmentation_head with TIE: {e}")
+                    model.tie_module = tie_module
+            else:
+                # loss_only 模式：仅附加模块
+                model.tie_module = tie_module
+                print("[INFO] TIE module attached (loss_only mode)")
+    elif tie_mode != "none" and not TIE_AVAILABLE:
+        print(f"[WARN] TIE mode={tie_mode} requested but TIE module not available")
+    # ==================== End TIE 模块集成 ====================
+
+    # 现在加载 checkpoint（TIE 结构已经就位，权重会正确匹配）
     if args.ckpt and os.path.exists(args.ckpt):
         print(f"[INFO] Loading fine-tuned checkpoint {args.ckpt} ...")
         ckpt = torch.load(args.ckpt, map_location=device)
@@ -648,8 +880,41 @@ def load_model(args, device: torch.device):
             state = ckpt.get("state_dict", ckpt.get("model", ckpt))
         else:
             state = ckpt
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        
+        # ==================== 过滤形状不匹配的权重 ====================
+        # 当跨数据集推理时（如 MVTec checkpoint 用于 VisA），prompt_learner 相关权重可能不兼容
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped_keys = []
+        
+        for k, v in state.items():
+            if k in model_state:
+                if v.shape == model_state[k].shape:
+                    filtered_state[k] = v
+                else:
+                    skipped_keys.append(f"{k}: ckpt={v.shape} vs model={model_state[k].shape}")
+            else:
+                # 允许额外的键（如 TIE 模块）
+                filtered_state[k] = v
+        
+        if skipped_keys:
+            print(f"[WARN] Skipped {len(skipped_keys)} mismatched weights (cross-dataset inference):")
+            for sk in skipped_keys[:5]:  # 只打印前5个
+                print(f"       {sk}")
+            if len(skipped_keys) > 5:
+                print(f"       ... and {len(skipped_keys) - 5} more")
+        # ==================== End 过滤 ====================
+        
+        missing, unexpected = model.load_state_dict(filtered_state, strict=False)
         print(f"[INFO] Loaded fine-tuned weights. missing={len(missing)} unexpected={len(unexpected)}")
+        
+        # 打印 TIE 相关的加载情况
+        if tie_mode != "none":
+            tie_keys_loaded = [k for k in state.keys() if "tie_module" in k or "tie" in k.lower()]
+            if tie_keys_loaded:
+                print(f"[INFO] TIE weights found in checkpoint: {len(tie_keys_loaded)} keys")
+            else:
+                print("[WARN] No TIE weights found in checkpoint (tie_module.* keys)")
     else:
         print("[INFO] No fine-tuned checkpoint provided. Using base SAM3 weights.")
 
@@ -710,9 +975,19 @@ def _get_sample_id_from_meta(ds, global_idx: int, fallback_cls: str, fallback_sp
 @torch.no_grad()
 def run_inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 确定数据集类型和元数据路径
+    dataset_type = getattr(args, "dataset", "mvtec").lower()
+    if dataset_type == "visa":
+        # VisA: 使用 CSV 文件
+        meta_path = args.meta_path or os.path.join(args.data_root, "split_csv", "1cls.csv")
+    else:
+        # MVTec-AD: 使用 meta.json
+        meta_path = args.meta_path or os.path.join(args.data_root, "meta.json")
+    
     loader = build_loader(
         args.data_root,
-        args.meta_path or os.path.join(args.data_root, "meta.json"),
+        meta_path,
         args.mode,
         args.batch_size,
         include_test_defects=getattr(args, "include_test_defects", False),
@@ -720,6 +995,8 @@ def run_inference(args):
         specie_split_ratio=getattr(args, "specie_split_ratio", 0.8),
         specie_split_seed=getattr(args, "specie_split_seed", 42),
         save_dir=getattr(args, "save_dir", None),
+        dataset_type=dataset_type,
+        obj_name=getattr(args, "obj_name", None),
     )
     model = load_model(args, device)
     
@@ -776,21 +1053,47 @@ def run_inference(args):
         # --- forward passes ---
         # PROMPT-driven inference: run two prompts per image and pick the prompt that yields
         # the highest anomaly score (max query score), similar to reverse-prompt evaluation.
+        
+        # 为 TIE in_forward 模式准备 is_anomaly tensor
+        # 注意：在实际部署中可能没有 ground truth，此时传 None 让 TIE 均匀应用
+        is_anomaly_tensor = torch.tensor(is_anomaly, dtype=torch.bool, device=device) if is_anomaly is not None else None
+        
         if custom_prompt:
             pred_masks_1, query_scores_1, _ = _forward_once(
-                model, images, prompt_lists, class_names, masks_size=masks.shape[-2:], device=device
+                model, images, prompt_lists, class_names, masks_size=masks.shape[-2:], device=device,
+                is_anomaly=is_anomaly_tensor
             )
             pred_masks_2, query_scores_2 = None, None
         else:
-            damage_lists = [[f"damage {class_names[i]}"] for i in range(len(class_names))]
-            specie_lists = [[str(specie_names[i]).strip() if str(specie_names[i]).strip() else f"damage {class_names[i]}"] for i in range(len(class_names))]
+            # 根据数据集类型选择 prompt 模板
+            dataset_type = getattr(args, "dataset", "mvtec").lower()
+            
+            if dataset_type == "visa":
+                # VisA: 使用 "damage {cls}" 和 "good {cls}" 作为两个 prompt
+                damage_lists = [[f"damage {class_names[i]}"] for i in range(len(class_names))]
+                good_lists = [[f"good {class_names[i]}"] for i in range(len(class_names))]
+                
+                pred_masks_1, query_scores_1, _ = _forward_once(
+                    model, images, damage_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
+                    is_anomaly=is_anomaly_tensor
+                )
+                pred_masks_2, query_scores_2, _ = _forward_once(
+                    model, images, good_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
+                    is_anomaly=is_anomaly_tensor
+                )
+            else:
+                # MVTec-AD: 使用 "damage {cls}" 和 specie_name 作为两个 prompt
+                damage_lists = [[f"damage {class_names[i]}"] for i in range(len(class_names))]
+                specie_lists = [[str(specie_names[i]).strip() if str(specie_names[i]).strip() else f"damage {class_names[i]}"] for i in range(len(class_names))]
 
-            pred_masks_1, query_scores_1, _ = _forward_once(
-                model, images, damage_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False
-            )
-            pred_masks_2, query_scores_2, _ = _forward_once(
-                model, images, specie_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False
-            )
+                pred_masks_1, query_scores_1, _ = _forward_once(
+                    model, images, damage_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
+                    is_anomaly=is_anomaly_tensor
+                )
+                pred_masks_2, query_scores_2, _ = _forward_once(
+                    model, images, specie_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
+                    is_anomaly=is_anomaly_tensor
+                )
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -837,8 +1140,13 @@ def run_inference(args):
                 alt_prompt, alt_score = "", 0.0
             
             else:
+                # 根据数据集类型选择 prompt 标签
+                dataset_type = getattr(args, "dataset", "mvtec").lower()
                 p1 = f"damage {cls_name}"
-                p2 = str(specie_names[b]).strip() if str(specie_names[b]).strip() else p1
+                if dataset_type == "visa":
+                    p2 = f"good {cls_name}"
+                else:
+                    p2 = str(specie_names[b]).strip() if str(specie_names[b]).strip() else p1
             
                 pm1_low = pred_masks_1[b]  # (Q, h, w)
                 pm2_low = pred_masks_2[b]  # (Q, h, w)
@@ -1064,10 +1372,18 @@ def run_inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("MSAM test (confidence-head ranking)")
     parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--meta_path", type=str, default=None)
+    parser.add_argument("--meta_path", type=str, default=None,
+                        help="Path to meta.json (MVTec) or CSV file (VisA). If None, uses default for dataset type.")
     parser.add_argument("--mode", type=str, default="test", choices=["train", "train_all", "test"])
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--output_dir", type=str, default="./outputs")
+    
+    # ==================== 数据集选择 ====================
+    parser.add_argument("--dataset", type=str, default="mvtec", choices=["mvtec", "visa"],
+                        help="Dataset type: mvtec (MVTec-AD) or visa (VisA)")
+    parser.add_argument("--obj_name", type=str, default=None,
+                        help="Filter by class/object name (e.g., 'bottle' for MVTec, 'candle' for VisA)")
+    # ==================== End 数据集选择 ====================
 
     # prompts
     parser.add_argument("--prompt", type=str, default=None, help="override prompt list for ALL samples, comma-separated")
@@ -1107,6 +1423,27 @@ if __name__ == "__main__":
     parser.add_argument("--mask_alpha_edge", type=float, default=0.9)
     parser.add_argument("--mask_alpha_power", type=float, default=1.0)
     parser.add_argument("--mask_alpha_blur", type=float, default=0.8)
+
+    # ==================== TIE 模块参数 ====================
+    parser.add_argument("--tie_mode", type=str, default="none",
+                        choices=["none", "loss_only", "in_forward"],
+                        help="TIE inference mode: none(禁用), loss_only(仅用于诊断), in_forward(应用TIE平移)")
+    parser.add_argument("--tie_num_vectors", type=int, default=4,
+                        help="TIE 伪相关向量数量")
+    parser.add_argument("--tie_source", type=str, default="learnable",
+                        choices=["learnable", "text", "hybrid"],
+                        help="TIE 伪相关向量来源")
+    parser.add_argument("--tie_apply_to_queries", action="store_true", default=False,
+                        help="TIE 应用于 decoder queries (默认启用)")
+    parser.add_argument("--no_tie_apply_to_queries", action="store_true", default=False,
+                        help="显式禁用 TIE 在 queries 上的应用")
+    parser.add_argument("--tie_apply_to_features", action="store_true", default=False,
+                        help="TIE 应用于视觉特征 (默认关闭)")
+    parser.add_argument("--tie_adaptive_scale", action="store_true", default=False,
+                        help="TIE 使用自适应缩放")
+    parser.add_argument("--no_tie_adaptive_scale", action="store_true", default=False,
+                        help="显式禁用 TIE 自适应缩放")
+    # ==================== End TIE 参数 ====================
 
     args = parser.parse_args()
     run_inference(args)
