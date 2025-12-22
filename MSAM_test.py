@@ -59,11 +59,12 @@ class SegmentationHeadWithTIE(nn.Module):
     If is_anomaly is None, TIE translation is applied uniformly (assuming potential anomaly).
     """
 
-    def __init__(self, seg_head: nn.Module, tie_module: nn.Module, apply_to_features: bool = False):
+    def __init__(self, seg_head: nn.Module, tie_module: nn.Module, apply_to_features: bool = False, infer_scale: float = 1.0):
         super().__init__()
         self.seg_head = seg_head
         self.tie_module = tie_module
         self.apply_to_features = bool(apply_to_features)
+        self.infer_scale = float(infer_scale)
         self._is_anomaly: Optional[torch.Tensor] = None
 
     def set_is_anomaly(self, is_anomaly: Optional[torch.Tensor]):
@@ -82,7 +83,10 @@ class SegmentationHeadWithTIE(nn.Module):
                     tie_out_feat = self.tie_module(visual_features=vf, is_anomaly=is_anomaly, return_diagnostics=False)
                     if tie_out_feat.get("translated_features", None) is not None:
                         bf = list(backbone_feats)
-                        bf[0] = tie_out_feat["translated_features"]
+                        tf = tie_out_feat["translated_features"]
+                        s = float(getattr(self, "infer_scale", 1.0))
+                        # scaled replace: vf + s*(tf - vf)
+                        bf[0] = vf + s * (tf - vf)
             except Exception:
                 bf = backbone_feats
 
@@ -94,12 +98,17 @@ class SegmentationHeadWithTIE(nn.Module):
                     last = oq2[-1]
                     tie_out = self.tie_module(decoder_hs=last, is_anomaly=is_anomaly, return_diagnostics=False)
                     if tie_out.get("translated_queries", None) is not None:
-                        oq2[-1] = tie_out["translated_queries"]
+                        tq = tie_out["translated_queries"]
+                        s = float(getattr(self, "infer_scale", 1.0))
+                        # scaled replace: last + s*(tq - last)
+                        oq2[-1] = last + s * (tq - last)
                     oq = oq2
                 elif oq.dim() == 3:
                     tie_out = self.tie_module(decoder_hs=oq, is_anomaly=is_anomaly, return_diagnostics=False)
                     if tie_out.get("translated_queries", None) is not None:
-                        oq = tie_out["translated_queries"]
+                        tq = tie_out["translated_queries"]
+                        s = float(getattr(self, "infer_scale", 1.0))
+                        oq = oq + s * (tq - oq)
             except Exception:
                 pass
 
@@ -859,6 +868,7 @@ def load_model(args, device: torch.device):
                         seg_head=model.segmentation_head,
                         tie_module=tie_module,
                         apply_to_features=bool(getattr(args, "tie_apply_to_features", False)),
+                        infer_scale=float(getattr(args, "tie_infer_scale", 1.0)),
                     ).to(device)
                     print("[INFO] Segmentation head wrapped with TIE (in_forward mode)")
                 except Exception as e:
@@ -1043,7 +1053,13 @@ def run_inference(args):
         if getattr(args, "prompt", None):
             custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
         if custom_prompt:
+            # Override all samples with user-provided prompts (comma-separated)
             prompt_lists = [custom_prompt for _ in prompt_lists]
+        else:
+            # When --prompt is NOT provided (e.g., VisA has no specie_name), use:
+            #   candidate-1: normal {cls_name}
+            #   candidate-2: damaged {cls_name}
+            prompt_lists = [[f"normal {class_names[i]}",f"good {class_names[i]}", f"anomaly {class_names[i]}",f"damaged {class_names[i]}"] for i in range(len(class_names))]
 
         # measure GPU time
         if device.type == "cuda":
@@ -1428,6 +1444,8 @@ if __name__ == "__main__":
     parser.add_argument("--tie_mode", type=str, default="none",
                         choices=["none", "loss_only", "in_forward"],
                         help="TIE inference mode: none(禁用), loss_only(仅用于诊断), in_forward(应用TIE平移)")
+    parser.add_argument("--tie_infer_scale", type=float, default=1.0,
+                        help="TIE inference translation scale: 0=disable, 1=full, (0,1)=conservative")
     parser.add_argument("--tie_num_vectors", type=int, default=4,
                         help="TIE 伪相关向量数量")
     parser.add_argument("--tie_source", type=str, default="learnable",
