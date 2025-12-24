@@ -428,11 +428,11 @@ class MVTecMetaDataset(Dataset):
 
         if is_anomaly:
             # positive: damaged template + defect descriptors (specie_name / keywords)
-            prompt_list = [f"anormaly {cls_name}", f"damaged {cls_name}", f"defect {cls_name}" ]
+            prompt_list = [f"anomaly {cls_name}", "damaged", "defect"]
             prompt_list.extend(_select_defect_keywords(cls_name, specie_name))
         else:
             # positive: normal template (keep short)
-            prompt_list = [f"normal {cls_name}", f"perfect {cls_name}", f"good {cls_name}"]
+            prompt_list = [f"normal {cls_name}", "perfect", "good"]
 
         return img, img_mask, prompt_list, is_anomaly, cls_name, specie_name
 

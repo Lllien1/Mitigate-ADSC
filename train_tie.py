@@ -35,6 +35,10 @@ import matplotlib.pyplot as plt
 
 import json
 
+
+# ==================== 新增：学习率调度器 ====================
+
+
 # ==================== TIE (Text-guided Image Embedding Translation) integration ====================
 class SegmentationHeadWithTIE(nn.Module):
     """Wrap SAM3 segmentation head: translate obj_queries (decoder queries) with TIE before mask prediction.
@@ -107,7 +111,6 @@ def _build_tie_module(args: argparse.Namespace, model_core: nn.Module, device: t
     spurious_source = getattr(args, "tie_source", "learnable")
     
     # 处理布尔参数：默认启用 queries 和 adaptive_scale，除非显式禁用
-    # 逻辑：如果 --no_xxx 被指定，则禁用；否则如果 --xxx 被指定或者默认情况下启用
     no_queries = getattr(args, "no_tie_apply_to_queries", False)
     yes_queries = getattr(args, "tie_apply_to_queries", False)
     apply_to_queries = not no_queries and (yes_queries or True)  # 默认 True，除非显式 --no_xxx
@@ -209,8 +212,6 @@ def _build_tie_loss(args: argparse.Namespace) -> Optional[TIELoss]:
     )
 # ==================== End TIE integration ====================
 
-
-# ==================== 新增：学习率调度器 ====================
 
 class WarmupCosineScheduler:
     """
@@ -739,7 +740,7 @@ def get_prompt_group_labels(prompt_lists, class_names, device):
     for prompts in prompt_lists:
         # 只用 prompt 内容作为 key（忽略 class_name）
         # 这样不同类别的相同缺陷类型可以形成正样本对
-        key_prompts = prompts[1:] if (prompts is not None and len(prompts) > 1) else []
+        key_prompts = prompts[1:3] if (prompts is not None and len(prompts) > 1) else []
         key = tuple(sorted(key_prompts)) if key_prompts else ("__normal__",)
         
         if key not in group_to_id:
@@ -991,8 +992,8 @@ def align_loss_with_background_margin(
     visual_embed: torch.Tensor,     # (B, D)
     is_background: torch.Tensor,    # (B,) bool
     group_labels: torch.Tensor,     # (B,) 分组标签
-    temp: float = 0.1,              # 增大温度（原 0.07）
-    margin: float = 0.3             # 降低 margin（原 0.5）
+    temp: float = 0.15,              # 增大温度（原 0.07）
+    margin: float = 0.2             # 降低 margin（原 0.5）
 ):
     """
     改进的对齐损失：
@@ -1236,7 +1237,8 @@ class MinNormalBatchSampler(torch.utils.data.Sampler):
                 if max_norm < min_norm:
                     n_norm = max_norm
                 else:
-                    n_norm = rng.randint(min_norm, max_norm)
+                    # n_norm = rng.randint(min_norm, max_norm)
+                    n_norm = min_norm
             elif norm:
                 # 没有anomaly时只能全normal（不建议出现，但保证不崩）
                 n_norm = min(self.batch_size, max(1, int(self.min_normals)))
@@ -1656,8 +1658,8 @@ def main(args: argparse.Namespace):
         apply_lora_to_decoder(model_for_decoder, rank=args.decoder_lora_rank, alpha=args.decoder_lora_alpha)
 
     prompt_and_lora: List[torch.nn.Parameter] = []
-    tie_params: List[torch.nn.Parameter] = []
     other_params: List[torch.nn.Parameter] = []
+    tie_params: List[torch.nn.Parameter] = []
     decoder_params: List[torch.nn.Parameter] = []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -1702,7 +1704,7 @@ def main(args: argparse.Namespace):
         {"params": prompt_and_lora, "lr": args.lr_prompt},
         {"params": other_params, "lr": args.lr_main},
     ]
-
+    
     # TIE params (optional separate LR)
     if len(tie_params) > 0:
         lr_tie = float(args.lr_prompt if getattr(args, "lr_tie", None) is None else args.lr_tie)
@@ -1750,11 +1752,11 @@ def main(args: argparse.Namespace):
     if getattr(args, 'enable_two_stage', False):
         lambda_scheduler = TwoStageLambdaScheduler(
             total_steps=total_steps,
-            stage1_ratio=getattr(args, 'stage1_ratio', 0.35),
-            stage1_lambda=getattr(args, 'stage1_lambda', 0.08),
+            stage1_ratio=getattr(args, 'stage1_ratio', 0.30),
+            stage1_lambda=getattr(args, 'stage1_lambda', 0.10),
             stage2_lambda=getattr(args, 'stage2_lambda', 0.20),
             transition=getattr(args, 'lambda_transition', 'linear'),
-            transition_ratio=getattr(args, 'transition_ratio', 0.15),
+            transition_ratio=getattr(args, 'transition_ratio', 0.25),
         )
     
     print("=" * 60)
@@ -2041,6 +2043,14 @@ def main(args: argparse.Namespace):
                 indices = out["indices"]  # local alias for later loops
 
                 # --- end matcher robust handling ---
+
+                # ---- log len(src_q) distribution ----
+                if is_main_process:
+                    # indices: List[(src_q, tgt_q)] length=B
+                    src_q_lens = [int(src_q.numel()) for (src_q, _) in indices]  # 每张图匹配到的query数量
+                    nonempty_ratio = sum(l > 0 for l in src_q_lens) / max(1, len(src_q_lens))
+                    mean_len = sum(src_q_lens) / max(1, len(src_q_lens))
+                    max_len = max(src_q_lens) if len(src_q_lens) > 0 else 0
                 
 
                 # ====== DEBUG BLOCK ======
@@ -2619,38 +2629,26 @@ def main(args: argparse.Namespace):
                                     ax3.set_xlabel("Cosine Similarity")
                                     ax3.set_ylabel("Count")
                                     
-                                    # ===== Panel 4: TIE 投影效果或统计信息 =====
+                                    # ===== Panel 4: 统计信息 =====
                                     ax4 = axes[1, 1]
-                                    # 显示训练统计
-                                    stats_text = f"""Epoch {epoch+1} Statistics
-                                    
-Alignment Loss:
-  align_loss: {align_loss.item():.4f}
-  query_align: {query_align_loss.item():.4f}
+                                    stats_text = f"""Epoch {epoch+1} Statistics                                    
+                                        Alignment Loss:
+                                          align_loss: {align_loss.item():.4f}
+                                          query_align: {query_align_loss.item():.4f}
 
-Similarity Stats:
-  pos_sim (same group): {pos_sim:.4f}
-  neg_sim (diff group): {neg_sim:.4f}
-  separation: {pos_sim - neg_sim:.4f}
+                                        Similarity Stats:
+                                          pos_sim (same group): {pos_sim:.4f}
+                                          neg_sim (diff group): {neg_sim:.4f}
+                                          separation: {pos_sim - neg_sim:.4f}
 
-Sample Distribution:
-  Normal: {n_bg}
-  Anomaly: {n_anom}
-  Total: {B}
+                                        Sample Distribution:
+                                          Normal: {n_bg}
+                                          Anomaly: {n_anom}
+                                          Total: {B}
 
-Prompt-Visual Sim:
-  Mean: {diag_sim.mean():.4f}
-  Std: {diag_sim.std():.4f}"""
-                                    
-                                    # 如果TIE启用，添加TIE统计
-                                    if lambda_tie > 0:
-                                        stats_text += f"""
-
-TIE Effect:
-  loss_tie: {loss_tie.item():.4f}
-  normal_proj: {tie_normal_proj:.4f}
-  anomaly_proj: {tie_anomaly_proj:.4f}
-  separation: {tie_normal_proj - tie_anomaly_proj:.4f}"""
+                                        Prompt-Visual Sim:
+                                          Mean: {diag_sim.mean():.4f}
+                                          Std: {diag_sim.std():.4f}"""
                                     
                                     ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=10,
                                             verticalalignment='top', fontfamily='monospace',
@@ -2674,7 +2672,6 @@ TIE Effect:
                 # -------------------------
 
 
-                
                 # ==================== TIE loss (reduce false positives via spurious translation) ====================
                 loss_tie = torch.tensor(0.0, device=device)
                 tie_orth_loss = torch.tensor(0.0, device=device)  # 正交性损失
@@ -2846,15 +2843,20 @@ TIE Effect:
                 writer.add_scalar("loss/align", align_loss.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
-                # TIE 损失记录（仅当 TIE 启用时记录详细信息）
-                if lambda_tie > 0:
-                    writer.add_scalar("loss/tie", loss_tie.item(), global_step)
-                    writer.add_scalar("tie/orthogonality", tie_orth_loss.item() if isinstance(tie_orth_loss, torch.Tensor) else tie_orth_loss, global_step)
-                    writer.add_scalar("tie/discrimination", tie_disc_loss.item() if isinstance(tie_disc_loss, torch.Tensor) else tie_disc_loss, global_step)
-                    writer.add_scalar("tie/normal_proj", tie_normal_proj, global_step)
-                    writer.add_scalar("tie/anomaly_proj", tie_anomaly_proj, global_step)
-                    writer.add_scalar("tie/proj_separation", tie_normal_proj - tie_anomaly_proj, global_step)
-                    writer.add_scalar("lambda/tie", lambda_tie, global_step)
+            # TIE loss logging
+            if is_main_process and writer is not None and lambda_tie > 0:
+                writer.add_scalar("loss/tie", loss_tie.item(), global_step)
+                writer.add_scalar("loss/tie_orth", tie_orth_loss.item(), global_step)
+                writer.add_scalar("loss/tie_disc", tie_disc_loss.item(), global_step)
+                writer.add_scalar("debug/tie_normal_proj", tie_normal_proj, global_step)
+                writer.add_scalar("debug/tie_anomaly_proj", tie_anomaly_proj, global_step)
+
+            if is_main_process and writer is not None:
+                writer.add_scalar("debug/src_q_nonempty_ratio", nonempty_ratio, global_step)
+                writer.add_scalar("debug/src_q_len_mean", mean_len, global_step)
+                writer.add_scalar("debug/src_q_len_max", max_len, global_step)
+                # 可选：直方图（看分布最直观）
+                writer.add_histogram("debug/src_q_len_hist", torch.tensor(src_q_lens), global_step)
             # 记录当前学习率
             if is_main_process and writer is not None:
                 current_lrs = scheduler.get_lr()
@@ -2927,6 +2929,31 @@ if __name__ == "__main__":
     parser.add_argument("--align_temp", type=float, default=0.1, help="temperature for contrastive alignment (increased from 0.07 for stability)")
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
+    parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
+    parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
+    parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
+    parser.add_argument("--parallel_lora_alpha", type=float, default=None, help="Alpha scaling for parallel LoRA")
+    parser.add_argument("--include_test_defects", action="store_true",help="(legacy) include defects from test split when forming dataset")
+    parser.add_argument("--train_from_test", action="store_true",help="When set, build training set from MVTec test split defects only, per-specie split")
+    parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
+    parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
+    parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
+    
+    # === 新增: align loss 相关参数 ===
+    parser.add_argument("--use_anomaly_grouping", action="store_true", 
+                        help="Use simpler anomaly/normal grouping instead of prompt-based grouping for align loss")
+    parser.add_argument("--query_align_top_k", type=int, default=64, 
+                        help="Top-k queries to compete in query alignment loss (reduces from Q=900 to top_k)")
+    parser.add_argument("--query_align_temp", type=float, default=0.2,
+                        help="Temperature for query alignment loss (higher = softer, easier to learn)")
+
+
+    #--------------- Diagnostic logging args ---------------
+    parser.add_argument("--log_freq", type=int, default=100, help="Logging frequency (steps) for align diagnostics")
+    parser.add_argument("--tsne_freq", type=int, default=500, help="TSNE save frequency (steps)")
+    parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
+    
+    parser.add_argument("--align_margin", type=float, default=0.5,help="Margin for pushing defect prompts away from background embeddings")
 
     # ==================== TIE (spurious correlation mitigation) ====================
     parser.add_argument("--tie_mode", type=str, default="none",
@@ -2958,31 +2985,6 @@ if __name__ == "__main__":
     parser.add_argument("--tie_spurious_prompts", nargs="*", default=None,
                         help="Optional list of spurious prompts when tie_source is text/hybrid.")
     # ==================== End TIE args ====================
-    parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
-    parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
-    parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
-    parser.add_argument("--parallel_lora_alpha", type=float, default=None, help="Alpha scaling for parallel LoRA")
-    parser.add_argument("--include_test_defects", action="store_true",help="(legacy) include defects from test split when forming dataset")
-    parser.add_argument("--train_from_test", action="store_true",help="When set, build training set from MVTec test split defects only, per-specie split")
-    parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
-    parser.add_argument("--specie_split_seed", type=int, default=42,help="Random seed for per-specie split reproducibility")
-    parser.add_argument("--splits_save_dir", type=str, default=None,help="If set, write specie_splits_{cls}.json files for reproducibility.")
-    
-    # === 新增: align loss 相关参数 ===
-    parser.add_argument("--use_anomaly_grouping", action="store_true", 
-                        help="Use simpler anomaly/normal grouping instead of prompt-based grouping for align loss")
-    parser.add_argument("--query_align_top_k", type=int, default=64, 
-                        help="Top-k queries to compete in query alignment loss (reduces from Q=900 to top_k)")
-    parser.add_argument("--query_align_temp", type=float, default=0.2,
-                        help="Temperature for query alignment loss (higher = softer, easier to learn)")
-
-
-    #--------------- Diagnostic logging args ---------------
-    parser.add_argument("--log_freq", type=int, default=100, help="Logging frequency (steps) for align diagnostics")
-    parser.add_argument("--tsne_freq", type=int, default=500, help="TSNE save frequency (steps)")
-    parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
-    
-    parser.add_argument("--align_margin", type=float, default=0.5,help="Margin for pushing defect prompts away from background embeddings")
     parser.add_argument("--lambda_query_align", type=float, default=0.5,help="Weight for query-level alignment loss (会被两阶段调度器覆盖)")
 
     # ==================== 新增：两阶段 query_align 调度参数 ====================

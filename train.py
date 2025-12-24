@@ -564,7 +564,7 @@ def get_prompt_group_labels(prompt_lists, class_names, device):
     for prompts in prompt_lists:
         # 只用 prompt 内容作为 key（忽略 class_name）
         # 这样不同类别的相同缺陷类型可以形成正样本对
-        key_prompts = prompts[1:] if (prompts is not None and len(prompts) > 1) else []
+        key_prompts = prompts[1:3] if (prompts is not None and len(prompts) > 1) else []
         key = tuple(sorted(key_prompts)) if key_prompts else ("__normal__",)
         
         if key not in group_to_id:
@@ -816,8 +816,8 @@ def align_loss_with_background_margin(
     visual_embed: torch.Tensor,     # (B, D)
     is_background: torch.Tensor,    # (B,) bool
     group_labels: torch.Tensor,     # (B,) 分组标签
-    temp: float = 0.1,              # 增大温度（原 0.07）
-    margin: float = 0.3             # 降低 margin（原 0.5）
+    temp: float = 0.15,              # 增大温度（原 0.07）
+    margin: float = 0.2             # 降低 margin（原 0.5）
 ):
     """
     改进的对齐损失：
@@ -1061,7 +1061,8 @@ class MinNormalBatchSampler(torch.utils.data.Sampler):
                 if max_norm < min_norm:
                     n_norm = max_norm
                 else:
-                    n_norm = rng.randint(min_norm, max_norm)
+                    # n_norm = rng.randint(min_norm, max_norm)
+                    n_norm = min_norm
             elif norm:
                 # 没有anomaly时只能全normal（不建议出现，但保证不崩）
                 n_norm = min(self.batch_size, max(1, int(self.min_normals)))
@@ -1541,11 +1542,11 @@ def main(args: argparse.Namespace):
     if getattr(args, 'enable_two_stage', False):
         lambda_scheduler = TwoStageLambdaScheduler(
             total_steps=total_steps,
-            stage1_ratio=getattr(args, 'stage1_ratio', 0.35),
-            stage1_lambda=getattr(args, 'stage1_lambda', 0.08),
+            stage1_ratio=getattr(args, 'stage1_ratio', 0.30),
+            stage1_lambda=getattr(args, 'stage1_lambda', 0.10),
             stage2_lambda=getattr(args, 'stage2_lambda', 0.20),
             transition=getattr(args, 'lambda_transition', 'linear'),
-            transition_ratio=getattr(args, 'transition_ratio', 0.15),
+            transition_ratio=getattr(args, 'transition_ratio', 0.25),
         )
     
     print("=" * 60)
@@ -1823,6 +1824,14 @@ def main(args: argparse.Namespace):
                 indices = out["indices"]  # local alias for later loops
 
                 # --- end matcher robust handling ---
+
+                # ---- log len(src_q) distribution ----
+                if is_main_process:
+                    # indices: List[(src_q, tgt_q)] length=B
+                    src_q_lens = [int(src_q.numel()) for (src_q, _) in indices]  # 每张图匹配到的query数量
+                    nonempty_ratio = sum(l > 0 for l in src_q_lens) / max(1, len(src_q_lens))
+                    mean_len = sum(src_q_lens) / max(1, len(src_q_lens))
+                    max_len = max(src_q_lens) if len(src_q_lens) > 0 else 0
                 
 
                 # ====== DEBUG BLOCK ======
@@ -2320,7 +2329,7 @@ def main(args: argparse.Namespace):
                              # 修改点 2: 如果不计算，则创建一个零张量，确保变量存在
                              query_align_loss = torch.tensor(0.0, device=device)
 
-                        # ===== Diagnostics =====
+                        # ===== Diagnostics (每 log_freq 步打印一次) =====
                         if (step % getattr(args, "log_freq", 100)) == 0:
                             p_norm = F.normalize(prompt_proto, dim=1)
                             m_norm = F.normalize(visual_embed, dim=1)
@@ -2340,104 +2349,119 @@ def main(args: argparse.Namespace):
                             n_anom = (~is_background).sum().item()
                             print(f"[BG/ANOM] n_background={n_bg}, n_anomaly={n_anom}")
 
-                            # TSNE: 每个epoch结束时保存可视化
-                            is_last_step = (step == len(dataloader) - 1)
-                            if is_last_step and B >= 4:
-                                try:
-                                    ns = min(getattr(args, "tsne_samples", 64), B)
-                                    sel = np.random.choice(B, ns, replace=False)
-                                    p_sample = p_norm[sel].detach().cpu().numpy()
-                                    m_sample = m_norm[sel].detach().cpu().numpy()
-                                    labels_sample = group_labels[sel].cpu().numpy()
-                                    is_bg_sample = is_background[sel].cpu().numpy()  # True=normal, False=anomaly
-                                    
-                                    X = np.concatenate([p_sample, m_sample], axis=0)
-                                    Z = TSNE(n_components=2, perplexity=min(30, ns-1), init='pca', random_state=42).fit_transform(X)
-                                    
-                                    # 创建多面板图
-                                    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-                                    
-                                    # ===== Panel 1: Prompt vs Visual (按 group 着色) =====
-                                    ax1 = axes[0, 0]
-                                    scatter1 = ax1.scatter(Z[:ns, 0], Z[:ns, 1], c=labels_sample, 
-                                                          cmap='tab10', marker='o', alpha=0.8, s=50, label='prompt')
-                                    ax1.scatter(Z[ns:, 0], Z[ns:, 1], c=labels_sample, 
-                                               cmap='tab10', marker='x', alpha=0.8, s=50, label='visual')
-                                    ax1.legend(fontsize=10)
-                                    ax1.set_title(f"Prompt-Visual Alignment (color=group)", fontsize=12)
-                                    ax1.set_xlabel("Dim 1")
-                                    ax1.set_ylabel("Dim 2")
-                                    
-                                    # ===== Panel 2: Normal vs Anomaly 分离 =====
-                                    ax2 = axes[0, 1]
-                                    colors_na = ['green' if bg else 'red' for bg in is_bg_sample]
-                                    ax2.scatter(Z[:ns, 0], Z[:ns, 1], c=colors_na, marker='o', alpha=0.7, s=50, label='prompt')
-                                    ax2.scatter(Z[ns:, 0], Z[ns:, 1], c=colors_na, marker='x', alpha=0.7, s=50, label='visual')
-                                    # 添加图例
-                                    from matplotlib.patches import Patch
-                                    legend_elements = [Patch(facecolor='green', label='Normal'),
-                                                      Patch(facecolor='red', label='Anomaly')]
-                                    ax2.legend(handles=legend_elements, fontsize=10)
-                                    ax2.set_title(f"Normal vs Anomaly Separation", fontsize=12)
-                                    ax2.set_xlabel("Dim 1")
-                                    ax2.set_ylabel("Dim 2")
-                                    
-                                    # ===== Panel 3: 相似度分布 =====
-                                    ax3 = axes[1, 0]
-                                    # 计算 prompt-visual 相似度
-                                    sim_matrix = (p_norm @ m_norm.t()).detach().cpu().numpy()
-                                    diag_sim = np.diag(sim_matrix)  # 同一样本的相似度
-                                    
-                                    normal_idx = np.where(is_bg_sample)[0]
-                                    anomaly_idx = np.where(~is_bg_sample)[0]
-                                    
-                                    if len(normal_idx) > 0:
-                                        ax3.hist(diag_sim[normal_idx], bins=20, alpha=0.6, label=f'Normal (n={len(normal_idx)})', color='green')
-                                    if len(anomaly_idx) > 0:
-                                        ax3.hist(diag_sim[anomaly_idx], bins=20, alpha=0.6, label=f'Anomaly (n={len(anomaly_idx)})', color='red')
-                                    ax3.axvline(x=diag_sim.mean(), color='black', linestyle='--', label=f'Mean={diag_sim.mean():.3f}')
-                                    ax3.legend(fontsize=9)
-                                    ax3.set_title("Prompt-Visual Similarity Distribution", fontsize=12)
-                                    ax3.set_xlabel("Cosine Similarity")
-                                    ax3.set_ylabel("Count")
-                                    
-                                    # ===== Panel 4: 统计信息 =====
-                                    ax4 = axes[1, 1]
-                                    stats_text = f"""Epoch {epoch+1} Statistics                                    
-                                        Alignment Loss:
-                                          align_loss: {align_loss.item():.4f}
-                                          query_align: {query_align_loss.item():.4f}
+                        # ===== TSNE: 每个epoch结束时保存可视化 (独立于 log_freq) =====
+                        is_last_step = (step == len(dataloader) - 1)
+                        if is_last_step and B >= 4 and is_main_process:
+                            try:
+                                # 重新计算 TSNE 所需的变量（确保变量存在）
+                                p_norm_tsne = F.normalize(prompt_proto, dim=1)
+                                m_norm_tsne = F.normalize(visual_embed, dim=1)
+                                
+                                ns = min(getattr(args, "tsne_samples", 64), B)
+                                sel = np.random.choice(B, ns, replace=False)
+                                p_sample = p_norm_tsne[sel].detach().cpu().numpy()
+                                m_sample = m_norm_tsne[sel].detach().cpu().numpy()
+                                labels_sample = group_labels[sel].cpu().numpy()
+                                is_bg_sample = is_background[sel].cpu().numpy()  # True=normal, False=anomaly
+                                
+                                X = np.concatenate([p_sample, m_sample], axis=0)
+                                Z = TSNE(n_components=2, perplexity=min(30, ns-1), init='pca', random_state=42).fit_transform(X)
+                                
+                                # 创建多面板图
+                                fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+                                
+                                # ===== Panel 1: Prompt vs Visual (按 group 着色) =====
+                                ax1 = axes[0, 0]
+                                scatter1 = ax1.scatter(Z[:ns, 0], Z[:ns, 1], c=labels_sample, 
+                                                      cmap='tab10', marker='o', alpha=0.8, s=50, label='prompt')
+                                ax1.scatter(Z[ns:, 0], Z[ns:, 1], c=labels_sample, 
+                                           cmap='tab10', marker='x', alpha=0.8, s=50, label='visual')
+                                ax1.legend(fontsize=10)
+                                ax1.set_title(f"Prompt-Visual Alignment (color=group)", fontsize=12)
+                                ax1.set_xlabel("Dim 1")
+                                ax1.set_ylabel("Dim 2")
+                                
+                                # ===== Panel 2: Normal vs Anomaly 分离 =====
+                                ax2 = axes[0, 1]
+                                colors_na = ['green' if bg else 'red' for bg in is_bg_sample]
+                                ax2.scatter(Z[:ns, 0], Z[:ns, 1], c=colors_na, marker='o', alpha=0.7, s=50, label='prompt')
+                                ax2.scatter(Z[ns:, 0], Z[ns:, 1], c=colors_na, marker='x', alpha=0.7, s=50, label='visual')
+                                # 添加图例
+                                from matplotlib.patches import Patch
+                                legend_elements = [Patch(facecolor='green', label='Normal'),
+                                                  Patch(facecolor='red', label='Anomaly')]
+                                ax2.legend(handles=legend_elements, fontsize=10)
+                                ax2.set_title(f"Normal vs Anomaly Separation", fontsize=12)
+                                ax2.set_xlabel("Dim 1")
+                                ax2.set_ylabel("Dim 2")
+                                
+                                # ===== Panel 3: 相似度分布 =====
+                                ax3 = axes[1, 0]
+                                # 计算 prompt-visual 相似度
+                                sim_matrix = (p_norm_tsne @ m_norm_tsne.t()).detach().cpu().numpy()
+                                diag_sim = np.diag(sim_matrix)  # 同一样本的相似度
+                                
+                                normal_idx = np.where(is_bg_sample)[0]
+                                anomaly_idx = np.where(~is_bg_sample)[0]
+                                
+                                if len(normal_idx) > 0:
+                                    ax3.hist(diag_sim[normal_idx], bins=20, alpha=0.6, label=f'Normal (n={len(normal_idx)})', color='green')
+                                if len(anomaly_idx) > 0:
+                                    ax3.hist(diag_sim[anomaly_idx], bins=20, alpha=0.6, label=f'Anomaly (n={len(anomaly_idx)})', color='red')
+                                ax3.axvline(x=diag_sim.mean(), color='black', linestyle='--', label=f'Mean={diag_sim.mean():.3f}')
+                                ax3.legend(fontsize=9)
+                                ax3.set_title("Prompt-Visual Similarity Distribution", fontsize=12)
+                                ax3.set_xlabel("Cosine Similarity")
+                                ax3.set_ylabel("Count")
+                                
+                                # ===== Panel 4: 统计信息 =====
+                                ax4 = axes[1, 1]
+                                # 计算统计量
+                                sim_for_stats = (p_norm_tsne @ m_norm_tsne.t()) / float(args.align_temp)
+                                same_grp = (group_labels.unsqueeze(0) == group_labels.unsqueeze(1))
+                                pos_sim_val = sim_for_stats[same_grp].mean().item() if same_grp.sum() > 0 else 0
+                                neg_sim_val = sim_for_stats[~same_grp].mean().item() if (~same_grp).sum() > 0 else 0
+                                n_bg_val = is_background.sum().item()
+                                n_anom_val = (~is_background).sum().item()
+                                
+                                stats_text = f"""Epoch {epoch+1} Statistics                                    
+    Alignment Loss:
+      align_loss: {align_loss.item():.4f}
+      query_align: {query_align_loss.item():.4f}
 
-                                        Similarity Stats:
-                                          pos_sim (same group): {pos_sim:.4f}
-                                          neg_sim (diff group): {neg_sim:.4f}
-                                          separation: {pos_sim - neg_sim:.4f}
+    Similarity Stats:
+      pos_sim (same group): {pos_sim_val:.4f}
+      neg_sim (diff group): {neg_sim_val:.4f}
+      separation: {pos_sim_val - neg_sim_val:.4f}
 
-                                        Sample Distribution:
-                                          Normal: {n_bg}
-                                          Anomaly: {n_anom}
-                                          Total: {B}
+    Sample Distribution:
+      Normal: {n_bg_val}
+      Anomaly: {n_anom_val}
+      Total: {B}
 
-                                        Prompt-Visual Sim:
-                                          Mean: {diag_sim.mean():.4f}
-                                          Std: {diag_sim.std():.4f}"""
-                                    
-                                    ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=10,
-                                            verticalalignment='top', fontfamily='monospace',
-                                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                                    ax4.axis('off')
-                                    ax4.set_title("Training Statistics", fontsize=12)
-                                    
-                                    plt.suptitle(f"t-SNE Visualization - Epoch {epoch+1}", fontsize=14, fontweight='bold')
-                                    plt.tight_layout()
-                                    
-                                    tsne_out_dir = os.path.join(args.log_dir, "tsne")
-                                    os.makedirs(tsne_out_dir, exist_ok=True)
-                                    plt.savefig(os.path.join(tsne_out_dir, f"tsne_epoch{epoch+1:02d}.png"), dpi=150, bbox_inches='tight')
-                                    plt.close()
-                                    print(f"[INFO] Saved enhanced t-SNE visualization for epoch {epoch+1}")
-                                except Exception as e:
-                                    print(f"[WARN] TSNE visualization failed: {e}")
+    Prompt-Visual Sim:
+      Mean: {diag_sim.mean():.4f}
+      Std: {diag_sim.std():.4f}"""
+                                
+                                ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=10,
+                                        verticalalignment='top', fontfamily='monospace',
+                                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                                ax4.axis('off')
+                                ax4.set_title("Training Statistics", fontsize=12)
+                                
+                                plt.suptitle(f"t-SNE Visualization - Epoch {epoch+1}", fontsize=14, fontweight='bold')
+                                plt.tight_layout()
+                                
+                                tsne_out_dir = os.path.join(log_dir, "tsne")
+                                os.makedirs(tsne_out_dir, exist_ok=True)
+                                tsne_save_path = os.path.join(tsne_out_dir, f"tsne_epoch{epoch+1:02d}.png")
+                                plt.savefig(tsne_save_path, dpi=150, bbox_inches='tight')
+                                plt.close()
+                                print(f"[INFO] Saved enhanced t-SNE visualization to {tsne_save_path}")
+                            except Exception as e:
+                                import traceback
+                                print(f"[WARN] TSNE visualization failed: {e}")
+                                traceback.print_exc()
                 else:
                     align_loss = torch.tensor(0.0, device=device)
                     query_align_loss = torch.tensor(0.0, device=device)
@@ -2575,6 +2599,13 @@ def main(args: argparse.Namespace):
                 writer.add_scalar("loss/align", align_loss.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
+
+            if is_main_process and writer is not None:
+                writer.add_scalar("debug/src_q_nonempty_ratio", nonempty_ratio, global_step)
+                writer.add_scalar("debug/src_q_len_mean", mean_len, global_step)
+                writer.add_scalar("debug/src_q_len_max", max_len, global_step)
+                # 可选：直方图（看分布最直观）
+                writer.add_histogram("debug/src_q_len_hist", torch.tensor(src_q_lens), global_step)
             # 记录当前学习率
             if is_main_process and writer is not None:
                 current_lrs = scheduler.get_lr()
