@@ -1,9 +1,26 @@
+"""
+model_wrapper.py
+
+SAM3 微调模型封装，支持多种提示学习器：
+- averaged/static: 原有SoWA风格
+- perclass: Per-class template
+- coop: CoOp可学习静态向量
+- cocoop: CoCoOp图像条件化向量
+"""
+
 from typing import List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
-from model_components import AveragedPromptLearner, apply_lora_to_sam, PerClassTemplatePromptLearner
+from model_components import (
+    AveragedPromptLearner, 
+    apply_lora_to_sam, 
+    PerClassTemplatePromptLearner,
+    CoOpPromptLearner,
+    CoCoOpPromptLearner,
+    ParallelLoRA,
+)
 import json
 from sam3.model_builder import (
     _create_segmentation_head,
@@ -56,22 +73,12 @@ class FineTuneSAM3(nn.Module):
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-        if getattr(args, "prompt_learner_type", "") == "perclass":
-            self.prompt_learner = PerClassTemplatePromptLearner(
-                text_encoder=self.text_encoder,
-                class_names=args.class_list,
-                n_ctx=getattr(args, "n_ctx", 4),
-                num_templates=getattr(args, "num_templates", 4),
-                freeze_text_encoder=getattr(args, "freeze_text", True),
-                proj=getattr(self.text_encoder, "resizer", None),
-            )
-        else:
-            self.prompt_learner = AveragedPromptLearner(
-                text_encoder=self.text_encoder,
-                n_ctx=4,
-                freeze_text_encoder=freeze_text,
-                proj=self.text_encoder.resizer,
-            )
+        self.prompt_learner = AveragedPromptLearner(
+            text_encoder=self.text_encoder,
+            n_ctx=4,
+            freeze_text_encoder=freeze_text,
+            proj=self.text_encoder.resizer,
+        )
         self.to(self.device)
 
     def forward(self, images: torch.Tensor, prompt_lists: Sequence[List[str]]) -> dict:
@@ -134,7 +141,15 @@ class FineTuneSAM3(nn.Module):
 
 
 class FineTuneSAM3Official(nn.Module):
-    """Use official build_sam3_image_model then add LoRA + prompt learner."""
+    """
+    Use official build_sam3_image_model then add LoRA + prompt learner.
+    
+    支持的 prompt_learner_type:
+    - "averaged" / "static": 原有的SoWA风格静态提示
+    - "perclass": Per-class template提示
+    - "coop": CoOp风格可学习提示向量
+    - "cocoop": CoCoOp风格图像条件化提示
+    """
 
     def __init__(
         self,
@@ -149,14 +164,22 @@ class FineTuneSAM3Official(nn.Module):
         parallel_lora_rank: int = 16,
         parallel_lora_alpha: Optional[float] = None,
         device: Optional[torch.device] = None,
-        # NEW args:
+        # Per-class 相关参数
         class_list: Optional[Sequence[str]] = None,
-        prompt_learner_type: str = "averaged",
         num_templates: int = 4,
+        # ========== 提示学习器配置 ==========
+        prompt_learner_type: str = "averaged",
         n_ctx: int = 4,
+        ctx_init: str = "",
+        class_token_position: str = "end",
+        use_keywords: bool = False,  # 是否使用关键词聚合
+        # CoCoOp特有参数
+        cocoop_vis_dim: int = 256,
+        cocoop_reduction: int = 16,
     ) -> None:
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.prompt_learner_type = prompt_learner_type.lower()
 
         full_model = build_sam3_image_model(
             bpe_path=bpe_path,
@@ -184,16 +207,15 @@ class FineTuneSAM3Official(nn.Module):
         if enable_lora:
             wrapped = apply_lora_to_sam(
                 self.backbone.vision_backbone.trunk,
-                target_substrings=("qkv",),   # 关键：让 LoRA 直接改 attention 权重
+                target_substrings=("qkv",),
                 rank=lora_rank,
                 alpha=lora_alpha,
             )
             print(f"[INFO] Applied qkv-LoRA to {len(wrapped)} linear layers in vision trunk")        
 
-        # parallel LoRA injection (keep existing)
+        # parallel LoRA injection
         if enable_parallel_lora:
             from sam3.model.vitdet import Attention
-            from model_components import ParallelLoRA
             for module in self.backbone.vision_backbone.trunk.modules():
                 if isinstance(module, Attention):
                     in_dim = module.proj.in_features
@@ -202,7 +224,7 @@ class FineTuneSAM3Official(nn.Module):
                                                       rank=parallel_lora_rank, alpha=parallel_lora_alpha)
                     module.enable_parallel_lora = True
 
-        # freeze vision except LoRA weights (existing)
+        # freeze vision except LoRA weights
         if freeze_vision:
             for n, p in self.backbone.vision_backbone.trunk.named_parameters():
                 if "lora" in n:
@@ -212,11 +234,10 @@ class FineTuneSAM3Official(nn.Module):
             for p in self.backbone.language_backbone.parameters():
                 p.requires_grad = False
 
-        # set text_encoder as attribute (IMPORTANT)
         self.text_encoder = self.backbone.language_backbone
 
-        # build prompt_learner based on provided prompt_learner_type and class_list
-        if prompt_learner_type == "perclass":
+        # ========== 构建 prompt_learner ==========
+        if self.prompt_learner_type == "perclass":
             if class_list is None:
                 raise ValueError("Per-class prompt learner requested but class_list is None")
             self.prompt_learner = PerClassTemplatePromptLearner(
@@ -227,14 +248,43 @@ class FineTuneSAM3Official(nn.Module):
                 freeze_text_encoder=freeze_text,
                 proj=getattr(self.text_encoder, "resizer", None),
             )
+            print(f"[INFO] Using PerClassTemplatePromptLearner with {len(class_list)} classes")
+            
+        elif self.prompt_learner_type == "coop":
+            self.prompt_learner = CoOpPromptLearner(
+                text_encoder=self.text_encoder,
+                n_ctx=n_ctx,
+                ctx_init=ctx_init,
+                freeze_text_encoder=freeze_text,
+                proj=getattr(self.text_encoder, "resizer", None),
+                class_token_position=class_token_position,
+                use_keywords=use_keywords,
+            )
+            print(f"[INFO] Using CoOpPromptLearner: n_ctx={n_ctx}, ctx_init='{ctx_init}', use_keywords={use_keywords}")
+            
+        elif self.prompt_learner_type == "cocoop":
+            self.prompt_learner = CoCoOpPromptLearner(
+                text_encoder=self.text_encoder,
+                n_ctx=n_ctx,
+                ctx_init=ctx_init,
+                freeze_text_encoder=freeze_text,
+                proj=getattr(self.text_encoder, "resizer", None),
+                class_token_position=class_token_position,
+                vis_dim=cocoop_vis_dim,
+                reduction_factor=cocoop_reduction,
+                use_keywords=use_keywords,
+            )
+            print(f"[INFO] Using CoCoOpPromptLearner: n_ctx={n_ctx}, vis_dim={cocoop_vis_dim}, use_keywords={use_keywords}")
+            
         else:
-            # averaged / SoWA (default)
+            # 默认: averaged / static
             self.prompt_learner = AveragedPromptLearner(
                 text_encoder=self.text_encoder,
                 n_ctx=n_ctx,
                 freeze_text_encoder=freeze_text,
                 proj=getattr(self.text_encoder, "resizer", None),
             )
+            print(f"[INFO] Using AveragedPromptLearner (static/SoWA style)")
 
         self.to(self.device)
 
@@ -244,7 +294,7 @@ class FineTuneSAM3Official(nn.Module):
             try:
                 from safetensors.torch import load_file
             except ImportError as e:
-                raise ImportError("Please install safetensors to load .safetensors weights: pip install safetensors") from e
+                raise ImportError("Please install safetensors: pip install safetensors") from e
             raw_state = load_file(ckpt_path, device="cpu")
         else:
             raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -262,11 +312,24 @@ class FineTuneSAM3Official(nn.Module):
                 mapped[k] = v
         return mapped
 
-    def forward(self, images: torch.Tensor, prompt_lists: Sequence[List[str]], class_names: Optional[Sequence[str]] = None) -> dict:
+    def forward(
+        self, 
+        images: torch.Tensor, 
+        prompt_lists: Sequence[List[str]], 
+        class_names: Optional[Sequence[str]] = None
+    ) -> dict:
         """
-        Modified forward:
-          - accepts optional class_names (list of strings) so per-class prompt learner can be used
-          - returns prompt_seq and decoder_features in the out dict so training can compute align losses
+        Forward pass with support for different prompt learner types.
+        
+        Args:
+            images: (B, 3, H, W) 输入图像
+            prompt_lists: [B]个列表，每个包含提示词
+                CoOp/CoCoOp简化版: [["{anomaly/normal} {cls_name}"], ...]
+                CoOp/CoCoOp完整版: [["{anomaly/normal} {cls_name}", "kw1", "kw2"], ...]
+            class_names: 可选，用于per-class prompt learner
+        
+        Returns:
+            dict包含分割输出和中间特征
         """
         images = images.to(self.device)
         backbone_out = self.backbone.forward_image(images)
@@ -274,16 +337,37 @@ class FineTuneSAM3Official(nn.Module):
         vis_pos = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
         vis_feat_sizes = [x.shape[-2:] for x in vis_pos]
 
-        # ---------- handle prompt learner with optional class_names ----------
-        if class_names is not None and hasattr(self, "prompt_learner"):
-            # map class_names to indices using prompt_learner.class_to_idx (safe get)
-            cls_ids = [self.prompt_learner.class_to_idx.get(c.lower(), 0) if c is not None else 0 for c in class_names]
-            prompt_seq, prompt_mask = self.prompt_learner(prompt_lists, class_ids=cls_ids, device=self.device)
+        B = images.shape[0]
+        
+        # 提取图像特征 (用于CoCoOp)
+        image_features_for_cocoop = None
+        if self.prompt_learner_type == "cocoop":
+            # vis_feats[0]: (B, C, H, W) → (B, C)
+            image_features_for_cocoop = vis_feats[0].mean(dim=[2, 3])
+        
+        # 调用 prompt_learner
+        if hasattr(self.prompt_learner, "class_to_idx") and class_names is not None:
+            # PerClassTemplatePromptLearner
+            cls_ids = [
+                self.prompt_learner.class_to_idx.get(c.lower(), 0) if c is not None else 0 
+                for c in class_names
+            ]
+            prompt_seq, prompt_mask = self.prompt_learner(
+                prompt_lists, 
+                class_ids=cls_ids, 
+                image_features=image_features_for_cocoop,
+                device=self.device
+            )
         else:
-            prompt_seq, prompt_mask = self.prompt_learner(prompt_lists, device=self.device)
+            # CoOp / CoCoOp / Averaged
+            prompt_seq, prompt_mask = self.prompt_learner(
+                prompt_lists, 
+                image_features=image_features_for_cocoop,
+                device=self.device
+            )
+        
         prompt_pos = torch.zeros_like(prompt_seq)
 
-        # prepare image features for encoder
         img_feats = [x.flatten(2).permute(2, 0, 1) for x in vis_feats]
         img_pos = [x.flatten(2).permute(2, 0, 1) for x in vis_pos]
 
@@ -324,7 +408,6 @@ class FineTuneSAM3Official(nn.Module):
             prompt_mask=prompt_mask,
         )
 
-        # Build return dict. Include prompt_seq (L,B,W) for align loss.
         out = {
             "pred_masks": seg_out.get("pred_masks"),
             "semantic_seg": seg_out.get("semantic_seg"),
@@ -332,15 +415,11 @@ class FineTuneSAM3Official(nn.Module):
             "iou_predictions": seg_out.get("iou_predictions"),
             "decoder_hs": hs,
             "reference_boxes": reference_boxes,
-            # return prompt_seq so training can extract prototype via prompt_seq[-1]
             "prompt_seq": prompt_seq,
         }
 
-        # Try to attach a spatial decoder feature map for mask-embedding pooling:
-        # Preferred: if segmentation_head returns a mask feature map, use it.
-        # Fallback: use backbone top-level feature vis_feats[0] (B,C,H,W).
+        # decoder features
         decoder_feat = None
-        # commonly segmentation heads provide "mask_features" or "mask_pred_feats" etc. try several keys:
         for key in ("mask_features", "mask_feat", "mask_pred_feat", "decoder_features"):
             v = seg_out.get(key, None)
             if isinstance(v, torch.Tensor) and v is not None and v.dim() == 4:
@@ -348,14 +427,11 @@ class FineTuneSAM3Official(nn.Module):
                 break
 
         if decoder_feat is None:
-            # fallback to backbone feature (first FPN level)
-            # ensure vis_feats[0] is in (B,C,H,W); if it's list, pick first
             try:
                 decoder_feat = vis_feats[0]
             except Exception:
                 decoder_feat = None
 
-        out["decoder_features"] = decoder_feat  # may be None if unavailable
+        out["decoder_features"] = decoder_feat
 
         return out
-

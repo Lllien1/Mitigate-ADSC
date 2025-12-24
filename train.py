@@ -1118,6 +1118,8 @@ def build_dataloaders(
     specie_split_seed: int = 42,
     splits_save_dir: Optional[str] = None,
     min_normals_per_batch: int = 0,
+    # CoOp/CoCoOp prompt mode
+    prompt_mode: str = "simple",
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -1132,6 +1134,7 @@ def build_dataloaders(
         specie_split_ratio=specie_split_ratio,
         specie_split_seed=specie_split_seed,
         save_dir=splits_save_dir,  # pass the run-specific folder as dataset.save_dir
+        prompt_mode=prompt_mode,
     )
 
 
@@ -1369,15 +1372,20 @@ def main(args: argparse.Namespace):
             lora_alpha=args.lora_alpha,
             freeze_vision=args.freeze_vision,
             freeze_text=args.freeze_text,
-            # ----- new: for parallel lora -----
             enable_parallel_lora=args.enable_parallel_lora,
             parallel_lora_rank=args.parallel_lora_rank,
             parallel_lora_alpha=args.parallel_lora_alpha,
-            # ----- new: for parallel lora -----
             device=device,
             class_list=args.class_list,
-            prompt_learner_type='perclass',
             num_templates=getattr(args, "num_templates", 4),
+            # ===== CoOp/CoCoOp参数 =====
+            prompt_learner_type=args.prompt_learner_type,
+            n_ctx=args.n_ctx,
+            ctx_init=args.ctx_init,
+            class_token_position=args.class_token_position,
+            use_keywords=args.use_keywords,
+            cocoop_vis_dim=args.cocoop_vis_dim,
+            cocoop_reduction=args.cocoop_reduction,
         )
     else:
         model = FineTuneSAM3(
@@ -1431,6 +1439,7 @@ def main(args: argparse.Namespace):
         specie_split_seed=args.specie_split_seed,
         splits_save_dir=save_dir,   # pass run-specific save_dir to dataset
         min_normals_per_batch=getattr(args, 'min_normals_per_batch', 0),
+        prompt_mode=args.prompt_mode,
     )
 
 
@@ -1439,7 +1448,7 @@ def main(args: argparse.Namespace):
     for n, p in model.named_parameters():
         nl = n.lower()
         if ("lora" in nl) or ("out_adapter" in nl) or ("prompt_learner" in nl) or ("prompt" in nl) \
-           or ("segmentation_head" in nl):
+           or ("segmentation_head" in nl) or ("meta_net" in nl):
             p.requires_grad = True
         else:
             p.requires_grad = False
@@ -2729,6 +2738,29 @@ if __name__ == "__main__":
                         help="梯度累积步数 (默认1即不累积，设为2则有效batch=batch_size*2)")
     parser.add_argument("--min_normals_per_batch", type=int, default=2,
                         help="在训练 batch 中至少包含多少个 normal/good 样本（用于压制假阳性；单卡时生效）")
+    
+    # ==================== CoOp/CoCoOp 提示学习参数 ====================
+    parser.add_argument("--prompt_learner_type", type=str, default="perclass",
+                        choices=["averaged", "static", "perclass", "coop", "cocoop"],
+                        help="提示学习器类型")
+    parser.add_argument("--n_ctx", type=int, default=4,
+                        help="可学习上下文向量数量")
+    parser.add_argument("--ctx_init", type=str, default="",
+                        help="上下文初始化文本，如'a photo of a'")
+    parser.add_argument("--class_token_position", type=str, default="end",
+                        choices=["end", "middle", "front"],
+                        help="类别token位置")
+    parser.add_argument("--use_keywords", action="store_true",
+                        help="是否使用关键词聚合（默认关闭，推荐不开启）")
+    parser.add_argument("--cocoop_vis_dim", type=int, default=256,
+                        help="CoCoOp Meta-Net输入维度")
+    parser.add_argument("--cocoop_reduction", type=int, default=16,
+                        help="CoCoOp Meta-Net瓶颈缩减因子")
+    
+    # 数据集prompt模式
+    parser.add_argument("--prompt_mode", type=str, default="simple",
+                        choices=["simple", "full"],
+                        help="数据集prompt模式: simple(推荐)只有类别描述, full包含关键词")
 
 
     args = parser.parse_args()

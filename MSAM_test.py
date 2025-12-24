@@ -622,6 +622,7 @@ def build_loader(
     save_dir: Optional[str] = None,
     dataset_type: str = "mvtec",  # "mvtec" or "visa"
     obj_name: Optional[str] = None,  # filter by class name
+    prompt_mode: str = "simple",  # CoOp/CoCoOp prompt mode
 ):
     """Build dataloader for MVTec-AD or VisA dataset."""
     
@@ -632,6 +633,7 @@ def build_loader(
             csv_path=meta_path,
             mode=mode,
             obj_name=obj_name,
+            prompt_mode=prompt_mode,
         )
     else:
         # MVTec-AD dataset: meta_path should be meta.json
@@ -648,6 +650,7 @@ def build_loader(
             specie_split_seed=specie_split_seed,
             save_dir=save_dir,
             obj_name=obj_name,
+            prompt_mode=prompt_mode,
         )
 
     def collate_fn(batch):
@@ -849,6 +852,12 @@ def load_model(args, device: torch.device):
         "prompt_learner_type": getattr(args, "prompt_learner_type", "perclass"),
         "num_templates": getattr(args, "num_templates", 4),
         "n_ctx": getattr(args, "n_ctx", 4),
+        # CoOp/CoCoOp 参数
+        "ctx_init": getattr(args, "ctx_init", ""),
+        "class_token_position": getattr(args, "class_token_position", "end"),
+        "use_keywords": getattr(args, "use_keywords", False),
+        "cocoop_vis_dim": getattr(args, "cocoop_vis_dim", 256),
+        "cocoop_reduction": getattr(args, "cocoop_reduction", 16),
     })
     model = Constructor(**ctor_kwargs).to(device).eval()
 
@@ -1007,6 +1016,7 @@ def run_inference(args):
         save_dir=getattr(args, "save_dir", None),
         dataset_type=dataset_type,
         obj_name=getattr(args, "obj_name", None),
+        prompt_mode=getattr(args, "prompt_mode", "simple"),
     )
     model = load_model(args, device)
     
@@ -1414,10 +1424,27 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
 
-    # prompt learner config
-    parser.add_argument("--prompt_learner_type", type=str, default="perclass")
+    # prompt learner config - CoOp/CoCoOp 提示学习参数
+    parser.add_argument("--prompt_learner_type", type=str, default="perclass",
+                        choices=["averaged", "static", "perclass", "coop", "cocoop"],
+                        help="提示学习器类型")
     parser.add_argument("--num_templates", type=int, default=4)
-    parser.add_argument("--n_ctx", type=int, default=4)
+    parser.add_argument("--n_ctx", type=int, default=4,
+                        help="可学习上下文向量数量")
+    parser.add_argument("--ctx_init", type=str, default="",
+                        help="上下文初始化文本")
+    parser.add_argument("--class_token_position", type=str, default="end",
+                        choices=["end", "middle", "front"],
+                        help="类别token位置")
+    parser.add_argument("--use_keywords", action="store_true",
+                        help="是否使用关键词聚合")
+    parser.add_argument("--cocoop_vis_dim", type=int, default=256,
+                        help="CoCoOp Meta-Net输入维度")
+    parser.add_argument("--cocoop_reduction", type=int, default=16,
+                        help="CoCoOp Meta-Net瓶颈缩减因子")
+    parser.add_argument("--prompt_mode", type=str, default="simple",
+                        choices=["simple", "full"],
+                        help="数据集prompt模式")
 
     # dataset split from test defects
     parser.add_argument("--train_from_test", action="store_true")

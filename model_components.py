@@ -1,18 +1,28 @@
+"""
+model_components.py
+
+包含：
+- LoRA 相关组件
+- CoOpPromptLearner: CoOp风格可学习提示（静态）
+- CoCoOpPromptLearner: CoCoOp风格可学习提示（图像条件化）
+- 原有的 AveragedPromptLearner, PerClassTemplatePromptLearner
+"""
+
 import math
-from typing import Iterable, List, Optional, Sequence, Tuple
+from collections import OrderedDict
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sam3.model.text_encoder_ve import VETextEncoder
+
+# ================================================================================
+# LoRA 组件
+# ================================================================================
 
 class ParallelLoRA(nn.Module):
-    """
-    Parallel low-rank adapter (side-branch).
-    Computes update = scaling * ((x @ A.T) @ B.T)
-    and returns update (to be added to main output).
-    """
+    """Parallel low-rank adapter (side-branch)."""
 
     def __init__(self, in_features: int, out_features: int, rank: int = 16, alpha: Optional[float] = None):
         super().__init__()
@@ -22,37 +32,19 @@ class ParallelLoRA(nn.Module):
         self.alpha = float(alpha or rank)
         self.scaling = self.alpha / float(rank)
 
-        # LoRA params: shapes chosen to match (x @ A^T) -> (N, rank), then @ B^T -> (N, out_features)
         self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
 
-        # Init
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (..., in_features)
-        returns: (..., out_features)
-        """
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])  # (N, in_features)
-        lora_mid = x_flat @ self.lora_A.t()  # (N, rank)
-        update = lora_mid @ self.lora_B.t()  # (N, out_features)
-        update = update.view(*orig_shape[:-1], -1)  # (..., out_features)
+        x_flat = x.reshape(-1, x.shape[-1])
+        lora_mid = x_flat @ self.lora_A.t()
+        update = lora_mid @ self.lora_B.t()
+        update = update.view(*orig_shape[:-1], -1)
         return update * self.scaling
-
-    def fold_into_linear(self, linear: nn.Linear):
-        """
-        Fold the adapter into a given Linear layer in-place:
-          linear.weight.data += scaling * (B @ A)
-        Preconditions:
-          - linear.weight.shape == (out_features, in_features)
-        """
-        assert linear.weight.shape[0] == self.out_features and linear.weight.shape[1] == self.in_features
-        with torch.no_grad():
-            delta = (self.lora_B @ self.lora_A) * self.scaling  # (out, in)
-            linear.weight.data += delta
 
 
 class LoRALinear(nn.Module):
@@ -71,13 +63,11 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
-        # Freeze the base weights to train only LoRA (unless caller overrides).
         self.base.weight.requires_grad = False
         if self.base.bias is not None:
             self.base.bias.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # flatten last dim for matmul; supports extra leading dims
         y = self.base(x)
         lora_update = (x @ self.lora_A.t()) @ self.lora_B.t()
         return y + lora_update * self.scaling
@@ -89,18 +79,11 @@ def apply_lora_to_sam(
     rank: int = 16,
     alpha: Optional[float] = None,
 ) -> List[str]:
-    """Replace Linear layers containing target substrings with LoRA-wrapped versions.
-
-    Designed for SAM3 ViT-Det attention blocks (`sam3/model/vitdet.py:Attention.qkv`).
-    Returns list of module names that were wrapped.
-    """
+    """Replace Linear layers containing target substrings with LoRA-wrapped versions."""
     wrapped: List[str] = []
     for name, child in list(module.named_children()):
-        # Recurse first
         wrapped.extend(
-            apply_lora_to_sam(
-                child, target_substrings=target_substrings, rank=rank, alpha=alpha
-            )
+            apply_lora_to_sam(child, target_substrings=target_substrings, rank=rank, alpha=alpha)
         )
         if isinstance(child, nn.Linear) and any(s in name for s in target_substrings):
             lora = LoRALinear(child, rank=rank, alpha=alpha)
@@ -108,14 +91,405 @@ def apply_lora_to_sam(
             wrapped.append(name)
     return wrapped
 
-class PerClassTemplatePromptLearner(nn.Module):
-    """
-    Per-class template + SoWA-style prompt learner.
 
-    Usage:
-      pl = PerClassTemplatePromptLearner(text_encoder, class_names=class_list, n_ctx=4, num_templates=4)
-      prompt_seq, prompt_mask = pl(prompt_lists, class_ids=[cls_idx_0, cls_idx_1, ...], device=device)
+# ================================================================================
+# CoOp 提示学习器 (静态可学习向量)
+# 论文: Learning to Prompt for Vision-Language Models (Zhou et al., 2022)
+# ================================================================================
+
+class CoOpPromptLearner(nn.Module):
     """
+    CoOp-style Prompt Learner for Anomaly Detection.
+    
+    简化版提示格式（推荐）:
+        [v1][v2]...[vM] + [anomaly/normal {cls_name}]
+    
+    完整版提示格式（可选，use_keywords=True）:
+        [v1][v2]...[vM] + [anomaly/normal {cls_name}] + [kw_pooled]
+    
+    Args:
+        text_encoder: SAM3的文本编码器
+        n_ctx: 可学习上下文向量数量 (默认4)
+        ctx_init: 用于初始化的文本 (如"a photo of a")
+        freeze_text_encoder: 是否冻结文本编码器
+        proj: 投影层
+        class_token_position: 类别token位置 ("end"/"middle"/"front")
+        use_keywords: 是否使用关键词聚合 (默认False，推荐关闭)
+    """
+    
+    def __init__(
+        self,
+        text_encoder,
+        n_ctx: int = 4,
+        ctx_init: str = "",
+        freeze_text_encoder: bool = True,
+        proj: Optional[nn.Module] = None,
+        class_token_position: str = "end",
+        use_keywords: bool = False,  # 默认关闭，使用简化版
+    ):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.context_length = getattr(text_encoder, "context_length", 32)
+        
+        # 获取 text encoder 的 width
+        self.width = getattr(text_encoder.encoder, "width", None)
+        if self.width is None:
+            self.width = getattr(text_encoder, "width", None)
+        assert self.width is not None, "Cannot determine text encoder embedding width"
+        
+        self.n_ctx = n_ctx
+        self.class_token_position = class_token_position
+        self.proj = proj if proj is not None else getattr(text_encoder, "resizer", None)
+        self.use_keywords = use_keywords
+        
+        # ===== 核心: 可学习的上下文向量 =====
+        if ctx_init and len(ctx_init) > 0:
+            # 使用指定文本的word embedding初始化
+            ctx_init_tokens = text_encoder.tokenizer([ctx_init], context_length=self.context_length)
+            with torch.no_grad():
+                _, ctx_init_embeds = text_encoder.encoder(ctx_init_tokens)
+                n_available = min(n_ctx, ctx_init_embeds.shape[1] - 1)
+                ctx_init_embeds = ctx_init_embeds[0, 1:n_available+1, :]
+                if n_available < n_ctx:
+                    pad = torch.randn(n_ctx - n_available, self.width) * 0.02
+                    ctx_init_embeds = torch.cat([ctx_init_embeds, pad], dim=0)
+            self.ctx = nn.Parameter(ctx_init_embeds.clone())
+            print(f"[CoOpPromptLearner] 使用 '{ctx_init}' 初始化 {n_ctx} 个上下文向量")
+        else:
+            # 随机初始化 (std=0.02，与原始CoOp一致)
+            self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
+            print(f"[CoOpPromptLearner] 随机初始化 {n_ctx} 个上下文向量")
+        
+        # 关键词attention (仅当 use_keywords=True 时使用)
+        if use_keywords:
+            self.q_keyword = nn.Parameter(torch.randn(self.width) * 0.02)
+            self.keyword_attn_scale = math.sqrt(self.width)
+        
+        if freeze_text_encoder:
+            for p in self.text_encoder.parameters():
+                p.requires_grad = False
+        
+        print(f"[CoOpPromptLearner] use_keywords={use_keywords}, position={class_token_position}")
+    
+    @torch.no_grad()
+    def _encode_text(self, texts: List[str], device: torch.device) -> torch.Tensor:
+        """编码文本列表，返回EOT位置的embedding"""
+        if len(texts) == 0:
+            return torch.zeros((0, self.width), device=device)
+        
+        tokenized = self.text_encoder.tokenizer(texts, context_length=self.context_length).to(device)
+        eot_indices = tokenized.argmax(dim=-1)
+        if eot_indices.dim() > 1:
+            eot_indices = eot_indices.argmax(dim=1)
+        _, token_embeds = self.text_encoder.encoder(tokenized)
+        
+        batch_indices = torch.arange(len(texts), device=device)
+        text_features = token_embeds[batch_indices, eot_indices]
+        return text_features.to(device)
+    
+    def forward(
+        self, 
+        prompt_lists: Sequence[List[str]],
+        image_features: Optional[torch.Tensor] = None,  # CoOp不使用
+        class_ids: Optional[Sequence[int]] = None,
+        device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            prompt_lists: [B]个列表
+                简化版: [["{anomaly/normal} {cls}"], ...]
+                完整版: [["{anomaly/normal} {cls}", "kw1", "kw2", ...], ...]
+            image_features: 未使用 (CoOp是静态的)
+            device: 计算设备
+        
+        Returns:
+            prompt_seq: (L, B, W) 提示序列
+            prompt_mask: (B, L) 注意力mask
+        """
+        device = device or self.ctx.device
+        B = len(prompt_lists)
+        
+        batch_features = []
+        
+        for prompts in prompt_lists:
+            if len(prompts) == 0:
+                prompts = ["normal"]
+            
+            # 1) 编码主描述 (第一个prompt: "anomaly bottle" 或 "normal bottle")
+            main_desc = prompts[0]
+            main_embed = self._encode_text([main_desc], device)  # (1, W)
+            
+            # 2) 可学习上下文向量
+            ctx = self.ctx.to(device)  # (n_ctx, W)
+            
+            # 3) 关键词聚合 (仅当 use_keywords=True)
+            if self.use_keywords and len(prompts) > 1:
+                keywords = prompts[1:]
+                kw_embeds = self._encode_text(keywords, device)  # (K, W)
+                qk = self.q_keyword.view(self.width, 1).to(device)
+                kw_scores = torch.matmul(kw_embeds, qk).squeeze(-1) / self.keyword_attn_scale
+                kw_weights = torch.softmax(kw_scores, dim=0)
+                kw_prototype = (kw_weights.unsqueeze(-1) * kw_embeds).sum(dim=0, keepdim=True)  # (1, W)
+            else:
+                kw_prototype = None
+            
+            # 4) 组合: [ctx] + [main_embed] (+ [kw_prototype])
+            if self.class_token_position == "end":
+                if kw_prototype is not None:
+                    combined = torch.cat([ctx, main_embed, kw_prototype], dim=0)
+                else:
+                    combined = torch.cat([ctx, main_embed], dim=0)
+            elif self.class_token_position == "front":
+                if kw_prototype is not None:
+                    combined = torch.cat([main_embed, ctx, kw_prototype], dim=0)
+                else:
+                    combined = torch.cat([main_embed, ctx], dim=0)
+            else:  # middle
+                mid = self.n_ctx // 2
+                if kw_prototype is not None:
+                    combined = torch.cat([ctx[:mid], main_embed, ctx[mid:], kw_prototype], dim=0)
+                else:
+                    combined = torch.cat([ctx[:mid], main_embed, ctx[mid:]], dim=0)
+            
+            batch_features.append(combined.unsqueeze(0))
+        
+        prompt_batch = torch.cat(batch_features, dim=0)  # (B, L, W)
+        
+        if self.proj is not None:
+            prompt_batch = self.proj(prompt_batch)
+        
+        L = prompt_batch.shape[1]
+        prompt_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+        
+        return prompt_batch.transpose(0, 1), prompt_mask
+
+
+# ================================================================================
+# CoCoOp 提示学习器 (图像条件化可学习向量)
+# 论文: Conditional Prompt Learning for Vision-Language Models (Zhou et al., 2022)
+# ================================================================================
+
+class CoCoOpPromptLearner(nn.Module):
+    """
+    CoCoOp-style Conditional Prompt Learner for Anomaly Detection.
+    
+    简化版提示格式（推荐）:
+        [v1+π][v2+π]...[vM+π] + [anomaly/normal {cls_name}]
+    
+    其中 π = Meta-Net(image_features) 是图像条件化的token
+    
+    关键优势 (论文 Table 1):
+    - CoOp unseen classes: 63.22%
+    - CoCoOp unseen classes: 71.69% (+8.47%)
+    
+    Meta-Net 架构 (与官方一致):
+        Linear(vis_dim, vis_dim//16) → ReLU → Linear(vis_dim//16, text_width)
+    
+    Args:
+        text_encoder: SAM3的文本编码器
+        n_ctx: 可学习上下文向量数量 (默认4)
+        ctx_init: 用于初始化的文本
+        freeze_text_encoder: 是否冻结文本编码器
+        proj: 投影层
+        class_token_position: 类别token位置
+        vis_dim: 视觉特征维度 (SAM3 backbone输出，默认256)
+        reduction_factor: Meta-Net瓶颈缩减因子 (默认16，与官方一致)
+        use_keywords: 是否使用关键词聚合 (默认False)
+    """
+    
+    def __init__(
+        self,
+        text_encoder,
+        n_ctx: int = 4,
+        ctx_init: str = "",
+        freeze_text_encoder: bool = True,
+        proj: Optional[nn.Module] = None,
+        class_token_position: str = "end",
+        vis_dim: int = 256,
+        reduction_factor: int = 16,
+        use_keywords: bool = False,
+    ):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.context_length = getattr(text_encoder, "context_length", 32)
+        
+        self.width = getattr(text_encoder.encoder, "width", None)
+        if self.width is None:
+            self.width = getattr(text_encoder, "width", None)
+        assert self.width is not None, "Cannot determine text encoder embedding width"
+        
+        self.n_ctx = n_ctx
+        self.class_token_position = class_token_position
+        self.proj = proj if proj is not None else getattr(text_encoder, "resizer", None)
+        self.vis_dim = vis_dim
+        self.use_keywords = use_keywords
+        
+        # ===== 可学习的上下文向量 =====
+        if ctx_init and len(ctx_init) > 0:
+            ctx_init_tokens = text_encoder.tokenizer([ctx_init], context_length=self.context_length)
+            with torch.no_grad():
+                _, ctx_init_embeds = text_encoder.encoder(ctx_init_tokens)
+                n_available = min(n_ctx, ctx_init_embeds.shape[1] - 1)
+                ctx_init_embeds = ctx_init_embeds[0, 1:n_available+1, :]
+                if n_available < n_ctx:
+                    pad = torch.randn(n_ctx - n_available, self.width) * 0.02
+                    ctx_init_embeds = torch.cat([ctx_init_embeds, pad], dim=0)
+            self.ctx = nn.Parameter(ctx_init_embeds.clone())
+            print(f"[CoCoOpPromptLearner] 使用 '{ctx_init}' 初始化 {n_ctx} 个上下文向量")
+        else:
+            self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
+            print(f"[CoCoOpPromptLearner] 随机初始化 {n_ctx} 个上下文向量")
+        
+        # ===== Meta-Net: 与官方实现完全一致 =====
+        # 官方代码: nn.Sequential(OrderedDict([
+        #     ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
+        #     ("relu", nn.ReLU(inplace=True)),
+        #     ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
+        # ]))
+        hidden_dim = vis_dim // reduction_factor
+        self.meta_net = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(vis_dim, hidden_dim)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(hidden_dim, self.width))
+        ]))
+        print(f"[CoCoOpPromptLearner] Meta-Net: {vis_dim} → {hidden_dim} → {self.width}")
+        
+        # 关键词attention
+        if use_keywords:
+            self.q_keyword = nn.Parameter(torch.randn(self.width) * 0.02)
+            self.keyword_attn_scale = math.sqrt(self.width)
+        
+        if freeze_text_encoder:
+            for p in self.text_encoder.parameters():
+                p.requires_grad = False
+        
+        print(f"[CoCoOpPromptLearner] use_keywords={use_keywords}, position={class_token_position}")
+    
+    @torch.no_grad()
+    def _encode_text(self, texts: List[str], device: torch.device) -> torch.Tensor:
+        if len(texts) == 0:
+            return torch.zeros((0, self.width), device=device)
+        
+        tokenized = self.text_encoder.tokenizer(texts, context_length=self.context_length).to(device)
+        eot_indices = tokenized.argmax(dim=-1)
+        if eot_indices.dim() > 1:
+            eot_indices = eot_indices.argmax(dim=1)
+        _, token_embeds = self.text_encoder.encoder(tokenized)
+        
+        batch_indices = torch.arange(len(texts), device=device)
+        text_features = token_embeds[batch_indices, eot_indices]
+        return text_features.to(device)
+    
+    def forward(
+        self,
+        prompt_lists: Sequence[List[str]],
+        image_features: Optional[torch.Tensor] = None,
+        class_ids: Optional[Sequence[int]] = None,
+        device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            prompt_lists: [B]个列表，每个包含 ["{anomaly/normal} {cls}", ...]
+            image_features: (B, vis_dim) 或 (B, C, H, W) 图像特征
+                          如果为None，退化为CoOp（π=0）
+            device: 计算设备
+        
+        Returns:
+            prompt_seq: (L, B, W) 条件化提示序列
+            prompt_mask: (B, L) 注意力mask
+        """
+        device = device or self.ctx.device
+        B = len(prompt_lists)
+        
+        # ===== 生成图像条件token π =====
+        if image_features is not None:
+            image_features = image_features.to(device)
+            
+            # 处理不同维度的输入
+            if image_features.dim() == 4:
+                # (B, C, H, W) → (B, C) via global average pooling
+                image_features = image_features.mean(dim=[2, 3])
+            
+            # 确保维度匹配
+            feat_dim = image_features.shape[-1]
+            if feat_dim != self.vis_dim:
+                if feat_dim > self.vis_dim:
+                    image_features = image_features[..., :self.vis_dim]
+                else:
+                    # 填充到 vis_dim
+                    pad = torch.zeros(B, self.vis_dim - feat_dim, device=device)
+                    image_features = torch.cat([image_features, pad], dim=-1)
+            
+            # Meta-Net: 与官方一致的使用方式
+            # bias = self.meta_net(im_features)  # (batch, ctx_dim)
+            # bias = bias.unsqueeze(1)           # (batch, 1, ctx_dim)
+            # ctx_shifted = ctx + bias           # 广播加法
+            pi = self.meta_net(image_features)  # (B, width)
+        else:
+            pi = torch.zeros((B, self.width), device=device)
+        
+        batch_features = []
+        
+        for i, prompts in enumerate(prompt_lists):
+            if len(prompts) == 0:
+                prompts = ["normal"]
+            
+            # 1) 编码主描述
+            main_desc = prompts[0]
+            main_embed = self._encode_text([main_desc], device)  # (1, W)
+            
+            # 2) 条件化上下文向量: ctx + π (与官方一致)
+            # 官方: ctx_shifted = ctx + bias, 其中 bias 对所有 ctx token 相同
+            ctx_conditioned = self.ctx.to(device) + pi[i].unsqueeze(0)  # (n_ctx, W)
+            
+            # 3) 关键词聚合 (可选)
+            if self.use_keywords and len(prompts) > 1:
+                keywords = prompts[1:]
+                kw_embeds = self._encode_text(keywords, device)
+                qk = self.q_keyword.view(self.width, 1).to(device)
+                kw_scores = torch.matmul(kw_embeds, qk).squeeze(-1) / self.keyword_attn_scale
+                kw_weights = torch.softmax(kw_scores, dim=0)
+                kw_prototype = (kw_weights.unsqueeze(-1) * kw_embeds).sum(dim=0, keepdim=True)
+            else:
+                kw_prototype = None
+            
+            # 4) 组合
+            if self.class_token_position == "end":
+                if kw_prototype is not None:
+                    combined = torch.cat([ctx_conditioned, main_embed, kw_prototype], dim=0)
+                else:
+                    combined = torch.cat([ctx_conditioned, main_embed], dim=0)
+            elif self.class_token_position == "front":
+                if kw_prototype is not None:
+                    combined = torch.cat([main_embed, ctx_conditioned, kw_prototype], dim=0)
+                else:
+                    combined = torch.cat([main_embed, ctx_conditioned], dim=0)
+            else:  # middle
+                mid = self.n_ctx // 2
+                if kw_prototype is not None:
+                    combined = torch.cat([ctx_conditioned[:mid], main_embed, ctx_conditioned[mid:], kw_prototype], dim=0)
+                else:
+                    combined = torch.cat([ctx_conditioned[:mid], main_embed, ctx_conditioned[mid:]], dim=0)
+            
+            batch_features.append(combined.unsqueeze(0))
+        
+        prompt_batch = torch.cat(batch_features, dim=0)  # (B, L, W)
+        
+        if self.proj is not None:
+            prompt_batch = self.proj(prompt_batch)
+        
+        L = prompt_batch.shape[1]
+        prompt_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+        
+        return prompt_batch.transpose(0, 1), prompt_mask
+
+
+# ================================================================================
+# 原有的 PerClassTemplatePromptLearner
+# ================================================================================
+
+class PerClassTemplatePromptLearner(nn.Module):
+    """Per-class template + SoWA-style prompt learner."""
 
     def __init__(
         self,
@@ -140,14 +514,11 @@ class PerClassTemplatePromptLearner(nn.Module):
         self.num_classes = len(self.class_names)
 
         self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
-        # class templates
         self.class_templates = nn.Parameter(
             torch.randn(self.num_classes, num_templates, self.width) * 0.02
-        )  # (C, T, W)
+        )
 
         self.proj = proj if proj is not None else getattr(text_encoder, "resizer", None)
-
-        # SoWA-like: token-level and keyword-level queries
         self.q_token = nn.Parameter(torch.randn(self.width) * 0.02)
         self.q_keyword = nn.Parameter(torch.randn(self.width) * 0.02)
         self.token_attn_scale = token_attn_scale if token_attn_scale is not None else math.sqrt(self.width)
@@ -157,32 +528,11 @@ class PerClassTemplatePromptLearner(nn.Module):
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-    @torch.no_grad()
-    def _tokenize_and_encode(self, keywords: List[str], device: torch.device):
-        """Tokenize and run text encoder return tokens and token_mask (True for valid tokens)."""
-        if len(keywords) == 0:
-            keywords = ["normal"]
-        tokenized = self.text_encoder.tokenizer(keywords, context_length=self.context_length).to(device)
-        eot_indices = tokenized.argmax(dim=-1)
-        if eot_indices.dim() > 1:
-            eot_indices = eot_indices.argmax(dim=1)
-        _, tokens = self.text_encoder.encoder(tokenized)  # (N, seq_len, W)
-        tokens = tokens.to(device)
-        seq_len = tokens.shape[1]
-        pos = torch.arange(seq_len, device=device).unsqueeze(0)
-        token_mask = pos <= eot_indices.unsqueeze(1)  # (N, seq_len)
-        return tokens, token_mask
-
-    def forward(self, prompt_lists: Sequence[List[str]], class_ids: Optional[Sequence[int]] = None, device: Optional[torch.device] = None):
-        """
-        prompt_lists: Sequence[B] of list[str]
-        class_ids: optional Sequence[B] of ints (0..num_classes-1)
-        returns prompt_seq (L,B,W), prompt_mask (B,L)
-        """
+    def forward(self, prompt_lists: Sequence[List[str]], class_ids: Optional[Sequence[int]] = None,
+                image_features: Optional[torch.Tensor] = None, device: Optional[torch.device] = None):
         device = device or self.ctx.device
         B = len(prompt_lists)
 
-        # flatten keywords
         all_keywords = []
         counts = []
         for kws in prompt_lists:
@@ -192,28 +542,25 @@ class PerClassTemplatePromptLearner(nn.Module):
         N = len(all_keywords)
 
         if N == 0:
-            # fallback: zero prototype
             keyword_prototypes = torch.zeros((B, 1, self.width), device=device)
         else:
             tokenized = self.text_encoder.tokenizer(all_keywords, context_length=self.context_length).to(device)
             eot = tokenized.argmax(dim=-1)
             if eot.dim() > 1:
                 eot = eot.argmax(dim=1)
-            _, tokens = self.text_encoder.encoder(tokenized)  # (N, seq_len, W)
+            _, tokens = self.text_encoder.encoder(tokenized)
             tokens = tokens.to(device)
             seq_len = tokens.shape[1]
             pos = torch.arange(seq_len, device=device).unsqueeze(0)
             token_mask = pos <= eot.unsqueeze(1)
 
-            # token-level attention:
             q = self.q_token.view(self.width, 1).to(device)
-            scores = torch.matmul(tokens, q).squeeze(-1) / (self.token_attn_scale or math.sqrt(self.width))
+            scores = torch.matmul(tokens, q).squeeze(-1) / self.token_attn_scale
             min_val = torch.finfo(scores.dtype).min
             scores = scores.masked_fill(~token_mask, min_val)
-            token_w = torch.softmax(scores, dim=1)  # (N, seq_len)
-            keyword_embeds_all = (token_w.unsqueeze(-1) * tokens).sum(dim=1)  # (N, W)
+            token_w = torch.softmax(scores, dim=1)
+            keyword_embeds_all = (token_w.unsqueeze(-1) * tokens).sum(dim=1)
 
-            # regroup per sample
             max_k = max(counts) if max(counts) > 0 else 1
             kw_padded = torch.zeros((B, max_k, self.width), device=device)
             kw_mask = torch.ones((B, max_k), dtype=torch.bool, device=device)
@@ -224,44 +571,36 @@ class PerClassTemplatePromptLearner(nn.Module):
                     kw_mask[i, :k] = False
                     idx += k
 
-            # keyword-level attention
             qk = self.q_keyword.view(self.width, 1).to(device)
-            kw_scores = torch.matmul(kw_padded, qk).squeeze(-1) / (self.keyword_attn_scale or math.sqrt(self.width))  # (B, max_k)
+            kw_scores = torch.matmul(kw_padded, qk).squeeze(-1) / self.keyword_attn_scale
             kw_scores = kw_scores.masked_fill(kw_mask, min_val)
-            kw_w = torch.softmax(kw_scores, dim=1)  # (B,max_k)
-            keyword_prototypes = (kw_w.unsqueeze(-1) * kw_padded).sum(dim=1, keepdim=True)  # (B,1,W)
+            kw_w = torch.softmax(kw_scores, dim=1)
+            keyword_prototypes = (kw_w.unsqueeze(-1) * kw_padded).sum(dim=1, keepdim=True)
 
-        # class templates batch
         if class_ids is None:
             class_templates_batch = self.class_templates[0].unsqueeze(0).repeat(B, 1, 1)
         else:
             ids = torch.tensor(class_ids, dtype=torch.long, device=device)
-            class_templates_batch = self.class_templates[ids]  # (B, T, W)
+            class_templates_batch = self.class_templates[ids]
 
-        ctx_b = self.ctx.unsqueeze(0).to(device).repeat(B, 1, 1)  # (B, n_ctx, W)
-        stacked = torch.cat([ctx_b, class_templates_batch, keyword_prototypes], dim=1)  # (B, n_ctx+T+1, W)
+        ctx_b = self.ctx.unsqueeze(0).to(device).repeat(B, 1, 1)
+        stacked = torch.cat([ctx_b, class_templates_batch, keyword_prototypes], dim=1)
         projected = self.proj(stacked) if self.proj is not None else stacked
         prompt_mask = torch.zeros((projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device)
 
         return projected.transpose(0, 1), prompt_mask
 
-class AveragedPromptLearner(nn.Module):
-    """
-    SoWA-style prompt learner:
-      - token-level attention: for each keyword phrase, produce a keyword embedding
-        by attending over its token embeddings (learned query).
-      - keyword-level attention: attend over keyword embeddings to produce a single
-        prototype for the sample (learned query).
-      - prepend learnable ctx tokens to the prototype as before.
 
-    Returns:
-      prompt_seq: (n_ctx + 1, B, width)
-      prompt_mask: (B, n_ctx + 1)  -- False = visible (same convention as original code)
-    """
+# ================================================================================
+# 原有的 AveragedPromptLearner (SoWA风格)
+# ================================================================================
+
+class AveragedPromptLearner(nn.Module):
+    """SoWA-style prompt learner (原有静态提示)"""
 
     def __init__(
         self,
-        text_encoder: VETextEncoder,
+        text_encoder,
         n_ctx: int = 4,
         freeze_text_encoder: bool = True,
         proj: Optional[nn.Module] = None,
@@ -271,128 +610,65 @@ class AveragedPromptLearner(nn.Module):
         super().__init__()
         self.text_encoder = text_encoder
         self.context_length = getattr(text_encoder, "context_length", 32)
-        # width: embedding dim of text encoder tokens
         self.width = getattr(text_encoder.encoder, "width", None)
         if self.width is None:
-            # fallback to known attribute if layout differs
             self.width = getattr(text_encoder, "width", None)
-        assert self.width is not None, "Cannot determine text encoder embedding width"
+        assert self.width is not None
 
         self.n_ctx = n_ctx
-        # learnable context tokens
         self.ctx = nn.Parameter(torch.randn(n_ctx, self.width) * 0.02)
         self.proj = proj if proj is not None else getattr(text_encoder, "resizer", None)
 
-        # token-level learned query vector (used to score tokens within each keyword)
-        # we store as a parameter vector of size (width,)
         self.q_token = nn.Parameter(torch.randn(self.width) * 0.02)
-        # keyword-level learned query vector (used to score keywords)
         self.q_keyword = nn.Parameter(torch.randn(self.width) * 0.02)
-
-        # optional temperature / scaling factors (learnable hyperparams are optional)
-        self.token_attn_scale = (
-            token_attn_scale if token_attn_scale is not None else math.sqrt(self.width)
-        )
-        self.keyword_attn_scale = (
-            keyword_attn_scale if keyword_attn_scale is not None else math.sqrt(self.width)
-        )
+        self.token_attn_scale = token_attn_scale if token_attn_scale is not None else math.sqrt(self.width)
+        self.keyword_attn_scale = keyword_attn_scale if keyword_attn_scale is not None else math.sqrt(self.width)
 
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-    @torch.no_grad()
-    def _tokenize_and_encode(self, keywords: List[str], device: torch.device):
-        """
-        Tokenize a list of keywords and return:
-           token_ids: tensor (n_words, seq_len) -- token id per position (uses .argmax as before)
-           eot_indices: tensor (n_words,) -- position index of EOT / last meaningful token (same as before)
-           token_embs: tensor (n_words, seq_len, width) -- token embeddings from text_encoder.encoder
-        This mirrors the original pipeline but returns token-level embeddings (not just EOT).
-        """
-        if len(keywords) == 0:
-            keywords = ["normal"]
-        # tokenizer existing interface in repo:
-        tokenized = self.text_encoder.tokenizer(keywords, context_length=self.context_length).to(device)
-        # tokenized is used previously with argmax to get eot indices
-        eot_indices = tokenized.argmax(dim=-1)  # shape: (n_words, ) or (n_words, seq_len)? repo's original code worked
-        # In original code they did tokens[range, eot_indices] so eot_indices must be (n_words,) giving the index.
-        # To be robust: if eot_indices is 2D, take argmax across seq to get position index per word:
-        if eot_indices.dim() > 1:
-            # eot_indices maybe shape (n_words, seq_len) if tokenizer returns weird shape
-            # take the position of the highest value across seq dimension
-            eot_indices = eot_indices.argmax(dim=1)
-
-        # run text encoder to get token embeddings: tokens: (n_words, seq_len, width)
-        _, tokens = self.text_encoder.encoder(tokenized)
-        # Ensure tokens is float tensor on device
-        tokens = tokens.to(device)
-
-        # Build mask for valid token positions for each keyword using eot_indices:
-        seq_len = tokens.shape[1]
-        pos = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
-        # token_mask True for positions <= eot_index (i.e., valid tokens), False otherwise
-        token_mask = pos <= eot_indices.unsqueeze(1)  # shape (n_words, seq_len), dtype=bool
-
-        return eot_indices, tokens, token_mask
-
-    def forward(self, prompt_lists: Sequence[List[str]], device: Optional[torch.device] = None):
-        """
-        Input:
-          prompt_lists: Sequence of lists of keyword strings, length B
-        Output:
-          prompt_seq: (n_ctx+1, B, width)
-          prompt_mask: (B, n_ctx+1)  (False = visible)
-        """
+    def forward(self, prompt_lists: Sequence[List[str]], image_features: Optional[torch.Tensor] = None,
+                class_ids: Optional[Sequence[int]] = None, device: Optional[torch.device] = None):
         device = device or self.ctx.device
         batch_features = []
 
         for words in prompt_lists:
-            # encode tokens and compute token-level keyword embeddings
-            eot_indices, tokens, token_mask = self._tokenize_and_encode(words, device=device)
-            # tokens: (n_words, seq_len, width)
+            if len(words) == 0:
+                words = ["normal"]
+            tokenized = self.text_encoder.tokenizer(words, context_length=self.context_length).to(device)
+            eot_indices = tokenized.argmax(dim=-1)
+            if eot_indices.dim() > 1:
+                eot_indices = eot_indices.argmax(dim=1)
+            _, tokens = self.text_encoder.encoder(tokenized)
+            tokens = tokens.to(device)
             n_words = tokens.shape[0]
 
             if n_words == 0:
-                # fallback to zero prototype
                 prototype = torch.zeros((1, self.width), device=device)
             else:
-                # token-level attention:
-                # scores = (tokens @ q_token) / scale  -> (n_words, seq_len)
-                # mask out positions after EOT with -1e9
-                q = self.q_token.view(self.width, 1)  # (width,1)
-                # compute dot product along width: (n_words, seq_len, width) @ (width,1) -> (n_words, seq_len, 1)
-                # faster as torch.einsum or matmul
-                scores = torch.matmul(tokens, q).squeeze(-1)  # (n_words, seq_len)
-                scores = scores / (self.token_attn_scale if self.token_attn_scale is not None else math.sqrt(self.width))
-
-                # mask positions beyond EOT
-                min_val = torch.tensor(torch.finfo(scores.dtype).min, device=scores.device, dtype=scores.dtype)
+                seq_len = tokens.shape[1]
+                pos = torch.arange(seq_len, device=device).unsqueeze(0)
+                token_mask = pos <= eot_indices.unsqueeze(1)
+                
+                q = self.q_token.view(self.width, 1)
+                scores = torch.matmul(tokens, q).squeeze(-1) / self.token_attn_scale
+                min_val = torch.finfo(scores.dtype).min
                 scores = scores.masked_fill(~token_mask, min_val)
-                # softmax over seq_len
-                token_weights = torch.softmax(scores, dim=1)  # (n_words, seq_len)
-                # compute keyword embedding as weighted sum of token embeddings
-                keyword_embeds = (token_weights.unsqueeze(-1) * tokens).sum(dim=1)  # (n_words, width)
+                token_weights = torch.softmax(scores, dim=1)
+                keyword_embeds = (token_weights.unsqueeze(-1) * tokens).sum(dim=1)
 
-                # keyword-level attention: compute scores over the n_words
-                qk = self.q_keyword.view(self.width, 1)  # (width,1)
-                kw_scores = torch.matmul(keyword_embeds, qk).squeeze(-1)  # (n_words,)
-                kw_scores = kw_scores / (self.keyword_attn_scale if self.keyword_attn_scale is not None else math.sqrt(self.width))
-                kw_weights = torch.softmax(kw_scores, dim=0)  # (n_words,)
+                qk = self.q_keyword.view(self.width, 1)
+                kw_scores = torch.matmul(keyword_embeds, qk).squeeze(-1) / self.keyword_attn_scale
+                kw_weights = torch.softmax(kw_scores, dim=0)
+                prototype = (kw_weights.unsqueeze(-1) * keyword_embeds).sum(dim=0, keepdim=True)
 
-                # produce prototype as weighted sum of keyword embeddings
-                prototype = (kw_weights.unsqueeze(-1) * keyword_embeds).sum(dim=0, keepdim=True)  # (1, width)
-
-            # prepend ctx tokens as before
-            ctx = self.ctx.unsqueeze(0).to(device)  # (1, n_ctx, width)
-            prototype = prototype.unsqueeze(0)  # (1,1,width)
-            stacked = torch.cat([ctx, prototype], dim=1)  # (1, n_ctx+1, width)
+            ctx = self.ctx.unsqueeze(0).to(device)
+            prototype = prototype.unsqueeze(0)
+            stacked = torch.cat([ctx, prototype], dim=1)
             batch_features.append(stacked)
 
-        prompt_batch = torch.cat(batch_features, dim=0)  # (B, n_ctx+1, width)
+        prompt_batch = torch.cat(batch_features, dim=0)
         projected = self.proj(prompt_batch) if self.proj is not None else prompt_batch
-        # prompt_mask: False = visible (same convention); all ctx + prototype are visible (False)
         prompt_mask = torch.zeros((projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device)
-        # return seq-first for transformer encoder (seq,len first)
         return projected.transpose(0, 1), prompt_mask
-# -------------------------------------------------------------------------------
