@@ -1065,11 +1065,8 @@ def run_inference(args):
         if custom_prompt:
             # Override all samples with user-provided prompts (comma-separated)
             prompt_lists = [custom_prompt for _ in prompt_lists]
-        else:
-            # When --prompt is NOT provided (e.g., VisA has no specie_name), use:
-            #   candidate-1: normal {cls_name}
-            #   candidate-2: damaged {cls_name}
-            prompt_lists = [[f"normal {class_names[i]}",f"good {class_names[i]}", f"anomaly {class_names[i]}",f"damaged {class_names[i]}"] for i in range(len(class_names))]
+        # 注意：当 custom_prompt 为空时，prompt_lists 来自数据集但不会被使用
+        # 因为下面会根据 prompt_mode 重新构建 anomaly_lists 和 normal_lists
 
         # measure GPU time
         if device.type == "cuda":
@@ -1091,35 +1088,37 @@ def run_inference(args):
             )
             pred_masks_2, query_scores_2 = None, None
         else:
-            # 根据数据集类型选择 prompt 模板
+            # ===== 根据 prompt_mode 选择推理时的 prompt 格式 =====
+            # 关键原则：测试时的 prompt 必须与训练时 prompt[0] 一致！
+            prompt_mode = getattr(args, "prompt_mode", "simple").lower()
             dataset_type = getattr(args, "dataset", "mvtec").lower()
             
-            if dataset_type == "visa":
-                # VisA: 使用 "damage {cls}" 和 "good {cls}" 作为两个 prompt
-                damage_lists = [[f"damage {class_names[i]}"] for i in range(len(class_names))]
-                good_lists = [[f"good {class_names[i]}"] for i in range(len(class_names))]
-                
-                pred_masks_1, query_scores_1, _ = _forward_once(
-                    model, images, damage_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
-                    is_anomaly=is_anomaly_tensor
-                )
-                pred_masks_2, query_scores_2, _ = _forward_once(
-                    model, images, good_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
-                    is_anomaly=is_anomaly_tensor
-                )
+            if prompt_mode == "simple":
+                # ===== simple 模式（推荐）=====
+                # 训练时：anomaly 样本用 ["anomaly {cls}"], normal 样本用 ["normal {cls}"]
+                # 测试时：用这两个 prompt 分别推理，选择得分更高的
+                anomaly_lists = [[f"anomaly {class_names[i]}"] for i in range(len(class_names))]
+                normal_lists = [[f"normal {class_names[i]}"] for i in range(len(class_names))]
+            elif dataset_type == "visa":
+                # ===== VisA full 模式 =====
+                # 训练时：anomaly 样本用 ["damaged {cls}", ...], normal 样本用 ["normal {cls}", ...]
+                anomaly_lists = [[f"damaged {class_names[i]}"] for i in range(len(class_names))]
+                normal_lists = [[f"normal {class_names[i]}"] for i in range(len(class_names))]
             else:
-                # MVTec-AD: 使用 "damage {cls}" 和 specie_name 作为两个 prompt
-                damage_lists = [[f"damage {class_names[i]}"] for i in range(len(class_names))]
-                specie_lists = [[str(specie_names[i]).strip() if str(specie_names[i]).strip() else f"damage {class_names[i]}"] for i in range(len(class_names))]
+                # ===== MVTec-AD full 模式 =====
+                # 训练时：anomaly 样本用 ["anomaly {cls}", ...], normal 样本用 ["normal {cls}", ...]
+                anomaly_lists = [[f"anomaly {class_names[i]}"] for i in range(len(class_names))]
+                normal_lists = [[f"normal {class_names[i]}"] for i in range(len(class_names))]
 
-                pred_masks_1, query_scores_1, _ = _forward_once(
-                    model, images, damage_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
-                    is_anomaly=is_anomaly_tensor
-                )
-                pred_masks_2, query_scores_2, _ = _forward_once(
-                    model, images, specie_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
-                    is_anomaly=is_anomaly_tensor
-                )
+            # 推理：分别用 anomaly prompt 和 normal prompt 跑一遍
+            pred_masks_1, query_scores_1, _ = _forward_once(
+                model, images, anomaly_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
+                is_anomaly=is_anomaly_tensor
+            )
+            pred_masks_2, query_scores_2, _ = _forward_once(
+                model, images, normal_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
+                is_anomaly=is_anomaly_tensor
+            )
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -1166,13 +1165,22 @@ def run_inference(args):
                 alt_prompt, alt_score = "", 0.0
             
             else:
-                # 根据数据集类型选择 prompt 标签
+                # ===== 根据 prompt_mode 选择 prompt 标签（与推理时一致）=====
+                prompt_mode = getattr(args, "prompt_mode", "simple").lower()
                 dataset_type = getattr(args, "dataset", "mvtec").lower()
-                p1 = f"damage {cls_name}"
-                if dataset_type == "visa":
-                    p2 = f"good {cls_name}"
+                
+                if prompt_mode == "simple":
+                    # simple 模式：使用 anomaly/normal
+                    p1 = f"anomaly {cls_name}"
+                    p2 = f"normal {cls_name}"
+                elif dataset_type == "visa":
+                    # VisA full 模式
+                    p1 = f"damaged {cls_name}"
+                    p2 = f"normal {cls_name}"
                 else:
-                    p2 = str(specie_names[b]).strip() if str(specie_names[b]).strip() else p1
+                    # MVTec full 模式
+                    p1 = f"anomaly {cls_name}"
+                    p2 = f"normal {cls_name}"
             
                 pm1_low = pred_masks_1[b]  # (Q, h, w)
                 pm2_low = pred_masks_2[b]  # (Q, h, w)

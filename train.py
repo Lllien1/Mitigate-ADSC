@@ -549,23 +549,37 @@ def unfreeze_decoder_selectively(model, mode="last_layer"):
 
 def get_prompt_group_labels(prompt_lists, class_names, device):
     """
-    改进的分组策略：只按 prompt 内容分组，忽略 class_name。
+    改进的分组策略：基于 prompt_list 结构自动适配不同数据集。
     
-    原问题: 使用 (class_name, prompt_tuple) 导致每个类别形成独立组
-    例如 batch=8 来自 8 个类别 -> 8 个组各 1 个样本 -> 无多正样本对!
+    分组逻辑：
+    1. MVTec-AD full 模式 (len > 3)：有 specie_name
+       - prompt_list = ["anomaly bottle", "damaged", "defect", "broken large", ...]
+       - key = (prompt_list[0], prompt_list[3]) = ("anomaly bottle", "broken large")
+       - 同类别同 specie 的样本分到同一组
     
-    改进: 只用 prompt 内容分组
-    - "crack" 在 bottle 和 tile 中语义相同，应该是正样本对
-    - 相同的缺陷描述形成一组
+    2. 其他情况 (len <= 3)：simple 模式或 VisA
+       - prompt_list = ["anomaly bottle"] 或 ["anomaly bottle", "damaged", "defect"]
+       - key = (prompt_list[0],) = ("anomaly bottle",)
+       - 同类别同状态的样本分到同一组
+    
+    效果：
+    - MVTec full: bottle-broken_large 和 bottle-crack 分到不同组
+    - MVTec simple / VisA: 所有 anomaly bottle 一组，所有 normal bottle 一组
     """
     group_to_id = {}
     labels = []
     
     for prompts in prompt_lists:
-        # 只用 prompt 内容作为 key（忽略 class_name）
-        # 这样不同类别的相同缺陷类型可以形成正样本对
-        key_prompts = prompts[1:3] if (prompts is not None and len(prompts) > 1) else []
-        key = tuple(sorted(key_prompts)) if key_prompts else ("__normal__",)
+        if prompts is None or len(prompts) == 0:
+            key = ("__unknown__",)
+        elif len(prompts) > 3:
+            # MVTec-AD full 模式: 有 specie_name 在 [3] 位置
+            # key = (cls_template, specie_name)
+            key = (prompts[0], prompts[3])
+        else:
+            # simple 模式或 VisA: 只按 cls_template 分组
+            # key = (cls_template,)
+            key = (prompts[0],)
         
         if key not in group_to_id:
             group_to_id[key] = len(group_to_id)
@@ -2373,34 +2387,81 @@ def main(args: argparse.Namespace):
                                 labels_sample = group_labels[sel].cpu().numpy()
                                 is_bg_sample = is_background[sel].cpu().numpy()  # True=normal, False=anomaly
                                 
+                                # 获取采样样本的 class_names
+                                class_names_sample = [class_names[i] for i in sel]
+                                is_anomaly_sample = [is_anomaly[i] for i in sel]  # True=anomaly, False=normal
+                                
+                                # 为每个类别分配颜色
+                                unique_classes = sorted(list(set(class_names_sample)))
+                                # 使用更多颜色的colormap
+                                n_classes = len(unique_classes)
+                                if n_classes <= 10:
+                                    cmap = plt.cm.tab10
+                                elif n_classes <= 20:
+                                    cmap = plt.cm.tab20
+                                else:
+                                    cmap = plt.cm.turbo
+                                class_to_color = {cls: cmap(i / max(n_classes - 1, 1)) for i, cls in enumerate(unique_classes)}
+                                colors_sample = [class_to_color[cls] for cls in class_names_sample]
+                                
                                 X = np.concatenate([p_sample, m_sample], axis=0)
                                 Z = TSNE(n_components=2, perplexity=min(30, ns-1), init='pca', random_state=42).fit_transform(X)
                                 
                                 # 创建多面板图
-                                fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+                                fig, axes = plt.subplots(2, 2, figsize=(16, 14))
                                 
-                                # ===== Panel 1: Prompt vs Visual (按 group 着色) =====
+                                # ===== Panel 1: Visual Embeddings (按类别着色，按Normal/Anomaly区分形状) =====
                                 ax1 = axes[0, 0]
-                                scatter1 = ax1.scatter(Z[:ns, 0], Z[:ns, 1], c=labels_sample, 
-                                                      cmap='tab10', marker='o', alpha=0.8, s=50, label='prompt')
-                                ax1.scatter(Z[ns:, 0], Z[ns:, 1], c=labels_sample, 
-                                           cmap='tab10', marker='x', alpha=0.8, s=50, label='visual')
-                                ax1.legend(fontsize=10)
-                                ax1.set_title(f"Prompt-Visual Alignment (color=group)", fontsize=12)
+                                # 只绘制 visual embeddings (Z[ns:])
+                                for i in range(ns):
+                                    marker = 'o' if is_bg_sample[i] else '*'  # Normal=圆, Anomaly=星
+                                    size = 80 if is_bg_sample[i] else 150  # 星型稍大一点
+                                    ax1.scatter(Z[ns + i, 0], Z[ns + i, 1], 
+                                               c=[colors_sample[i]], marker=marker, s=size, 
+                                               edgecolors='black', linewidths=0.5, alpha=0.8)
+                                
+                                # 创建图例
+                                from matplotlib.lines import Line2D
+                                # 类别图例
+                                class_legend = [Line2D([0], [0], marker='s', color='w', markerfacecolor=class_to_color[cls], 
+                                                       markersize=10, label=cls) for cls in unique_classes]
+                                # 形状图例
+                                shape_legend = [
+                                    Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', 
+                                           markersize=10, label='Normal', markeredgecolor='black'),
+                                    Line2D([0], [0], marker='*', color='w', markerfacecolor='gray', 
+                                           markersize=14, label='Anomaly', markeredgecolor='black')
+                                ]
+                                legend1 = ax1.legend(handles=class_legend, loc='upper left', fontsize=8, title='Class')
+                                ax1.add_artist(legend1)
+                                ax1.legend(handles=shape_legend, loc='upper right', fontsize=9, title='Type')
+                                ax1.set_title(f"Visual Embeddings (color=class, shape=type)", fontsize=12)
                                 ax1.set_xlabel("Dim 1")
                                 ax1.set_ylabel("Dim 2")
                                 
-                                # ===== Panel 2: Normal vs Anomaly 分离 =====
+                                # ===== Panel 2: Prompt vs Visual (按类别着色) =====
                                 ax2 = axes[0, 1]
-                                colors_na = ['green' if bg else 'red' for bg in is_bg_sample]
-                                ax2.scatter(Z[:ns, 0], Z[:ns, 1], c=colors_na, marker='o', alpha=0.7, s=50, label='prompt')
-                                ax2.scatter(Z[ns:, 0], Z[ns:, 1], c=colors_na, marker='x', alpha=0.7, s=50, label='visual')
-                                # 添加图例
-                                from matplotlib.patches import Patch
-                                legend_elements = [Patch(facecolor='green', label='Normal'),
-                                                  Patch(facecolor='red', label='Anomaly')]
-                                ax2.legend(handles=legend_elements, fontsize=10)
-                                ax2.set_title(f"Normal vs Anomaly Separation", fontsize=12)
+                                # 绘制 prompt embeddings (Z[:ns]) 用 x 标记
+                                for i in range(ns):
+                                    ax2.scatter(Z[i, 0], Z[i, 1], c=[colors_sample[i]], marker='x', s=60, alpha=0.8, linewidths=2)
+                                # 绘制 visual embeddings (Z[ns:]) 用圆/星标记
+                                for i in range(ns):
+                                    marker = 'o' if is_bg_sample[i] else '*'
+                                    size = 60 if is_bg_sample[i] else 120
+                                    ax2.scatter(Z[ns + i, 0], Z[ns + i, 1], 
+                                               c=[colors_sample[i]], marker=marker, s=size, 
+                                               edgecolors='black', linewidths=0.5, alpha=0.8)
+                                
+                                # 图例
+                                pv_legend = [
+                                    Line2D([0], [0], marker='x', color='gray', markersize=10, label='Prompt', linestyle='None'),
+                                    Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=10, 
+                                           label='Visual (Normal)', markeredgecolor='black'),
+                                    Line2D([0], [0], marker='*', color='w', markerfacecolor='gray', markersize=14, 
+                                           label='Visual (Anomaly)', markeredgecolor='black')
+                                ]
+                                ax2.legend(handles=pv_legend, loc='upper right', fontsize=9)
+                                ax2.set_title(f"Prompt-Visual Alignment (color=class)", fontsize=12)
                                 ax2.set_xlabel("Dim 1")
                                 ax2.set_ylabel("Dim 2")
                                 
@@ -2433,32 +2494,49 @@ def main(args: argparse.Namespace):
                                 n_bg_val = is_background.sum().item()
                                 n_anom_val = (~is_background).sum().item()
                                 
-                                stats_text = f"""Epoch {epoch+1} Statistics                                    
-    Alignment Loss:
-      align_loss: {align_loss.item():.4f}
-      query_align: {query_align_loss.item():.4f}
-
-    Similarity Stats:
-      pos_sim (same group): {pos_sim_val:.4f}
-      neg_sim (diff group): {neg_sim_val:.4f}
-      separation: {pos_sim_val - neg_sim_val:.4f}
-
-    Sample Distribution:
-      Normal: {n_bg_val}
-      Anomaly: {n_anom_val}
-      Total: {B}
-
-    Prompt-Visual Sim:
-      Mean: {diag_sim.mean():.4f}
-      Std: {diag_sim.std():.4f}"""
+                                # 计算类别分布
+                                class_dist = {}
+                                for cls, anom in zip(class_names_sample, is_anomaly_sample):
+                                    if cls not in class_dist:
+                                        class_dist[cls] = {'normal': 0, 'anomaly': 0}
+                                    if anom:
+                                        class_dist[cls]['anomaly'] += 1
+                                    else:
+                                        class_dist[cls]['normal'] += 1
                                 
-                                ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=10,
+                                class_dist_str = "\n".join([f"    {cls}: N={v['normal']}, A={v['anomaly']}" 
+                                                           for cls, v in sorted(class_dist.items())])
+                                
+                                stats_text = f"""Epoch {epoch+1} Statistics
+                                
+Alignment Loss:
+  align_loss: {align_loss.item():.4f}
+  query_align: {query_align_loss.item():.4f}
+
+Similarity Stats:
+  pos_sim (same group): {pos_sim_val:.4f}
+  neg_sim (diff group): {neg_sim_val:.4f}
+  separation: {pos_sim_val - neg_sim_val:.4f}
+
+Sample Distribution (batch):
+  Normal: {n_bg_val}
+  Anomaly: {n_anom_val}
+  Total: {B}
+
+Class Distribution (sampled):
+{class_dist_str}
+
+Prompt-Visual Sim:
+  Mean: {diag_sim.mean():.4f}
+  Std: {diag_sim.std():.4f}"""
+                                
+                                ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=9,
                                         verticalalignment='top', fontfamily='monospace',
                                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
                                 ax4.axis('off')
                                 ax4.set_title("Training Statistics", fontsize=12)
                                 
-                                plt.suptitle(f"t-SNE Visualization - Epoch {epoch+1}", fontsize=14, fontweight='bold')
+                                plt.suptitle(f"t-SNE Visualization - Epoch {epoch+1} (●=Normal, ★=Anomaly)", fontsize=14, fontweight='bold')
                                 plt.tight_layout()
                                 
                                 tsne_out_dir = os.path.join(log_dir, "tsne")
