@@ -672,3 +672,338 @@ class AveragedPromptLearner(nn.Module):
         projected = self.proj(prompt_batch) if self.proj is not None else prompt_batch
         prompt_mask = torch.zeros((projected.shape[0], projected.shape[1]), dtype=torch.bool, device=projected.device)
         return projected.transpose(0, 1), prompt_mask
+
+
+# ================================================================================
+# 方案C：置信度融合头 (Confidence Fusion Head)
+# 融合 presence_logit, iou_pred, filo_conf -> final_conf
+# ================================================================================
+
+class ConfidenceFusionHead(nn.Module):
+    """
+    置信度融合头：学习如何融合SAM3的presence/iou和FiLo的置信度
+    
+    输入：
+        - presence_logit: (B, Q) 或 (B, Q, 1)
+        - iou_pred: (B, Q) 或 (B, Q, 1)
+        - filo_conf: (B,) 或 (B, 1) - FiLo异常图的最大响应
+        
+    输出：
+        - final_conf: (B, Q) 融合后的置信度
+    """
+    
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__()
+        
+        # 输入: presence(1) + iou(1) + filo(1) = 3
+        self.input_dim = 3
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),  # 输出单个置信度值
+        )
+        
+        # 可学习的融合权重（作为backup/residual）
+        self.alpha = nn.Parameter(torch.tensor([0.4, 0.3, 0.3]))  # presence, iou, filo
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(
+        self,
+        presence_logit: torch.Tensor,
+        iou_pred: torch.Tensor,
+        filo_conf: torch.Tensor,
+        return_weights: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            presence_logit: 各种可能形状 - (B, Q), (B, Q, 1), (B, 1), (B,) 等
+            iou_pred: 各种可能形状 - (B, Q), (B, Q, 1), (B, 1), (B,) 等
+            filo_conf: (B,) 或 (B, 1) - FiLo置信度
+            
+        Returns:
+            final_conf: (B, Q) 融合后的置信度（logits）
+        """
+        # 获取batch size
+        B = presence_logit.shape[0]
+        
+        # 处理 iou_pred 的形状，确定 Q
+        if iou_pred.dim() == 3:
+            iou_pred = iou_pred.squeeze(-1)  # (B, Q, 1) -> (B, Q)
+        elif iou_pred.dim() == 1:
+            iou_pred = iou_pred.unsqueeze(-1)  # (B,) -> (B, 1)
+        
+        Q = iou_pred.shape[1] if iou_pred.dim() == 2 else 1
+        
+        # 处理 presence_logit 的形状
+        if presence_logit.dim() == 3:
+            presence_logit = presence_logit.squeeze(-1)  # (B, Q, 1) -> (B, Q)
+        elif presence_logit.dim() == 1:
+            presence_logit = presence_logit.unsqueeze(-1)  # (B,) -> (B, 1)
+        
+        # 如果 presence_logit 是 (B, 1) 但 iou_pred 是 (B, Q)，需要扩展
+        if presence_logit.shape[1] == 1 and Q > 1:
+            presence_logit = presence_logit.expand(B, Q)  # (B, 1) -> (B, Q)
+        
+        # 如果 iou_pred 是 (B, 1) 但需要 Q 更大
+        if iou_pred.shape[1] == 1 and presence_logit.shape[1] > 1:
+            Q = presence_logit.shape[1]
+            iou_pred = iou_pred.expand(B, Q)
+        
+        # 处理 filo_conf
+        if filo_conf.dim() == 1:
+            filo_conf = filo_conf.unsqueeze(-1)  # (B,) -> (B, 1)
+        
+        # 确保 Q 一致
+        Q = max(presence_logit.shape[1], iou_pred.shape[1])
+        
+        # 将presence和iou转为概率
+        presence_prob = torch.sigmoid(presence_logit)  # (B, Q) 或 (B, 1)
+        iou_prob = torch.sigmoid(iou_pred) if iou_pred.max() > 1.0 else iou_pred  # (B, Q) 或 (B, 1)
+        
+        # 扩展到相同形状
+        if presence_prob.shape[1] < Q:
+            presence_prob = presence_prob.expand(B, Q)
+        if iou_prob.shape[1] < Q:
+            iou_prob = iou_prob.expand(B, Q)
+        
+        # 扩展filo_conf到所有query
+        filo_expanded = filo_conf.expand(B, Q)  # (B, 1) -> (B, Q)
+        
+        # 拼接输入: (B, Q, 3)
+        fusion_input = torch.stack([presence_prob, iou_prob, filo_expanded], dim=-1)
+        
+        # MLP融合
+        mlp_out = self.mlp(fusion_input).squeeze(-1)  # (B, Q)
+        
+        # 加权平均作为残差
+        alpha_normalized = F.softmax(self.alpha, dim=0)
+        weighted_avg = (
+            alpha_normalized[0] * presence_prob +
+            alpha_normalized[1] * iou_prob +
+            alpha_normalized[2] * filo_expanded
+        )
+        
+        # 最终输出 = MLP输出 + 残差
+        final_conf = mlp_out + 0.1 * weighted_avg
+        
+        if return_weights:
+            return final_conf, alpha_normalized
+        return final_conf
+
+
+# ================================================================================
+# 方案B：FiLo到Decoder的适配器 (FiLo-to-Decoder Adapter)
+# 把FiLo特征编码成decoder可用的memory
+# ================================================================================
+
+class FiLoDecoderAdapter(nn.Module):
+    """
+    FiLo到Decoder的适配器：把FiLo的patch_tokens转换为decoder的额外memory
+    
+    方式1: 作为额外的memory tokens（扩展memory）
+    方式2: 作为query的bias/conditioning
+    方式3: 通过cross-attention融合到memory
+    """
+    
+    def __init__(
+        self,
+        filo_dim: int = 768,           # FiLo输出维度
+        decoder_dim: int = 256,        # Decoder hidden dim
+        num_filo_tokens: int = 64,     # 压缩后的FiLo token数量
+        mode: str = "memory",          # "memory", "query_bias", "cross_attn"
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.mode = mode
+        self.num_filo_tokens = num_filo_tokens
+        self.decoder_dim = decoder_dim
+        
+        # FiLo特征投影
+        self.filo_proj = nn.Sequential(
+            nn.Linear(filo_dim, decoder_dim),
+            nn.LayerNorm(decoder_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        
+        if mode == "memory":
+            # 用于压缩FiLo tokens的可学习query
+            self.compress_queries = nn.Parameter(
+                torch.randn(num_filo_tokens, decoder_dim) * 0.02
+            )
+            self.compress_attn = nn.MultiheadAttention(
+                embed_dim=decoder_dim,
+                num_heads=8,
+                dropout=dropout,
+                batch_first=False,
+            )
+            
+        elif mode == "query_bias":
+            # 把FiLo特征编码成query的bias
+            self.bias_mlp = nn.Sequential(
+                nn.Linear(decoder_dim, decoder_dim),
+                nn.LayerNorm(decoder_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(decoder_dim, decoder_dim),
+            )
+            
+        elif mode == "cross_attn":
+            # 用于和memory做cross-attention
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=decoder_dim,
+                num_heads=8,
+                dropout=dropout,
+                batch_first=False,
+            )
+            self.cross_norm = nn.LayerNorm(decoder_dim)
+    
+    def forward(
+        self,
+        filo_tokens: torch.Tensor,      # (B, N_filo, D_filo)
+        memory: Optional[torch.Tensor] = None,  # (N_mem, B, D_dec) for cross_attn mode
+        query: Optional[torch.Tensor] = None,   # (Q, B, D_dec) for query_bias mode
+    ) -> dict:
+        """
+        Returns:
+            dict with keys depending on mode:
+            - "memory": extra_memory (num_filo_tokens, B, D_dec)
+            - "query_bias": query_bias (Q, B, D_dec)
+            - "cross_attn": enhanced_memory (N_mem, B, D_dec)
+        """
+        B = filo_tokens.shape[0]
+        
+        # 投影FiLo特征
+        filo_proj = self.filo_proj(filo_tokens)  # (B, N_filo, D_dec)
+        filo_proj = filo_proj.permute(1, 0, 2)   # (N_filo, B, D_dec)
+        
+        result = {}
+        
+        if self.mode == "memory":
+            # 用可学习query压缩FiLo tokens
+            queries = self.compress_queries.unsqueeze(1).expand(-1, B, -1)  # (num_tokens, B, D)
+            compressed, _ = self.compress_attn(
+                query=queries,
+                key=filo_proj,
+                value=filo_proj,
+            )  # (num_tokens, B, D)
+            result["extra_memory"] = compressed
+            
+        elif self.mode == "query_bias":
+            # 对FiLo特征做平均池化，然后生成bias
+            filo_pooled = filo_proj.mean(dim=0)  # (B, D)
+            bias = self.bias_mlp(filo_pooled)    # (B, D)
+            # 扩展到所有query
+            if query is not None:
+                Q = query.shape[0]
+                result["query_bias"] = bias.unsqueeze(0).expand(Q, -1, -1)  # (Q, B, D)
+            else:
+                result["query_bias"] = bias
+                
+        elif self.mode == "cross_attn":
+            # 和memory做cross-attention
+            if memory is not None:
+                enhanced, _ = self.cross_attn(
+                    query=memory,
+                    key=filo_proj,
+                    value=filo_proj,
+                )
+                result["enhanced_memory"] = self.cross_norm(memory + enhanced)
+            else:
+                result["enhanced_memory"] = None
+        
+        # 同时返回投影后的FiLo特征
+        result["filo_proj"] = filo_proj
+        
+        return result
+
+
+# ================================================================================
+# FiLo异常图编码器（用于方案B的变体）
+# 把2D anomaly_map编码成memory tokens
+# ================================================================================
+
+class FiLoMapEncoder(nn.Module):
+    """
+    把FiLo的anomaly_map (B, 2, H, W) 编码成memory tokens
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 2,          # normal + abnormal
+        hidden_dim: int = 256,
+        num_tokens: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        # 轻量级CNN编码器
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, hidden_dim, 3, stride=2, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 可学习query用于token化
+        self.queries = nn.Parameter(torch.randn(num_tokens, hidden_dim) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=8,
+            dropout=dropout,
+            batch_first=False,
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.num_tokens = num_tokens
+    
+    def forward(self, anomaly_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            anomaly_map: (B, 2, H, W)
+            
+        Returns:
+            tokens: (num_tokens, B, hidden_dim)
+        """
+        B = anomaly_map.shape[0]
+        
+        # CNN编码
+        features = self.encoder(anomaly_map)  # (B, hidden_dim, H', W')
+        H, W = features.shape[-2:]
+        
+        # Flatten并转置
+        features = features.flatten(2).permute(2, 0, 1)  # (H'*W', B, hidden_dim)
+        
+        # 用可学习query做cross-attention
+        queries = self.queries.unsqueeze(1).expand(-1, B, -1)  # (num_tokens, B, hidden_dim)
+        tokens, _ = self.cross_attn(
+            query=queries,
+            key=features,
+            value=features,
+        )
+        tokens = self.norm(tokens)
+        
+        return tokens

@@ -722,12 +722,18 @@ def _to_prob(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 def _forward_once(model, images: torch.Tensor, prompt_lists: List[List[str]], class_names: List[str],
                   masks_size: Tuple[int,int], device: torch.device, upsample: bool = True,
-                  is_anomaly: Optional[torch.Tensor] = None):
+                  is_anomaly: Optional[torch.Tensor] = None,
+                  use_filo_output: bool = False, 
+                  filo_mask_alpha: float = 0.0,
+                  filo_conf_alpha: float = 0.0):
     """Run one forward pass and return (pred_masks_prob[B,Q,H,W], query_scores[B,Q], raw_out).
     
     Args:
         is_anomaly: Optional tensor of shape (B,) indicating which samples are anomalies.
                    If None and TIE in_forward mode is used, TIE translation is applied uniformly.
+        use_filo_output: 是否使用FiLo的anomaly_map输出
+        filo_mask_alpha: FiLo mask与SAM3 mask的融合比例 (0=纯SAM3, 1=纯FiLo)
+        filo_conf_alpha: FiLo置信度与原始置信度的融合比例 (0=纯原始, 1=纯FiLo)
     """
     # 如果模型使用 TIE in_forward 模式，设置 is_anomaly
     # 检查是否有 SegmentationHeadWithTIE 包装
@@ -748,6 +754,8 @@ def _forward_once(model, images: torch.Tensor, prompt_lists: List[List[str]], cl
         pred_masks = F.interpolate(pred_masks, size=masks_size, mode="bilinear", align_corners=False)
 
     B, Q = pred_masks.shape[0], pred_masks.shape[1]
+    
+    # 先计算原始query_scores（用于选择最可信的query）
     presence_bq = _normalize_bq(out.get("presence_logit", None), B, Q, device=device)
     iou_bq = _normalize_bq(out.get("iou_predictions", None), B, Q, device=device)
     presence_prob = _to_prob(presence_bq)
@@ -761,6 +769,76 @@ def _forward_once(model, images: torch.Tensor, prompt_lists: List[List[str]], cl
         query_scores = iou_prob
     else:
         query_scores = None
+    
+    # ===== 方案C: 使用fused_conf替代query_scores =====
+    fused_conf = out.get("fused_conf", None)
+    if fused_conf is not None:
+        # fused_conf是融合后的置信度 (B, Q)，已经是logits
+        fused_prob = torch.sigmoid(fused_conf)
+        query_scores = fused_prob
+    
+    # ===== FiLo输出融合（修复版：只融合最可信的query）=====
+    filo_map_single = None  # (B, 1, H, W) FiLo的单通道异常图
+    
+    if use_filo_output and (filo_mask_alpha > 0 or filo_conf_alpha > 0):
+        filo_maps = out.get("filo_anomaly_maps", [])
+        filo_agg = out.get("filo_aggregated_map", None)
+        
+        if filo_agg is not None:
+            # filo_agg: (B, 2, H, W) - [normal, abnormal]
+            filo_map_single = filo_agg[:, 1:2, :, :]  # (B, 1, H, W)
+        elif len(filo_maps) > 0:
+            filo_map_single = filo_maps[-1][:, 1:2, :, :]  # (B, 1, H, W)
+        
+        if filo_map_single is not None:
+            # 检查FiLo输出是否在0-1范围（softmax概率）
+            filo_min = filo_map_single.min().item()
+            filo_max = filo_map_single.max().item()
+            if filo_min < -0.01 or filo_max > 1.01:
+                # 不是概率，需要sigmoid
+                filo_map_single = torch.sigmoid(filo_map_single)
+            
+            # 上采样到pred_masks的尺寸（不是masks_size）
+            # 关键修复：确保filo_map和pred_masks尺寸一致
+            pred_mask_size = pred_masks.shape[-2:]  # 当前pred_masks的尺寸
+            if filo_map_single.shape[-2:] != pred_mask_size:
+                filo_map_single = F.interpolate(
+                    filo_map_single, size=pred_mask_size, 
+                    mode="bilinear", align_corners=False
+                )
+            
+            # ===== 风险1修复：只对最可信的query做融合 =====
+            if filo_mask_alpha > 0:
+                for b in range(B):
+                    # 找到该图最可信的query
+                    if query_scores is not None:
+                        q_star = query_scores[b].argmax().item()
+                    else:
+                        # 没有置信度时，用mask面积最大的query
+                        q_star = pred_masks[b].sum(dim=(1, 2)).argmax().item()
+                    
+                    # 只对q_star做融合
+                    filo_b = filo_map_single[b, 0]  # (H, W)
+                    sam3_b = pred_masks[b, q_star]  # (H, W)
+                    
+                    if filo_mask_alpha >= 1.0:
+                        pred_masks[b, q_star] = filo_b
+                    else:
+                        pred_masks[b, q_star] = (1 - filo_mask_alpha) * sam3_b + filo_mask_alpha * filo_b
+            
+            # ===== 风险3修复：置信度融合独立控制 =====
+            if filo_conf_alpha > 0 and query_scores is not None:
+                # FiLo置信度：每张图的abnormal响应最大值
+                filo_conf_per_image = filo_map_single.view(B, -1).max(dim=-1)[0]  # (B,)
+                
+                for b in range(B):
+                    # 找到最可信的query，只调整它的置信度
+                    q_star = query_scores[b].argmax().item()
+                    orig_conf = query_scores[b, q_star]
+                    filo_conf = filo_conf_per_image[b]
+                    
+                    # 融合置信度
+                    query_scores[b, q_star] = (1 - filo_conf_alpha) * orig_conf + filo_conf_alpha * filo_conf
 
     return pred_masks, query_scores, out
 
@@ -858,6 +936,25 @@ def load_model(args, device: torch.device):
         "use_keywords": getattr(args, "use_keywords", False),
         "cocoop_vis_dim": getattr(args, "cocoop_vis_dim", 256),
         "cocoop_reduction": getattr(args, "cocoop_reduction", 16),
+        # VV Attention 参数
+        "enable_vv_attention": getattr(args, "enable_vv_attention", False),
+        "vv_num_heads": getattr(args, "vv_num_heads", 8),
+        "vv_dropout": getattr(args, "vv_dropout", 0.1),
+        # FiLo 参数
+        "enable_filo": getattr(args, "enable_filo", False),
+        "filo_dim_out": getattr(args, "filo_dim_out", 768),
+        "filo_k_linear": getattr(args, "filo_k_linear", 4),
+        "filo_k_cov": getattr(args, "filo_k_cov", 4),
+        "filo_image_size": getattr(args, "filo_image_size", 518),
+        "filo_use_alternating": getattr(args, "filo_use_alternating", True),
+        "num_feature_levels": getattr(args, "num_feature_levels", 4),
+        # 方案B: FiLo到Decoder回灌
+        "filo_to_decoder": getattr(args, "filo_to_decoder", False),
+        "filo_decoder_mode": getattr(args, "filo_decoder_mode", "memory"),
+        "filo_decoder_tokens": getattr(args, "filo_decoder_tokens", 64),
+        # 方案C: 置信度融合头
+        "enable_conf_fusion_head": getattr(args, "enable_conf_fusion_head", False),
+        "conf_fusion_hidden_dim": getattr(args, "conf_fusion_hidden_dim", 64),
     })
     model = Constructor(**ctor_kwargs).to(device).eval()
 
@@ -1081,10 +1178,17 @@ def run_inference(args):
         # 注意：在实际部署中可能没有 ground truth，此时传 None 让 TIE 均匀应用
         is_anomaly_tensor = torch.tensor(is_anomaly, dtype=torch.bool, device=device) if is_anomaly is not None else None
         
+        # FiLo输出配置（拆分成mask和conf两个独立alpha）
+        use_filo_output = getattr(args, "use_filo_output", False)
+        filo_mask_alpha = getattr(args, "filo_mask_alpha", 0.0)
+        filo_conf_alpha = getattr(args, "filo_conf_alpha", 0.0)
+        
         if custom_prompt:
             pred_masks_1, query_scores_1, _ = _forward_once(
                 model, images, prompt_lists, class_names, masks_size=masks.shape[-2:], device=device,
-                is_anomaly=is_anomaly_tensor
+                is_anomaly=is_anomaly_tensor,
+                use_filo_output=use_filo_output, 
+                filo_mask_alpha=filo_mask_alpha, filo_conf_alpha=filo_conf_alpha
             )
             pred_masks_2, query_scores_2 = None, None
         else:
@@ -1113,11 +1217,15 @@ def run_inference(args):
             # 推理：分别用 anomaly prompt 和 normal prompt 跑一遍
             pred_masks_1, query_scores_1, _ = _forward_once(
                 model, images, anomaly_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
-                is_anomaly=is_anomaly_tensor
+                is_anomaly=is_anomaly_tensor,
+                use_filo_output=use_filo_output, 
+                filo_mask_alpha=filo_mask_alpha, filo_conf_alpha=filo_conf_alpha
             )
             pred_masks_2, query_scores_2, _ = _forward_once(
                 model, images, normal_lists, class_names, masks_size=masks.shape[-2:], device=device, upsample=False,
-                is_anomaly=is_anomaly_tensor
+                is_anomaly=is_anomaly_tensor,
+                use_filo_output=use_filo_output, 
+                filo_mask_alpha=filo_mask_alpha, filo_conf_alpha=filo_conf_alpha
             )
 
         if device.type == "cuda":
@@ -1497,6 +1605,53 @@ if __name__ == "__main__":
     parser.add_argument("--no_tie_adaptive_scale", action="store_true", default=False,
                         help="显式禁用 TIE 自适应缩放")
     # ==================== End TIE 参数 ====================
+    
+    # ==================== VV Attention & FiLo 参数 ====================
+    parser.add_argument("--enable_vv_attention", action="store_true",
+                        help="启用 VV Attention 模块")
+    parser.add_argument("--vv_num_heads", type=int, default=8,
+                        help="VV Attention 的头数")
+    parser.add_argument("--vv_dropout", type=float, default=0.1,
+                        help="VV Attention 的 dropout")
+    
+    parser.add_argument("--enable_filo", action="store_true",
+                        help="启用 FiLo 模块（官方6路卷积实现）")
+    parser.add_argument("--filo_dim_out", type=int, default=768,
+                        help="FiLo 输出维度")
+    parser.add_argument("--filo_k_linear", type=int, default=4,
+                        help="FiLo LinearLayer 层数")
+    parser.add_argument("--filo_k_cov", type=int, default=4,
+                        help="FiLo CovLayer 层数")
+    parser.add_argument("--filo_image_size", type=int, default=518,
+                        help="FiLo 输出图像尺寸")
+    parser.add_argument("--filo_use_alternating", action="store_true", default=True,
+                        help="FiLo 使用交替分配（偶数层->QKV，奇数层->VV）")
+    parser.add_argument("--num_feature_levels", type=int, default=4,
+                        help="使用的 FPN 特征层数")
+    
+    # FiLo输出融合参数（独立控制mask和置信度）
+    parser.add_argument("--use_filo_output", action="store_true",
+                        help="使用FiLo的anomaly_map输出进行推理")
+    parser.add_argument("--filo_mask_alpha", type=float, default=0.0,
+                        help="FiLo mask与SAM3 mask的融合比例 (0=纯SAM3, 1=纯FiLo)。只对最可信query生效。")
+    parser.add_argument("--filo_conf_alpha", type=float, default=0.0,
+                        help="FiLo置信度与原始置信度的融合比例 (0=纯原始, 1=纯FiLo)。只对最可信query生效。")
+    
+    # 方案B: FiLo到Decoder回灌
+    parser.add_argument("--filo_to_decoder", action="store_true",
+                        help="启用FiLo特征到Decoder的回灌")
+    parser.add_argument("--filo_decoder_mode", type=str, default="memory",
+                        choices=["memory", "query_bias", "cross_attn"],
+                        help="FiLo到Decoder的回灌模式")
+    parser.add_argument("--filo_decoder_tokens", type=int, default=64,
+                        help="FiLo压缩后的token数量")
+    
+    # 方案C: 置信度融合头
+    parser.add_argument("--enable_conf_fusion_head", action="store_true",
+                        help="启用置信度融合头")
+    parser.add_argument("--conf_fusion_hidden_dim", type=int, default=64,
+                        help="置信度融合头的隐藏维度")
+    # ==================== End VV & FiLo 参数 ====================
 
     args = parser.parse_args()
     run_inference(args)

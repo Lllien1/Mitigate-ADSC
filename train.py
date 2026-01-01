@@ -33,7 +33,48 @@ from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
 import json
+import io
 
+# ==================== 新增：模型架构打印 ====================
+def _print_model_tree(model, name="model", filter_key="", file_handle=None, also_stdout=True):
+    """
+    Print model structure to stdout and/or file.
+    - file_handle: an opened file object (text mode) or None
+    - also_stdout: if True, print to terminal as well
+    """
+    buf = io.StringIO()
+
+    def _w(s=""):
+        buf.write(str(s) + "\n")
+
+    _w("\n" + "=" * 80)
+    _w(f"[PRINT] {name} repr:\n{model}\n")
+
+    _w(f"[PRINT] {name} named children:")
+    for n, m in model.named_children():
+        _w(f"  - {n} => {type(m).__name__}")
+
+    _w(f"\n[PRINT] {name} named modules (filtered='{filter_key}'):")
+    for n, m in model.named_modules():
+        if filter_key and (filter_key not in n):
+            continue
+        _w(f"{n:60s}  {type(m).__name__}")
+
+    _w(f"\n[PRINT] {name} named parameters (filtered='{filter_key}'):")
+    for n, p in model.named_parameters():
+        if filter_key and (filter_key not in n):
+            continue
+        _w(f"{n:80s}  shape={tuple(p.shape)}  trainable={p.requires_grad}")
+
+    _w("=" * 80 + "\n")
+
+    content = buf.getvalue()
+    if file_handle is not None:
+        file_handle.write(content)
+        file_handle.flush()
+
+    if also_stdout:
+        print(content, end="")
 
 # ==================== 新增：学习率调度器 ====================
 
@@ -758,6 +799,185 @@ def query_text_alignment_loss(
     
     return loss
 
+
+def query_text_alignment_loss_v2(
+    decoder_hs: torch.Tensor,       # (B, Q, D)
+    prompt_proto: torch.Tensor,     # (B, D) - 异常prompt
+    prompt_proto_normal: torch.Tensor,  # (B, D) - 正常prompt（可选，可为None）
+    indices: list,                  # matcher输出
+    pred_masks: torch.Tensor,       # (B, Q, H, W) - 预测的masks
+    gt_masks: torch.Tensor,         # (B, H, W) 或 (B, 1, H, W) - GT masks
+    is_anomaly: list,               # 每张图是否是异常
+    temp: float = 0.2,
+    top_k: int = 64,
+    use_soft_target: bool = True,   # 修复1：使用软标签
+    include_normal: bool = True,    # 修复2：normal图参与
+    normal_margin: float = 0.3,     # normal图的margin
+    use_full_softmax_ratio: float = 0.2,  # 修复3：前20%步用full softmax
+    current_step_ratio: float = 1.0,      # 当前步数占总步数的比例
+):
+    """
+    改进版 Query-Text Alignment Loss (v2) - 修复版
+    
+    关键修复：soft_target 使用 "matcher硬标签 + IoU软修正" 混合方式
+    - 保证 matched query 至少有 base_weight (70%) 的权重
+    - IoU 只作为额外的加权，不会导致均匀分布
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    # 归一化
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    p_norm = F.normalize(prompt_proto, dim=-1)
+    
+    # 如果有normal prompt
+    if prompt_proto_normal is not None:
+        p_norm_normal = F.normalize(prompt_proto_normal, dim=-1)
+    else:
+        p_norm_normal = None
+    
+    # 修复3：根据当前步数决定是否用full softmax
+    use_full_softmax = (current_step_ratio < use_full_softmax_ratio)
+    
+    loss_anomaly = torch.tensor(0.0, device=device)
+    loss_normal = torch.tensor(0.0, device=device)
+    valid_anomaly = 0
+    valid_normal = 0
+    
+    # 处理gt_masks形状
+    if gt_masks is not None and gt_masks.dim() == 4:
+        gt_masks = gt_masks.squeeze(1)  # (B, H, W)
+    
+    for b in range(B):
+        src_q, tgt_q = indices[b]
+        
+        # 计算所有query与异常prompt的相似度
+        all_sim = (hs_norm[b] @ p_norm[b]) / temp  # (Q,)
+        
+        if is_anomaly[b] and src_q.numel() > 0:
+            # ===== 异常图：获取matched query index =====
+            matched_q_idx = int(src_q[0].item())
+            if matched_q_idx >= Q:
+                continue
+            
+            # 决定用哪些query参与竞争
+            if use_full_softmax or Q <= top_k:
+                # 全量softmax
+                effective_indices = torch.arange(Q, device=device)
+                sim_selected = all_sim
+                target_idx_in_selected = torch.tensor([matched_q_idx], device=device)
+            else:
+                # top-k采样
+                effective_k = min(top_k, Q)
+                _, top_indices = torch.topk(all_sim.detach(), k=effective_k)
+                
+                # 确保 matched query 在 top_k 中
+                if matched_q_idx not in top_indices:
+                    top_indices = torch.cat([
+                        torch.tensor([matched_q_idx], device=device),
+                        top_indices[:-1]
+                    ])
+                
+                effective_indices = top_indices
+                sim_selected = all_sim[top_indices]
+                target_idx_in_selected = (top_indices == matched_q_idx).nonzero(as_tuple=True)[0]
+            
+            num_selected = len(effective_indices)
+            
+            # ===== 计算 loss =====
+            if use_soft_target and pred_masks is not None and gt_masks is not None:
+                # 混合方式：matcher硬标签 + IoU软修正
+                pm_b = pred_masks[b]  # (Q, H, W)
+                gt_b = gt_masks[b]    # (H, W)
+                
+                # 确保尺寸匹配
+                if pm_b.shape[-2:] != gt_b.shape[-2:]:
+                    gt_b_resized = F.interpolate(
+                        gt_b.unsqueeze(0).unsqueeze(0).float(),
+                        size=pm_b.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(0).squeeze(0)
+                else:
+                    gt_b_resized = gt_b.float()
+                
+                # 计算所有query的IoU
+                pm_b_prob = torch.sigmoid(pm_b) if pm_b.min() < 0 else pm_b
+                pm_b_binary = (pm_b_prob > 0.5).float()
+                intersection = (pm_b_binary * gt_b_resized).sum(dim=(1, 2))
+                union = pm_b_binary.sum(dim=(1, 2)) + gt_b_resized.sum() - intersection
+                iou_scores = intersection / (union + 1e-6)  # (Q,)
+                
+                # 只取 selected indices 的 IoU
+                iou_selected = iou_scores[effective_indices]  # (K,) or (Q,)
+                
+                # 关键修复：混合 soft target
+                # 基础权重：matched query 至少占 70%
+                base_weight = 0.7
+                
+                # 初始化 soft_target：所有 query 给一点点基础权重
+                soft_target = torch.full((num_selected,), (1 - base_weight) / num_selected, device=device)
+                # matched query 给 base_weight
+                soft_target[target_idx_in_selected] = base_weight
+                
+                # IoU 修正：如果有其他高 IoU 的 query，给它们一些额外权重
+                max_iou = iou_selected.max()
+                if max_iou > 0.1:  # 只有当有query的IoU > 0.1时才修正
+                    # 找到IoU > 0.1的queries
+                    high_iou_mask = iou_selected > 0.1
+                    if high_iou_mask.sum() > 0:
+                        # 重新分配 (1-base_weight) 的权重给高IoU queries
+                        iou_weights = iou_selected * high_iou_mask.float()
+                        iou_weights = iou_weights / (iou_weights.sum() + 1e-6) * (1 - base_weight)
+                        soft_target = torch.zeros_like(soft_target)
+                        soft_target[target_idx_in_selected] = base_weight
+                        soft_target = soft_target + iou_weights
+                
+                # 归一化确保和为1
+                soft_target = soft_target / (soft_target.sum() + 1e-6)
+                
+                # 计算 KL 散度 loss
+                log_probs = F.log_softmax(sim_selected, dim=0)
+                loss_b = -(soft_target * log_probs).sum()
+            else:
+                # 纯硬标签方式
+                loss_b = F.cross_entropy(sim_selected.unsqueeze(0), target_idx_in_selected.view(1))
+            
+            loss_anomaly = loss_anomaly + loss_b
+            valid_anomaly += 1
+        
+        elif include_normal and not is_anomaly[b]:
+            # ===== 修复2：Normal图也参与（直接惩罚高相似度）=====
+            # 目标：normal图中的所有query不应该与异常prompt太相似
+            max_sim_to_abnormal = all_sim.max()
+            
+            if p_norm_normal is not None:
+                # 有normal prompt时：query应更接近normal prompt
+                sim_to_normal = (hs_norm[b] @ p_norm_normal[b]) / temp
+                max_sim_to_normal = sim_to_normal.max()
+                margin_loss = F.relu(max_sim_to_abnormal - max_sim_to_normal + normal_margin)
+            else:
+                # 没有normal prompt时：直接惩罚与异常prompt的高相似度
+                # 目标：让 max_sim_to_abnormal 低于某个阈值（比如 0）
+                # 使用 soft hinge: 当 max_sim > -margin 时产生惩罚
+                margin_loss = F.relu(max_sim_to_abnormal + normal_margin)
+                # 或者更aggressive: 让整体相似度分布更平坦
+                # sim_var = all_sim.var()  # 方差越小越均匀
+                # margin_loss = F.relu(max_sim_to_abnormal) + 0.1 * sim_var
+            
+            loss_normal = loss_normal + margin_loss
+            valid_normal += 1
+    
+    # 合并损失
+    total_loss = torch.tensor(0.0, device=device)
+    
+    if valid_anomaly > 0:
+        total_loss = total_loss + loss_anomaly / valid_anomaly
+    
+    if valid_normal > 0:
+        total_loss = total_loss + 0.5 * loss_normal / valid_normal
+    
+    return total_loss
+
 def compute_visual_embedding_with_background(
     decoder_features,    # (B, C, H, W) 或 (B, Q, D)
     masks: torch.Tensor, # (B, H, W) GT masks
@@ -821,6 +1041,118 @@ def compute_visual_embedding_with_background(
     
     embeddings = torch.stack(embeddings, dim=0)
     is_background_tensor = torch.tensor(is_background, dtype=torch.bool, device=device)
+    
+    return embeddings, is_background_tensor
+
+
+def pool_prompt_features_sowa_style(
+    prompt_seq: torch.Tensor,
+    prompt_lists: list,
+    is_anomaly: list,
+    device: torch.device
+) -> torch.Tensor:
+    """
+    SOWA风格的prompt特征池化
+    
+    对于每个样本，根据其is_anomaly状态选择对应的prompt feature：
+    - 异常样本：使用abnormal类型的prompt（或所有prompts的mean）
+    - 正常样本：使用normal类型的prompt（或所有prompts的mean）
+    
+    Args:
+        prompt_seq: prompt特征，可能的格式:
+            - (L, B, D): L个层，每层B个样本，D维特征
+            - (B, L, D): B个样本，L个token，D维特征
+            - (B, D): 直接是每个样本的prompt特征
+        prompt_lists: List[str]，每个样本的prompt文本
+        is_anomaly: List[bool]，每个样本是否是异常
+        device: 设备
+    
+    Returns:
+        prompt_proto: (B, D) 每个样本对应的prompt prototype
+    """
+    if prompt_seq is None:
+        return None
+    
+    # 获取最后一层的特征（通常是最有用的）
+    if prompt_seq.dim() == 3:
+        # 可能是 (L, B, D) 或 (B, L, D)
+        if prompt_seq.shape[1] == len(prompt_lists):
+            # (L, B, D) 格式
+            last = prompt_seq[-1]  # (B, D)
+        elif prompt_seq.shape[0] == len(prompt_lists):
+            # (B, L, D) 格式 - 对L维度做mean pooling
+            last = prompt_seq.mean(dim=1)  # (B, D)
+        else:
+            # 不确定格式，取最后一个
+            last = prompt_seq[-1]
+    elif prompt_seq.dim() == 2:
+        last = prompt_seq  # 已经是 (B, D)
+    else:
+        # 其他情况，reshape
+        B = len(prompt_lists)
+        last = prompt_seq.reshape(B, -1)[:, : (prompt_seq.numel() // B)]
+    
+    # 确保是 (B, D) 格式
+    B = len(prompt_lists)
+    if last.shape[0] != B:
+        if last.shape[1] == B:
+            last = last.transpose(0, 1).contiguous()
+        else:
+            last = last.reshape(B, -1)[:, : (last.numel() // B)]
+    
+    return last.to(device)
+
+
+def compute_filo_aligned_features(
+    patch_tokens: torch.Tensor,  # (B, N, D) FiLo的patch tokens
+    masks: torch.Tensor,         # (B, H, W) GT masks
+    is_anomaly: list,            # 每张图是否是异常
+    device
+):
+    """
+    使用FiLo的patch_tokens计算aligned_features，用于align_loss
+    
+    这个函数让FiLo的梯度流入align_loss，使FiLo能够替代LoRA的作用。
+    
+    对于异常图：使用mask区域的patch tokens的加权pooling
+    对于正常图：使用全局average pooling作为背景锚点
+    """
+    B, N, D = patch_tokens.shape
+    H_feat = W_feat = int(N ** 0.5)  # 假设是方形
+    
+    if masks is None:
+        # 没有mask，使用全局pooling
+        embeddings = patch_tokens.mean(dim=1)  # (B, D)
+        is_background = torch.zeros(B, dtype=torch.bool, device=device)
+        return embeddings, is_background
+    
+    # 下采样mask到patch token的空间尺寸
+    masks_ds = F.interpolate(
+        masks.unsqueeze(1).float(),
+        size=(H_feat, W_feat),
+        mode='nearest'
+    ).squeeze(1)  # (B, H_feat, W_feat)
+    masks_flat = masks_ds.view(B, N, 1)  # (B, N, 1)
+    
+    embeddings = []
+    is_background_list = []
+    
+    for b in range(B):
+        if is_anomaly is not None and is_anomaly[b]:
+            # 异常图：mask区域的加权pooling
+            mask_b = masks_flat[b]  # (N, 1)
+            pos_count = mask_b.sum().clamp(min=1.0)
+            emb = (patch_tokens[b] * mask_b).sum(dim=0) / pos_count  # (D,)
+            embeddings.append(emb)
+            is_background_list.append(False)
+        else:
+            # 正常图：全局pooling（背景锚点）
+            emb = patch_tokens[b].mean(dim=0)  # (D,)
+            embeddings.append(emb)
+            is_background_list.append(True)
+    
+    embeddings = torch.stack(embeddings, dim=0)  # (B, D)
+    is_background_tensor = torch.tensor(is_background_list, dtype=torch.bool, device=device)
     
     return embeddings, is_background_tensor
 
@@ -1377,6 +1709,43 @@ def main(args: argparse.Namespace):
     args.class_list = class_list
     # ==============================================================================
 
+    # 解析 selected_levels 参数
+    def _parse_selected_levels(args):
+        """解析stages消融实验配置"""
+        # 预定义的消融配置
+        ABLATION_CONFIGS = {
+            'single_level_0': [0],
+            'single_level_1': [1],
+            'single_level_2': [2],
+            'single_level_3': [3],
+            'levels_0_1': [0, 1],
+            'levels_1_2': [1, 2],
+            'levels_2_3': [2, 3],
+            'levels_0_2': [0, 2],
+            'levels_0_1_2': [0, 1, 2],
+            'levels_1_2_3': [1, 2, 3],
+            'all_levels': [0, 1, 2, 3],
+            'sowa_style': [1, 2, 3],  # SOWA推荐：跳过最高分辨率层
+        }
+        
+        # 优先使用预定义配置
+        if hasattr(args, 'ablation_config') and args.ablation_config:
+            config = ABLATION_CONFIGS.get(args.ablation_config)
+            if config:
+                print(f"[INFO] 使用消融实验配置: {args.ablation_config} -> levels {config}")
+                return config
+        
+        # 其次使用手动指定的层
+        if hasattr(args, 'selected_levels') and args.selected_levels:
+            try:
+                levels = [int(x.strip()) for x in args.selected_levels.split(',')]
+                print(f"[INFO] 手动指定的层级: {levels}")
+                return levels
+            except:
+                pass
+        
+        return None  # 使用默认配置
+
     if args.use_official:
         model = FineTuneSAM3Official(
             bpe_path=args.bpe_path,
@@ -1400,6 +1769,27 @@ def main(args: argparse.Namespace):
             use_keywords=args.use_keywords,
             cocoop_vis_dim=args.cocoop_vis_dim,
             cocoop_reduction=args.cocoop_reduction,
+            # ===== 多尺度特征 & Stages消融 =====
+            num_feature_levels=getattr(args, "num_feature_levels", 1),
+            selected_levels=_parse_selected_levels(args),
+            enable_vv_attention=getattr(args, "enable_vv_attention", False),
+            vv_num_heads=getattr(args, "vv_num_heads", 8),
+            vv_dropout=getattr(args, "vv_dropout", 0.1),
+            # ===== FiLo模块 (6路卷积MMCI) =====
+            enable_filo=getattr(args, "enable_filo", False),
+            filo_dim_out=getattr(args, "filo_dim_out", 768),
+            filo_k_linear=getattr(args, "filo_k_linear", 4),
+            filo_k_cov=getattr(args, "filo_k_cov", 4),
+            filo_image_size=getattr(args, "filo_image_size", 518),
+            filo_use_alternating=getattr(args, "filo_use_alternating", True),
+            # ===== 方案B: FiLo到Decoder回灌 =====
+            filo_to_decoder=getattr(args, "filo_to_decoder", False),
+            filo_decoder_mode=getattr(args, "filo_decoder_mode", "memory"),
+            filo_decoder_tokens=getattr(args, "filo_decoder_tokens", 64),
+            # ===== 方案C: 置信度融合头 =====
+            enable_conf_fusion_head=getattr(args, "enable_conf_fusion_head", False),
+            conf_fusion_hidden_dim=getattr(args, "conf_fusion_hidden_dim", 64),
+            enable_multiscale_output=getattr(args, "enable_multiscale_vis", False),
         )
     else:
         model = FineTuneSAM3(
@@ -1413,6 +1803,49 @@ def main(args: argparse.Namespace):
         )
 
     model.to(device)
+
+    if args.print_backbone:
+        dump_f = None
+        if getattr(args, "print_backbone_to_txt", False):
+            txt_path = getattr(args, "print_backbone_txt_path", "backbone_dump.txt")
+            # 建议放到当前 run 的 save_dir 下（更好管理）
+            # 但此时 save_dir 还没生成的话，就先直接写到工作目录
+            dump_f = open(txt_path, "w", encoding="utf-8")
+            print(f"[INFO] Saving backbone dump to: {txt_path}")
+    
+        also_stdout = not getattr(args, "print_backbone_no_stdout", False)
+    
+        try:
+            _print_model_tree(model, name="FineTuneSAM3Official",
+                              filter_key=args.print_modules_filter,
+                              file_handle=dump_f, also_stdout=also_stdout)
+    
+            if hasattr(model, "backbone"):
+                _print_model_tree(model.backbone, name="model.backbone",
+                                  filter_key=args.print_modules_filter,
+                                  file_handle=dump_f, also_stdout=also_stdout)
+    
+                if hasattr(model.backbone, "vision_backbone"):
+                    _print_model_tree(model.backbone.vision_backbone, name="model.backbone.vision_backbone",
+                                      filter_key=args.print_modules_filter,
+                                      file_handle=dump_f, also_stdout=also_stdout)
+    
+                    if hasattr(model.backbone.vision_backbone, "trunk"):
+                        _print_model_tree(model.backbone.vision_backbone.trunk, name="model.backbone.vision_backbone.trunk",
+                                          filter_key=args.print_modules_filter,
+                                          file_handle=dump_f, also_stdout=also_stdout)
+    
+            if hasattr(model, "transformer"):
+                _print_model_tree(model.transformer, name="model.transformer",
+                                  filter_key=args.print_modules_filter,
+                                  file_handle=dump_f, also_stdout=also_stdout)
+    
+        finally:
+            if dump_f is not None:
+                dump_f.close()
+    
+        raise SystemExit(0)
+
 
     if args.distributed:
         model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
@@ -2118,7 +2551,7 @@ def main(args: argparse.Namespace):
                     loss_dice  = loss_dice  + bg_w * loss_dice_bg
 
                     if step % 50 == 0:
-                        print(f"[BG LOSS] focal_bg={float(loss_focal_bg):.4f} dice_bg={float(loss_dice_bg):.4f} bg_w={bg_w} num_bg_images={num_bg_images}")
+                        print(f"[BG LOSS] focal_bg={loss_focal_bg.detach().item():.4f} dice_bg={loss_dice_bg.detach().item():.4f} bg_w={bg_w} num_bg_images={num_bg_images}")
 
 
                         
@@ -2178,6 +2611,83 @@ def main(args: argparse.Namespace):
                     loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
 
+                # -------------------------
+                # FiLo Anomaly Map Loss (如果启用FiLo)
+                # 使用Focal + Dice Loss监督FiLo的anomaly_map拟合GT mask
+                # -------------------------
+                loss_filo = torch.tensor(0.0, device=device)
+                lambda_filo = getattr(args, 'lambda_filo', 0.0)
+                
+                if lambda_filo > 0.0:
+                    filo_anomaly_maps = out.get("filo_anomaly_maps", [])
+                    filo_agg_map = out.get("filo_aggregated_map", None)
+                    
+                    if filo_agg_map is not None or len(filo_anomaly_maps) > 0:
+                        # 使用聚合的map或最后一层的map
+                        if filo_agg_map is not None:
+                            filo_map = filo_agg_map  # (B, 2, H, W)
+                        else:
+                            # 多层时取最后一层
+                            filo_map = filo_anomaly_maps[-1]  # (B, 2, H, W)
+                        
+                        # filo_map[:, 1] 是abnormal通道，应该拟合GT mask
+                        filo_abnormal = filo_map[:, 1]  # (B, H, W)
+                        
+                        # ===== 风险2修复：检查FiLo输出是否是概率 =====
+                        filo_min = filo_abnormal.min().item()
+                        filo_max = filo_abnormal.max().item()
+                        
+                        if step < 5:
+                            # 前几步打印检查
+                            print(f"[FiLo Check] min={filo_min:.4f}, max={filo_max:.4f}, "
+                                  f"is_prob={(filo_min >= -0.01 and filo_max <= 1.01)}")
+                        
+                        # 如果不是概率（0-1范围），需要sigmoid
+                        if filo_min < -0.01 or filo_max > 1.01:
+                            filo_abnormal = torch.sigmoid(filo_abnormal)
+                            if step < 5:
+                                print(f"[FiLo] Applied sigmoid: now min={filo_abnormal.min():.4f}, max={filo_abnormal.max():.4f}")
+                        
+                        # GT mask
+                        gt_mask = masks  # (B, H, W)
+                        if gt_mask.dim() == 4:
+                            gt_mask = gt_mask.squeeze(1)
+                        
+                        # 确保尺寸匹配
+                        if filo_abnormal.shape[-2:] != gt_mask.shape[-2:]:
+                            filo_abnormal = F.interpolate(
+                                filo_abnormal.unsqueeze(1),
+                                size=gt_mask.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze(1)
+                        
+                        # 在计算BCE时禁用autocast（BCE在autocast下不安全）
+                        with torch.amp.autocast('cuda', enabled=False):
+                            # 转为float32
+                            filo_abnormal_f32 = filo_abnormal.float()
+                            gt_mask_f32 = gt_mask.float()
+                            
+                            # 现在filo_abnormal应该在0-1范围内
+                            filo_abnormal_clamped = filo_abnormal_f32.clamp(1e-6, 1 - 1e-6)
+                            
+                            # Focal-like loss (binary)
+                            pt = torch.where(gt_mask_f32 > 0.5, filo_abnormal_clamped, 1 - filo_abnormal_clamped)
+                            focal_weight = (1 - pt).pow(2.0)  # gamma=2
+                            bce = F.binary_cross_entropy(filo_abnormal_clamped, gt_mask_f32, reduction='none')
+                            loss_filo_focal = (focal_weight * bce).mean()
+                            
+                            # Dice loss
+                            intersection = (filo_abnormal_clamped * gt_mask_f32).sum(dim=(1, 2))
+                            union = filo_abnormal_clamped.sum(dim=(1, 2)) + gt_mask_f32.sum(dim=(1, 2))
+                            dice = (2 * intersection + 1e-6) / (union + 1e-6)
+                            loss_filo_dice = (1 - dice).mean()
+                        
+                        # 组合
+                        loss_filo = 0.5 * loss_filo_focal + 0.5 * loss_filo_dice
+                        
+                        if step % 50 == 0:
+                            print(f"[FiLo Loss] focal={float(loss_filo_focal):.4f} dice={float(loss_filo_dice):.4f} total={float(loss_filo):.4f}")
 
                 # loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
@@ -2225,6 +2735,38 @@ def main(args: argparse.Namespace):
                     # fallback (shouldn't happen because we normalized earlier), keep zero
                     loss_presence = torch.tensor(0.0, device=device)
 
+                # -------------------------
+                # 方案C: 置信度融合头损失
+                # 使用与presence相同的GT监督fused_conf
+                # -------------------------
+                loss_conf_fusion = torch.tensor(0.0, device=device)
+                lambda_conf_fusion = getattr(args, 'lambda_conf_fusion', 0.0)
+                
+                if lambda_conf_fusion > 0.0:
+                    fused_conf = out.get("fused_conf", None)
+                    if fused_conf is not None and pred_logits is not None:
+                        # fused_conf是融合后的置信度 (B, Q)
+                        # 使用与presence相同的target
+                        if presence_targets is not None:
+                            loss_conf_fusion = F.binary_cross_entropy_with_logits(
+                                fused_conf, presence_targets
+                            )
+                        else:
+                            # 构建target
+                            conf_targets = torch.zeros_like(fused_conf, dtype=torch.float32, device=device)
+                            indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
+                            for b in range(images.shape[0]):
+                                src_q, _ = indices_per_image[b]
+                                if src_q.numel() > 0:
+                                    src_q = src_q.to(device).long()
+                                    valid_mask = (src_q >= 0) & (src_q < fused_conf.shape[1])
+                                    src_q = src_q[valid_mask]
+                                    if src_q.numel() > 0:
+                                        conf_targets[b, src_q] = 1.0
+                            loss_conf_fusion = F.binary_cross_entropy_with_logits(fused_conf, conf_targets)
+                        
+                        if step % 50 == 0:
+                            print(f"[ConfFusion Loss] loss={float(loss_conf_fusion):.4f}")
 
                 # -------------------------
                 # 改进的 Contrastive Alignment：
@@ -2237,7 +2779,7 @@ def main(args: argparse.Namespace):
                 query_align_loss = torch.tensor(0.0, device=device)
                 
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
-                    # ===== Step 1: 获取 prompt prototype =====
+                    # ===== Step 1: 获取 prompt prototype (SOWA风格) =====
                     prompt_seq = out.get("prompt_seq", None)
                     if prompt_seq is None:
                         try:
@@ -2246,39 +2788,60 @@ def main(args: argparse.Namespace):
                             print("[WARN] cannot obtain prompt_seq from model_core.prompt_learner:", e)
                             prompt_seq = None
 
-                    prompt_proto = None
-                    if prompt_seq is not None:
-                        last = prompt_seq[-1]
-                        if last.dim() == 2:
-                            if last.shape[0] == B:
-                                prompt_proto = last
-                            elif last.shape[1] == B:
-                                prompt_proto = last.transpose(0, 1).contiguous()
-                            else:
-                                prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
-                        elif last.dim() == 3:
-                            prompt_proto = last if last.shape[0] == B else last[-1]
-                        else:
-                            prompt_proto = last.reshape(B, -1)[:, : (last.numel() // B)]
-
-                    # ===== Step 2: 获取 visual embedding（区分异常/正常）=====
-                    decoder_feat = out.get("decoder_features", None)
-                    if decoder_feat is None:
-                        decoder_feat = out.get("decoder_hs", None)
-                        if decoder_feat is not None and decoder_feat.dim() == 4:
-                            decoder_feat = decoder_feat[-1]
-                        # 确保 decoder_feat 是 (B, Q, D) 格式
-                        if decoder_feat is not None and decoder_feat.dim() == 3:
-                            if decoder_feat.shape[0] == Q and decoder_feat.shape[1] == B:
-                                decoder_feat = decoder_feat.permute(1, 0, 2).contiguous()
-                    
-                    # 使用改进的函数：区分异常/正常样本
-                    visual_embed, is_background = compute_visual_embedding_with_background(
-                        decoder_features=decoder_feat,
-                        masks=masks,
-                        is_anomaly=is_anomaly,  # 从 batch 数据中获取
+                    # 使用SOWA风格的pooling获取prompt_proto
+                    prompt_proto = pool_prompt_features_sowa_style(
+                        prompt_seq=prompt_seq,
+                        prompt_lists=prompt_lists,
+                        is_anomaly=is_anomaly,
                         device=device
                     )
+
+                    # ===== Step 2: 获取 visual embedding（区分异常/正常）=====
+                    # 优先级：FiLo patch_tokens > decoder_features
+                    
+                    # 尝试使用FiLo的patch_tokens（最优先）
+                    filo_qkv = out.get("filo_patch_tokens_qkv", [])
+                    filo_vv = out.get("filo_patch_tokens_vv", [])
+                    
+                    if len(filo_qkv) > 0 or len(filo_vv) > 0:
+                        # 合并所有FiLo patch tokens
+                        all_filo_tokens = filo_qkv + filo_vv
+                        
+                        # 取第一层的tokens用于align（或者可以合并多层）
+                        # patch_tokens: (B, N, 768)
+                        filo_feat = all_filo_tokens[0]  # 使用第一层
+                        
+                        # 使用mask-guided pooling计算aligned_features
+                        visual_embed, is_background = compute_filo_aligned_features(
+                            patch_tokens=filo_feat,
+                            masks=masks,
+                            is_anomaly=is_anomaly,
+                            device=device
+                        )
+                        
+                        if step % 100 == 0:
+                            print(f"[ALIGN] Using FiLo patch_tokens: shape={filo_feat.shape}, "
+                                  f"visual_embed={visual_embed.shape if visual_embed is not None else None}")
+                    
+                    else:
+                        # 回退到 decoder 特征
+                        decoder_feat = out.get("decoder_features", None)
+                        if decoder_feat is None:
+                            decoder_feat = out.get("decoder_hs", None)
+                            if decoder_feat is not None and decoder_feat.dim() == 4:
+                                decoder_feat = decoder_feat[-1]
+                            # 确保 decoder_feat 是 (B, Q, D) 格式
+                            if decoder_feat is not None and decoder_feat.dim() == 3:
+                                if decoder_feat.shape[0] == Q and decoder_feat.shape[1] == B:
+                                    decoder_feat = decoder_feat.permute(1, 0, 2).contiguous()
+                        
+                        # 使用改进的函数：区分异常/正常样本
+                        visual_embed, is_background = compute_visual_embedding_with_background(
+                            decoder_features=decoder_feat,
+                            masks=masks,
+                            is_anomaly=is_anomaly,  # 从 batch 数据中获取
+                            device=device
+                        )
                     
                     if visual_embed is None:
                         visual_embed = torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)
@@ -2329,9 +2892,11 @@ def main(args: argparse.Namespace):
                             margin=align_margin
                         )
                         
-                        # ===== Step 5: Query-level alignment（关键改进）=====
+                        # ===== Step 5: Query-level alignment（v2改进版）=====
                         # current_lambda_query_align 已在 batch 循环开始时初始化（两阶段调度或固定值）
-                        if current_lambda_query_align > 0: # <-- 修改为
+                        use_query_align_v2 = getattr(args, 'use_query_align_v2', True)
+                        
+                        if current_lambda_query_align > 0:
                             decoder_hs = out.get("decoder_hs", None)
                             if decoder_hs is not None:
                                 # 确保 decoder_hs 是 (B, Q, D) 格式
@@ -2340,16 +2905,66 @@ def main(args: argparse.Namespace):
                                 if decoder_hs.dim() == 3:
                                     if decoder_hs.shape[0] == Q and decoder_hs.shape[1] == B:
                                         decoder_hs = decoder_hs.permute(1, 0, 2).contiguous()
-                                # 计算 query-level alignment loss（使用改进的参数）
-                                query_align_loss = query_text_alignment_loss(
-                                    decoder_hs=decoder_hs,
-                                    prompt_proto=prompt_proto,
-                                    indices=indices,
-                                    temp=getattr(args, 'query_align_temp', 0.2),
-                                    top_k=getattr(args, 'query_align_top_k', 64)
-                                )
-                        else: # <-- 添加 else 分支 (可选但推荐)
-                             # 修改点 2: 如果不计算，则创建一个零张量，确保变量存在
+                                
+                                if use_query_align_v2:
+                                    # ===== 使用v2版本（三个关键修复）=====
+                                    # 注意：当前系统只有异常prompt，没有单独的normal prompt
+                                    # 所以 prompt_proto_normal 设为 None，使用简化的 margin loss
+                                    prompt_proto_normal = None  # 不使用，改用直接惩罚
+                                    
+                                    # 获取pred_masks
+                                    pred_masks_for_qa = out.get("pred_masks", None)
+                                    if pred_masks_for_qa is not None and pred_masks_for_qa.dim() == 5:
+                                        pred_masks_for_qa = pred_masks_for_qa[-1]  # 取最后一层
+                                    
+                                    # 构建gt_masks (B, H, W) - 统一使用pred_masks的尺寸
+                                    target_size = pred_masks_for_qa.shape[-2:] if pred_masks_for_qa is not None else (72, 72)
+                                    gt_masks_list = []
+                                    for t in list_targets:
+                                        if t["segments"].numel() > 0:
+                                            seg = t["segments"].sum(dim=0).clamp(0, 1)  # (H, W)
+                                            # 如果尺寸不匹配，进行resize
+                                            if seg.shape[-2:] != target_size:
+                                                seg = F.interpolate(
+                                                    seg.unsqueeze(0).unsqueeze(0).float(),
+                                                    size=target_size, mode='nearest'
+                                                ).squeeze(0).squeeze(0)
+                                            gt_masks_list.append(seg)
+                                        else:
+                                            gt_masks_list.append(torch.zeros(target_size, device=device))
+                                    gt_masks_for_qa = torch.stack(gt_masks_list, dim=0)  # (B, H, W)
+                                    
+                                    # 计算当前步数比例（使用全局step，不是epoch内step）
+                                    total_steps = len(dataloader) * args.epochs
+                                    global_step_for_qa = epoch * len(dataloader) + step
+                                    current_step_ratio = global_step_for_qa / total_steps
+                                    
+                                    query_align_loss = query_text_alignment_loss_v2(
+                                        decoder_hs=decoder_hs,
+                                        prompt_proto=prompt_proto,
+                                        prompt_proto_normal=prompt_proto_normal,
+                                        indices=indices,
+                                        pred_masks=pred_masks_for_qa,
+                                        gt_masks=gt_masks_for_qa,
+                                        is_anomaly=is_anomaly,
+                                        temp=getattr(args, 'query_align_temp', 0.2),
+                                        top_k=getattr(args, 'query_align_top_k', 64),
+                                        use_soft_target=getattr(args, 'query_align_soft_target', True),
+                                        include_normal=getattr(args, 'query_align_include_normal', True),
+                                        normal_margin=getattr(args, 'query_align_normal_margin', 0.3),
+                                        use_full_softmax_ratio=getattr(args, 'query_align_full_softmax_ratio', 0.2),
+                                        current_step_ratio=current_step_ratio,
+                                    )
+                                else:
+                                    # 使用原始v1版本
+                                    query_align_loss = query_text_alignment_loss(
+                                        decoder_hs=decoder_hs,
+                                        prompt_proto=prompt_proto,
+                                        indices=indices,
+                                        temp=getattr(args, 'query_align_temp', 0.2),
+                                        top_k=getattr(args, 'query_align_top_k', 64)
+                                    )
+                        else:
                              query_align_loss = torch.tensor(0.0, device=device)
 
                         # ===== Diagnostics (每 log_freq 步打印一次) =====
@@ -2363,9 +2978,17 @@ def main(args: argparse.Namespace):
                             pos_sim = sim[same_group].mean().item() if same_group.sum() > 0 else 0
                             neg_sim = sim[~same_group].mean().item() if (~same_group).sum() > 0 else 0
                             
+                            # 计算当前是否使用 full softmax
+                            total_steps = len(dataloader) * args.epochs
+                            global_step_diag = epoch * len(dataloader) + step
+                            current_ratio_diag = global_step_diag / total_steps
+                            use_full_sm = current_ratio_diag < getattr(args, 'query_align_full_softmax_ratio', 0.2)
+                            
                             print(f"[ALIGN] step={step} align_loss={align_loss.item():.6f} "
                                   f"query_align={query_align_loss.item():.6f} "
                                   f"pos_sim={pos_sim:.4f} neg_sim={neg_sim:.4f}")
+                            print(f"[QA-DBG] step_ratio={current_ratio_diag:.3f} use_full_softmax={use_full_sm} "
+                                  f"n_anomaly={sum(is_anomaly)} n_normal={len(is_anomaly)-sum(is_anomaly)}")
                             
                             # 打印 background vs anomaly embedding 统计
                             n_bg = is_background.sum().item()
@@ -2558,16 +3181,22 @@ Prompt-Visual Sim:
                 # Combine losses: 包含新的 query_align_loss
                 # current_lambda_query_align 已在 batch 循环开始时初始化
                 
+                # 获取lambda_filo和lambda_conf_fusion
+                lambda_filo = getattr(args, 'lambda_filo', 0.0)
+                lambda_conf_fusion = getattr(args, 'lambda_conf_fusion', 0.0)
+                
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
                     loss_main = (torch.exp(-log_var_focal) * loss_focal + log_var_focal) + \
                                 (torch.exp(-log_var_dice)  * loss_dice  + log_var_dice) + \
                                 (torch.exp(-log_var_iou)   * loss_iou   + log_var_iou)
                     total_loss = loss_main + args.presence_weight * loss_presence + \
-                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss
+                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
+                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion
                 else:
                     total_loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
                     total_loss = total_loss + args.presence_weight * loss_presence + \
-                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss
+                                 args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
+                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion
 
                 loss = total_loss
 
@@ -2703,6 +3332,59 @@ Prompt-Visual Sim:
             if is_main_process and writer is not None and lambda_scheduler is not None:
                 writer.add_scalar("lambda/query_align", current_lambda_query_align, global_step)
             
+            # ===== 多尺度特征 / 注意力可视化落盘 =====
+            if getattr(args, 'enable_multiscale_vis', False) and is_main_process:
+                vis_freq = getattr(args, 'multiscale_vis_freq', 500)
+                if global_step > 0 and (global_step % vis_freq) == 0:
+                    try:
+                        from multiscale_modules import FeatureVisualizer
+                        vis_root = os.path.join(save_dir, getattr(args, 'multiscale_vis_dir', 'feature_vis'))
+                        os.makedirs(vis_root, exist_ok=True)
+                        visualizer = FeatureVisualizer(save_dir=vis_root)
+                        
+                        ms = out.get("multiscale_features", None)
+                        if ms is not None and "used_features" in ms:
+                            feats = ms["used_features"]  # List[(B,C,H,W)]
+                            
+                            # 1) 多尺度特征图（均值/方差 + 原图）
+                            visualizer.visualize_fpn_levels(
+                                fpn_features=feats,
+                                image=images,
+                                save_name=f"step_{global_step}_features"
+                            )
+                            
+                            # 2) 特征统计
+                            visualizer.visualize_feature_statistics(
+                                features=feats,
+                                save_name=f"step_{global_step}_stats"
+                            )
+                            
+                            # 3) 文本-视觉相似度（用最高分辨率层）
+                            if "prompt_seq" in out and len(feats) > 0:
+                                visualizer.visualize_text_visual_similarity(
+                                    visual_feat=feats[0],
+                                    text_embed=out["prompt_seq"],
+                                    save_name=f"step_{global_step}_sim"
+                                )
+                            
+                            # 4) V-V 注意力权重
+                            if "vv_attention_weights" in out:
+                                for i, attn in enumerate(out["vv_attention_weights"]):
+                                    if i < len(feats):
+                                        H, W = feats[i].shape[-2], feats[i].shape[-1]
+                                        visualizer.visualize_attention_weights(
+                                            attn_weights=attn,
+                                            feature_shape=(H, W),
+                                            save_name=f"step_{global_step}_vv_attn_l{i}"
+                                        )
+                            
+                            # 5) MMCI 注意力权重
+                            print(f"[VIS] Saved multiscale visualization at step {global_step} to {vis_root}")
+                            
+                    except Exception as e:
+                        print(f"[WARN] multiscale visualization failed: {e}")
+            # ===== 多尺度可视化结束 =====
+            
 
             running_loss += loss.item()
             running_steps += 1
@@ -2763,6 +3445,8 @@ if __name__ == "__main__":
     parser.add_argument("--neg_samples_per_image", type=int, default=50, help="Max negative (unmatched) queries to sample per image for background loss")
     parser.add_argument("--lambda_align", type=float, default=0.1, help="weight for contrastive alignment loss (InfoNCE)")
     parser.add_argument("--align_temp", type=float, default=0.1, help="temperature for contrastive alignment (increased from 0.07 for stability)")
+    parser.add_argument("--lambda_filo", type=float, default=0.0, 
+                        help="Weight for FiLo anomaly map loss (Focal+Dice). Set >0 to enable FiLo supervision.")
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
     parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
@@ -2782,6 +3466,18 @@ if __name__ == "__main__":
                         help="Top-k queries to compete in query alignment loss (reduces from Q=900 to top_k)")
     parser.add_argument("--query_align_temp", type=float, default=0.2,
                         help="Temperature for query alignment loss (higher = softer, easier to learn)")
+    
+    # ===== Query Align V2 改进参数 =====
+    parser.add_argument("--use_query_align_v2", action="store_true", default=True,
+                        help="使用改进的query_align_v2版本（三个关键修复）")
+    parser.add_argument("--query_align_soft_target", action="store_true", default=True,
+                        help="[修复1] 使用IoU软标签代替硬标签，减少matcher漂移噪声")
+    parser.add_argument("--query_align_include_normal", action="store_true", default=True,
+                        help="[修复2] Normal图也参与query_align（margin loss）")
+    parser.add_argument("--query_align_normal_margin", type=float, default=0.3,
+                        help="[修复2] Normal图margin loss的margin值")
+    parser.add_argument("--query_align_full_softmax_ratio", type=float, default=0.2,
+                        help="[修复3] 前N%%步使用full softmax（更稳定），之后切回top-k")
 
 
     #--------------- Diagnostic logging args ---------------
@@ -2840,6 +3536,74 @@ if __name__ == "__main__":
                         choices=["simple", "full"],
                         help="数据集prompt模式: simple(推荐)只有类别描述, full包含关键词")
 
+    # ==================== 多尺度特征 & V-V注意力 & FiLo ====================
+    parser.add_argument("--num_feature_levels", type=int, default=1,
+                        help="使用多少层FPN特征 (1-4, SAM3通常支持4层)")
+    parser.add_argument("--enable_vv_attention", action="store_true",
+                        help="启用V-V自注意力增强视觉特征")
+    parser.add_argument("--vv_num_heads", type=int, default=8,
+                        help="V-V注意力的头数")
+    parser.add_argument("--vv_dropout", type=float, default=0.1,
+                        help="V-V注意力的dropout率")
+    # FiLo模块 (6路卷积MMCI)
+    parser.add_argument("--enable_filo", action="store_true",
+                        help="启用FiLo模块 (LinearLayer + CovLayer双分支解码)")
+    parser.add_argument("--filo_dim_out", type=int, default=768,
+                        help="FiLo输出维度 (对齐文本特征)")
+    parser.add_argument("--filo_k_linear", type=int, default=4,
+                        help="FiLo LinearLayer层数")
+    parser.add_argument("--filo_k_cov", type=int, default=4,
+                        help="FiLo CovLayer层数")
+    parser.add_argument("--filo_image_size", type=int, default=518,
+                        help="FiLo异常图输出尺寸")
+    parser.add_argument("--filo_use_alternating", action="store_true", default=True,
+                        help="FiLo是否交替分配FPN层 (偶数→Linear, 奇数→Cov)")
+    
+    # ==================== 方案B: FiLo到Decoder回灌 ====================
+    parser.add_argument("--filo_to_decoder", action="store_true",
+                        help="启用FiLo特征到Decoder的回灌（结构回灌）")
+    parser.add_argument("--filo_decoder_mode", type=str, default="memory",
+                        choices=["memory", "query_bias", "cross_attn"],
+                        help="FiLo到Decoder的回灌模式: memory(扩展memory), query_bias(query偏置), cross_attn(交叉注意力)")
+    parser.add_argument("--filo_decoder_tokens", type=int, default=64,
+                        help="FiLo压缩后的token数量（用于memory模式）")
+    
+    # ==================== 方案C: 置信度融合头 ====================
+    parser.add_argument("--enable_conf_fusion_head", action="store_true",
+                        help="启用置信度融合头（学习融合presence/iou/filo）")
+    parser.add_argument("--conf_fusion_hidden_dim", type=int, default=64,
+                        help="置信度融合头的隐藏维度")
+    parser.add_argument("--lambda_conf_fusion", type=float, default=0.0,
+                        help="置信度融合头损失权重 (设置>0启用训练)")
+    
+    parser.add_argument("--enable_multiscale_vis", action="store_true",
+                        help="启用多尺度特征可视化输出")
+    parser.add_argument("--multiscale_vis_freq", type=int, default=500,
+                        help="多尺度特征可视化保存频率(steps)")
+    parser.add_argument("--multiscale_vis_dir", type=str, default="feature_vis",
+                        help="多尺度可视化输出子目录（相对 save_dir）")
+    
+    # Stages消融实验
+    parser.add_argument("--selected_levels", type=str, default=None,
+                        help="指定使用的FPN层级，逗号分隔，如'0,1,2'用于消融实验")
+    parser.add_argument("--ablation_config", type=str, default=None,
+                        choices=['single_level_0', 'single_level_1', 'single_level_2', 'single_level_3',
+                                 'levels_0_1', 'levels_1_2', 'levels_2_3', 'levels_0_2',
+                                 'levels_0_1_2', 'levels_1_2_3', 'all_levels',
+                                 'sowa_style'],
+                        help="预定义的stages消融实验配置")
+    
+    parser.add_argument("--print_backbone", action="store_true",
+                    help="Print SAM3 backbone / trunk / transformer structure then exit.")
+    parser.add_argument("--print_modules_filter", type=str, default="",
+                        help="Optional substring filter to print only matching module names (e.g., 'vision_backbone.trunk').")
+    
+    parser.add_argument("--print_backbone_to_txt", action="store_true",
+                        help="Save printed backbone structure to a txt file.")
+    parser.add_argument("--print_backbone_txt_path", type=str, default="backbone_dump.txt",
+                        help="Path to save backbone dump txt (relative ok).")
+    parser.add_argument("--print_backbone_no_stdout", action="store_true",
+                        help="Do not print to stdout when dumping to txt.")
 
     args = parser.parse_args()
     main(args)
