@@ -885,6 +885,7 @@ def load_model(args, device: torch.device):
         "enable_lora": not getattr(args, "disable_lora", False),
         "lora_rank": getattr(args, "lora_rank", 16),
         "lora_alpha": getattr(args, "lora_alpha", None),
+        "lora_layer_ids": getattr(args, "lora_layer_ids", None),
         "freeze_vision": getattr(args, "freeze_vision", False),
         "freeze_text": getattr(args, "freeze_text", False),
         "device": device,
@@ -936,6 +937,14 @@ def load_model(args, device: torch.device):
         "use_keywords": getattr(args, "use_keywords", False),
         "cocoop_vis_dim": getattr(args, "cocoop_vis_dim", 256),
         "cocoop_reduction": getattr(args, "cocoop_reduction", 16),
+        # Compound Prompt Learning 参数
+        "compound_mode": getattr(args, "compound_mode", "cocoop"),
+        "compound_n_ctx": getattr(args, "compound_n_ctx", 4),
+        "compound_n_ctx_offset": getattr(args, "compound_n_ctx_offset", 2),
+        "compound_num_abnormal": getattr(args, "compound_num_abnormal", 10),
+        "compound_enable_dap": getattr(args, "compound_enable_dap", False),
+        "compound_dap_top_k": getattr(args, "compound_dap_top_k", 10),
+        "compound_meta_reduction": getattr(args, "compound_meta_reduction", 16),
         # VV Attention 参数
         "enable_vv_attention": getattr(args, "enable_vv_attention", False),
         "vv_num_heads": getattr(args, "vv_num_heads", 8),
@@ -994,6 +1003,16 @@ def load_model(args, device: torch.device):
         ckpt = torch.load(args.ckpt, map_location=device)
         if isinstance(ckpt, dict):
             state = ckpt.get("state_dict", ckpt.get("model", ckpt))
+            # 打印checkpoint中保存的配置（如果有）
+            if "config" in ckpt:
+                print(f"[INFO] Checkpoint config: {ckpt['config']}")
+            if "args" in ckpt:
+                saved_args = ckpt["args"]
+                print(f"[INFO] Checkpoint was trained with:")
+                for key in ["enable_filo", "filo_to_decoder", "filo_decoder_mode", 
+                           "enable_vv_attention", "enable_conf_fusion_head", "num_feature_levels"]:
+                    if hasattr(saved_args, key):
+                        print(f"       --{key} = {getattr(saved_args, key)}")
         else:
             state = ckpt
         
@@ -1023,6 +1042,48 @@ def load_model(args, device: torch.device):
         
         missing, unexpected = model.load_state_dict(filtered_state, strict=False)
         print(f"[INFO] Loaded fine-tuned weights. missing={len(missing)} unexpected={len(unexpected)}")
+        
+        # 打印详细的 missing/unexpected keys（帮助调试）
+        if len(missing) > 0:
+            print(f"[DEBUG] Missing keys (first 10):")
+            for mk in missing[:10]:
+                print(f"       - {mk}")
+            if len(missing) > 10:
+                print(f"       ... and {len(missing) - 10} more")
+        
+        if len(unexpected) > 0:
+            print(f"[DEBUG] Unexpected keys (first 10):")
+            for uk in unexpected[:10]:
+                print(f"       - {uk}")
+            if len(unexpected) > 10:
+                print(f"       ... and {len(unexpected) - 10} more")
+        
+        # ===== 配置验证：检查测试配置是否与训练配置匹配 =====
+        if "config" in ckpt:
+            train_config = ckpt["config"]
+            test_config = {
+                "enable_filo": getattr(args, "enable_filo", False),
+                "filo_to_decoder": getattr(args, "filo_to_decoder", False),
+                "filo_decoder_mode": getattr(args, "filo_decoder_mode", "memory"),
+                "enable_vv_attention": getattr(args, "enable_vv_attention", False),
+                "enable_conf_fusion_head": getattr(args, "enable_conf_fusion_head", False),
+            }
+            
+            mismatches = []
+            for key in test_config:
+                if key in train_config and train_config[key] != test_config[key]:
+                    mismatches.append(f"  {key}: train={train_config[key]}, test={test_config[key]}")
+            
+            if mismatches:
+                print("\n" + "="*60)
+                print("[WARNING] Configuration MISMATCH between training and testing!")
+                print("="*60)
+                for m in mismatches:
+                    print(m)
+                print("="*60)
+                print("This may cause missing/unexpected keys and poor performance!")
+                print("Please ensure test config matches training config.")
+                print("="*60 + "\n")
         
         # 打印 TIE 相关的加载情况
         if tie_mode != "none":
@@ -1537,12 +1598,14 @@ if __name__ == "__main__":
     parser.add_argument("--disable_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=float, default=None)
+    parser.add_argument("--lora_layer_ids", nargs="*", type=int, default=None,
+                        help="Which SAM3 encoder blocks to apply LoRA to (e.g., --lora_layer_ids 0 2 4). Default: all blocks.")
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
 
     # prompt learner config - CoOp/CoCoOp 提示学习参数
     parser.add_argument("--prompt_learner_type", type=str, default="perclass",
-                        choices=["averaged", "static", "perclass", "coop", "cocoop"],
+                        choices=["averaged", "static", "perclass", "coop", "cocoop", "compound"],
                         help="提示学习器类型")
     parser.add_argument("--num_templates", type=int, default=4)
     parser.add_argument("--n_ctx", type=int, default=4,
@@ -1558,6 +1621,24 @@ if __name__ == "__main__":
                         help="CoCoOp Meta-Net输入维度")
     parser.add_argument("--cocoop_reduction", type=int, default=16,
                         help="CoCoOp Meta-Net瓶颈缩减因子")
+    
+    # ==================== Compound Prompt Learning ====================
+    parser.add_argument("--compound_mode", type=str, default="cocoop",
+                        choices=["coop", "cocoop"],
+                        help="Compound: 模式选择 (coop=静态, cocoop=Meta-Net条件化)")
+    parser.add_argument("--compound_n_ctx", type=int, default=4,
+                        help="Compound: 共享上下文向量数量")
+    parser.add_argument("--compound_n_ctx_offset", type=int, default=2,
+                        help="Compound: 正常/异常偏移向量数量")
+    parser.add_argument("--compound_num_abnormal", type=int, default=10,
+                        help="Compound: 异常prompt数量")
+    parser.add_argument("--compound_enable_dap", action="store_true",
+                        help="Compound: 启用数据依赖异常先验")
+    parser.add_argument("--compound_dap_top_k", type=int, default=10,
+                        help="Compound: DAP top-k")
+    parser.add_argument("--compound_meta_reduction", type=int, default=16,
+                        help="Compound: Meta-Net瓶颈缩减因子")
+    
     parser.add_argument("--prompt_mode", type=str, default="simple",
                         choices=["simple", "full"],
                         help="数据集prompt模式")

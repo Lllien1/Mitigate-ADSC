@@ -48,6 +48,7 @@ class FineTuneSAM3(nn.Module):
         enable_lora: bool = True,
         lora_rank: int = 16,
         lora_alpha: Optional[float] = None,
+        lora_layer_ids: Optional[Sequence[int]] = None,
         freeze_vision: bool = True,
         freeze_text: bool = True,
         device: Optional[torch.device] = None,
@@ -70,6 +71,7 @@ class FineTuneSAM3(nn.Module):
                 target_substrings=("qkv",),
                 rank=lora_rank,
                 alpha=lora_alpha,
+                layer_ids=lora_layer_ids,
             )
 
         if freeze_vision:
@@ -170,6 +172,7 @@ class FineTuneSAM3Official(nn.Module):
         enable_lora: bool = True,
         lora_rank: int = 16,
         lora_alpha: Optional[float] = None,
+        lora_layer_ids: Optional[Sequence[int]] = None,
         freeze_vision: bool = True,
         freeze_text: bool = True,
         device: Optional[torch.device] = None,
@@ -184,6 +187,14 @@ class FineTuneSAM3Official(nn.Module):
         use_keywords: bool = True,
         cocoop_vis_dim: int = 256,
         cocoop_reduction: int = 16,
+        # ===== Compound Prompt Learning 参数 =====
+        compound_mode: str = "cocoop",
+        compound_n_ctx: int = 4,
+        compound_n_ctx_offset: int = 2,
+        compound_num_abnormal: int = 10,
+        compound_enable_dap: bool = False,
+        compound_dap_top_k: int = 10,
+        compound_meta_reduction: int = 16,
         # ===== VVAttention 参数 =====
         enable_vv_attention: bool = False,
         vv_num_heads: int = 8,
@@ -214,7 +225,9 @@ class FineTuneSAM3Official(nn.Module):
         self.prompt_learner_type = prompt_learner_type.lower()
         self.enable_multiscale_output = enable_multiscale_output
         self.selected_levels = selected_levels
-        
+
+        self._lora_layer_ids = lora_layer_ids  # 保存供后续使用
+
         # ===== 保存启用标志 =====
         self.enable_vv_attention = enable_vv_attention
         self.enable_filo = enable_filo
@@ -298,6 +311,7 @@ class FineTuneSAM3Official(nn.Module):
                 target_substrings=("qkv",),
                 rank=lora_rank,
                 alpha=lora_alpha,
+                layer_ids=lora_layer_ids,
             )
             print(f"[INFO] Applied qkv-LoRA to {len(wrapped)} linear layers")        
 
@@ -364,6 +378,25 @@ class FineTuneSAM3Official(nn.Module):
                 reduction_factor=cocoop_reduction,  # 修正：参数名是reduction_factor
             )
             print(f"[INFO] Using CoCoOpPromptLearner: n_ctx={n_ctx}")
+        
+        elif self.prompt_learner_type == "compound":
+            from compound_prompt_learner import CompoundPromptLearner
+            vis_dim = cocoop_vis_dim if cocoop_vis_dim > 0 else self.hidden_dim
+            self.prompt_learner = CompoundPromptLearner(
+                text_encoder=self.text_encoder,
+                n_V=compound_n_ctx,                    # 旧名 n_ctx -> 新名 n_V
+                n_w=compound_n_ctx_offset,             # 旧名 n_ctx_offset -> 新名 n_w
+                n_W=compound_n_ctx_offset,             # 旧名 n_ctx_offset -> 新名 n_W
+                num_abnormal_prompts=compound_num_abnormal,
+                mode=compound_mode,  # "coop" or "cocoop"
+                vis_dim=vis_dim,
+                meta_net_reduction=compound_meta_reduction,
+                freeze_text_encoder=freeze_text,
+                output_dim=self.hidden_dim,  # 投影到 SAM3 hidden_dim (256)
+            )
+            print(f"[INFO] Using CompoundPromptLearner: mode={compound_mode}, n_V={compound_n_ctx}, "
+                  f"n_w={compound_n_ctx_offset}, n_W={compound_n_ctx_offset}, "
+                  f"num_abnormal={compound_num_abnormal}")
             
         else:
             self.prompt_learner = AveragedPromptLearner(
@@ -465,7 +498,71 @@ class FineTuneSAM3Official(nn.Module):
         if self.prompt_learner_type == "cocoop":
             image_features_for_cocoop = vis_feats[0].mean(dim=[2, 3])
         
-        if hasattr(self.prompt_learner, "class_to_idx") and class_names is not None:
+        # ===== Compound Prompt Learner 特殊处理 =====
+        compound_dap_weights = None
+        if self.prompt_learner_type == "compound":
+            # 获取视觉特征用于 CoCoOp 模式的 Meta-Net
+            vis_global = vis_feats[0].mean(dim=[2, 3])  # (B, C)
+            
+            # 获取 patch 特征用于 DAP
+            patch_features = None
+            if hasattr(self.prompt_learner, 'enable_dap') and self.prompt_learner.enable_dap:
+                feat = vis_feats[0]
+                B_feat, C, H, W = feat.shape
+                patch_features = feat.flatten(2).transpose(1, 2)  # (B, H*W, C)
+            
+            # 调用 compound prompt learner
+            prompt_result = self.prompt_learner(
+                prompt_lists,
+                vis_feats=vis_feats[0],  # 传递视觉特征用于 Meta-Net
+                patch_features=patch_features,  # 传递 patch 特征用于 DAP
+                device=self.device,
+            )
+            
+            # 解包结果: CompoundPromptLearner 返回的是 prefix tokens，需要在这里转成 (L,B,D) 的 prompt_seq
+            if len(prompt_result) == 3:
+                prompt_prefixes, _prompt_mask3d, compound_dap_weights = prompt_result
+            else:
+                prompt_prefixes, _prompt_mask3d = prompt_result[:2]
+                compound_dap_weights = None
+
+            # (B, P, L, D) -> (P, B, D): 用 token 均值作为每个 prompt 的 prototype
+            prompt_seq = prompt_prefixes.mean(dim=2).permute(1, 0, 2).contiguous()
+            # key_padding_mask: True 表示 padding；这里没有 padding
+            prompt_mask = torch.zeros(
+                prompt_seq.shape[1], prompt_seq.shape[0],
+                dtype=torch.bool, device=prompt_seq.device
+            )
+            
+            # 【修复】提取所有prompt原型，不截断
+            # prompt_seq 是 (P, B, D)，其中 P = 1 + K
+            # prompt_seq[0] = normal, prompt_seq[1:] = K个abnormal
+            P = prompt_seq.shape[0]
+            
+            text_features_structured = {
+                'normal': prompt_seq[0],                          # (B, D)
+                'abnormal_all': prompt_seq[1:].permute(1, 0, 2),  # (B, K, D)
+                'abnormal_mean': prompt_seq[1:].mean(dim=0),      # (B, D)
+                'num_abnormal': P - 1,                            # K
+            }
+            
+            # 【新增】获取 w 向量的 prototype（用于 suspicious alignment loss）
+            # prompt_prefixes: (B, 1+K, max_len, D)
+            # prompt_prefixes[0] 是 normal_prefix = [V] + [w]
+            if hasattr(self.prompt_learner, 'n_V') and hasattr(self.prompt_learner, 'w'):
+                n_V = self.prompt_learner.n_V
+                n_w = self.prompt_learner.n_w
+                # normal_prefix 的前 n_V 个 token 是 V，后面的是 w
+                normal_prefix_tokens = prompt_prefixes[:, 0, :, :]  # (B, max_len, D)
+                # 取 w 的部分（从 n_V 开始，长度为 n_w）
+                w_tokens = normal_prefix_tokens[:, n_V:n_V + n_w, :]  # (B, n_w, D)
+                proto_suspicious = w_tokens.mean(dim=1)  # (B, D)
+                text_features_structured['proto_suspicious'] = proto_suspicious
+            
+            # 【删除】这行被删除了，因为它覆盖了上面的字典
+            # text_features_structured = prompt_seq[:2].permute(1, 0, 2).contiguous()
+
+        elif hasattr(self.prompt_learner, "class_to_idx") and class_names is not None:
             cls_ids = [
                 self.prompt_learner.class_to_idx.get(c.lower(), 0) if c is not None else 0 
                 for c in class_names
@@ -621,6 +718,7 @@ class FineTuneSAM3Official(nn.Module):
             "decoder_hs": hs,
             "reference_boxes": reference_boxes,
             "prompt_seq": prompt_seq,
+            "compound_dap_weights": compound_dap_weights,
         }
 
         decoder_feat = None
@@ -650,6 +748,19 @@ class FineTuneSAM3Official(nn.Module):
             out["filo_aggregated_map"] = filo_outputs.get('aggregated_map', None)
             out["filo_patch_tokens_qkv"] = filo_outputs.get('patch_tokens_qkv', [])
             out["filo_patch_tokens_vv"] = filo_outputs.get('patch_tokens_vv', [])
+        
+        # Compound Prompt Learner 输出
+        if compound_dap_weights is not None:
+            out["compound_dap_weights"] = compound_dap_weights
+        
+        # 【修复】添加结构化的 normal/abnormal 原型
+        if self.prompt_learner_type == "compound":
+            # text_features_structured 在 compound 分支中定义
+            out["text_features_structured"] = text_features_structured
+            
+            # 【新增】如果 text_features_structured 是字典且包含 proto_suspicious
+            if isinstance(text_features_structured, dict) and 'proto_suspicious' in text_features_structured:
+                out["proto_suspicious"] = text_features_structured['proto_suspicious']
 
         return out
 

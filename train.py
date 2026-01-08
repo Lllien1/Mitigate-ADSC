@@ -35,6 +35,1334 @@ import matplotlib.pyplot as plt
 import json
 import io
 
+# =============================================================================
+# 修改 1: AnomalyFeatureBank 增强版（支持正交化去冗余）
+# =============================================================================
+
+class AnomalyFeatureBankV2:
+    """
+    【v2.2 增强】异常特征 Memory Bank - 支持正交化去冗余
+    
+    新增功能：
+    1. 入库前与 normal prototype 正交化（去除类别特异性）
+    2. 支持延迟启用（warm_up_ratio）
+    3. 支持聚类去重（可选）
+    """
+    
+    def __init__(
+        self, 
+        max_size: int = 2048,
+        dim: int = 256,
+        min_fill_ratio: float = 0.5,
+        warm_up_ratio: float = 0.3,      # 【新增】前 30% 不启用
+        orthogonalize: bool = True,       # 【新增】是否正交化
+    ):
+        self.max_size = max_size
+        self.dim = dim
+        self.min_fill_ratio = min_fill_ratio
+        self.warm_up_ratio = warm_up_ratio
+        self.orthogonalize = orthogonalize
+        
+        self.bank = torch.zeros(max_size, dim)
+        self.ptr = 0
+        self.total_enqueued = 0
+        self.is_ready = False
+        
+        # 用于正交化的 normal prototype（运行时更新）
+        self.normal_proto_cache = None
+        
+    def update_normal_proto(self, proto_normal: torch.Tensor):
+        """更新 normal prototype 缓存（每个 step 调用）"""
+        # 使用 EMA 更新
+        proto = F.normalize(proto_normal.mean(dim=0).detach().cpu().float(), dim=-1)  # (D,)
+        if self.normal_proto_cache is None:
+            self.normal_proto_cache = proto
+        else:
+            self.normal_proto_cache = 0.9 * self.normal_proto_cache + 0.1 * proto
+    
+    def _orthogonalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        将特征与 normal prototype 正交化
+        
+        公式：f_orth = f - (f · n) * n
+        目的：去除与 normal 共享的成分，保留"异常特有"的语义
+        """
+        if self.normal_proto_cache is None or not self.orthogonalize:
+            return features
+        
+        features = features.float()
+        n = self.normal_proto_cache.float().to(features.device)  # (D,)
+        
+        # 计算投影
+        proj = (features @ n).unsqueeze(-1) * n.unsqueeze(0)  # (N, D)
+        
+        # 正交化
+        f_orth = features - proj
+        
+        # 重新归一化
+        f_orth = F.normalize(f_orth, dim=-1)
+        
+        return f_orth
+        
+    def enqueue(self, features: torch.Tensor, current_step_ratio: float = 0.0):
+        """
+        存入新的异常特征
+        
+        Args:
+            features: (N, D) 来自 matched queries 的特征
+            current_step_ratio: 当前训练进度 (0~1)
+        """
+        if features.numel() == 0:
+            return
+        
+        # 【新增】warm-up 阶段不入库
+        if current_step_ratio < self.warm_up_ratio:
+            return
+            
+        features = F.normalize(features.detach().cpu().float(), dim=-1)
+        
+        # 【新增】正交化
+        features = self._orthogonalize_features(features)
+        
+        batch_size = features.shape[0]
+        
+        if batch_size >= self.max_size:
+            self.bank = features[-self.max_size:]
+            self.ptr = 0
+            self.is_ready = True
+            self.total_enqueued += batch_size
+            return
+        
+        end_ptr = self.ptr + batch_size
+        
+        if end_ptr <= self.max_size:
+            self.bank[self.ptr:end_ptr] = features
+            self.ptr = end_ptr
+        else:
+            first_part = self.max_size - self.ptr
+            second_part = batch_size - first_part
+            self.bank[self.ptr:self.max_size] = features[:first_part]
+            self.bank[0:second_part] = features[first_part:]
+            self.ptr = second_part
+            self.is_ready = True
+        
+        self.total_enqueued += batch_size
+        
+        fill_count = min(self.total_enqueued, self.max_size)
+        fill_ratio = fill_count / self.max_size
+        
+        if fill_ratio >= self.min_fill_ratio and not self.is_ready:
+            self.is_ready = True
+            print(f"[AnomalyBankV2] Ready! Filled {fill_count}/{self.max_size} "
+                  f"({fill_ratio:.1%}), orthogonalize={self.orthogonalize}")
+    
+    def get_anchors(self, device: torch.device) -> Optional[torch.Tensor]:
+        if self.total_enqueued == 0:
+            return None
+        valid_count = min(self.total_enqueued, self.max_size)
+        if self.is_ready or valid_count == self.max_size:
+            return self.bank.to(device)
+        else:
+            return self.bank[:valid_count].to(device)
+    
+    def ready_for_w_learning(self, current_step_ratio: float = 0.0) -> bool:
+        """检查是否可以开始 w 学习"""
+        # 必须过了 warm-up 阶段 且 bank 已 ready
+        return current_step_ratio >= self.warm_up_ratio and self.is_ready
+    
+    def get_stats(self) -> dict:
+        valid_count = min(self.total_enqueued, self.max_size)
+        return {
+            "total_enqueued": self.total_enqueued,
+            "valid_count": valid_count,
+            "max_size": self.max_size,
+            "fill_ratio": valid_count / self.max_size,
+            "is_ready": self.is_ready,
+            "orthogonalize": self.orthogonalize,
+            "warm_up_ratio": self.warm_up_ratio,
+        }
+
+
+# =============================================================================
+# 修改 2: Suspicious Loss 增强版（w 与 abnormal 保持 margin）
+# =============================================================================
+
+def compute_suspicious_loss_with_margin(
+    decoder_hs: torch.Tensor,         # (B, Q, D)
+    proto_suspicious: torch.Tensor,   # (B, D) - w 的 prototype
+    proto_abnormal: torch.Tensor,     # (B, D) - W 的 prototype
+    anomaly_anchors: torch.Tensor,    # (N, D) - 来自 Memory Bank
+    is_anomaly: List[bool],
+    temp: float = 0.2,
+    top_r: int = 5,
+    w_abnormal_margin: float = 0.3,   # 【新增】w 与 abnormal 的 margin
+):
+    """
+    【v2.2 增强】Suspicious Loss + w 与 abnormal 的 margin 约束
+    
+    核心改进：
+    1. 让 w 学习正常图中的 hard negatives
+    2. 同时约束 w 不要太像 abnormal（防止 w 变成"异常子类"）
+    
+    Args:
+        w_abnormal_margin: w 与 abnormal 之间应保持的最小 margin
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    if anomaly_anchors is None or anomaly_anchors.shape[0] == 0:
+        return torch.tensor(0.0, device=device)
+    
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    proto_s = F.normalize(proto_suspicious, dim=-1)  # w
+    proto_a = F.normalize(proto_abnormal, dim=-1)    # W
+    anchors_norm = F.normalize(anomaly_anchors, dim=-1)
+    
+    loss_align = torch.tensor(0.0, device=device)
+    loss_margin = torch.tensor(0.0, device=device)
+    count = 0
+    
+    for b in range(B):
+        if not is_anomaly[b]:
+            # === Part 1: 让 suspicious queries 对齐到 w ===
+            sim_to_anchors = hs_norm[b] @ anchors_norm.t()
+            max_sim_to_anomaly, _ = sim_to_anchors.max(dim=1)
+            
+            r = min(top_r, Q)
+            _, suspicious_idx = max_sim_to_anomaly.topk(r)
+            
+            sim_to_w = (hs_norm[b] @ proto_s[b]) / temp
+            sim_to_w = sim_to_w.clamp(min=-10, max=10)  # 添加 clamp
+            for idx in suspicious_idx:
+                loss_align = loss_align - F.logsigmoid(sim_to_w[idx])
+                count += 1
+        
+        # === Part 2: w 与 abnormal 保持 margin（所有样本都算）===
+        # sim(w, W) 应该 < -margin（即 w 和 W 要足够不同）
+        sim_w_abnormal = (proto_s[b] @ proto_a[b])  # scalar
+        # Hinge loss: max(0, sim + margin)
+        loss_margin = loss_margin + F.relu(sim_w_abnormal + w_abnormal_margin)
+    
+    if count > 0:
+        loss_align = loss_align / count
+    
+    loss_margin = loss_margin / B
+    
+    # 组合
+    return loss_align + 0.5 * loss_margin
+
+
+def compute_suspicious_loss_hybrid_v2(
+    decoder_hs: torch.Tensor,
+    proto_suspicious: torch.Tensor,
+    proto_abnormal: torch.Tensor,     # 【新增】用于 margin 约束
+    anomaly_bank,  # AnomalyFeatureBankV2
+    matched_indices: List[tuple],
+    is_anomaly: List[bool],
+    current_step_ratio: float,        # 【新增】当前训练进度
+    temp: float = 0.2,
+    top_r: int = 5,
+    w_abnormal_margin: float = 0.3,
+    fallback_to_statistics: bool = True,
+):
+    """
+    【v2.2 增强】混合版 Suspicious Loss
+    
+    新增：
+    1. 支持 warm-up（训练前 30% 不启用）
+    2. w 与 abnormal 的 margin 约束
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+
+    if anomaly_bank is not None:
+        if current_step_ratio < anomaly_bank.warm_up_ratio:
+            return torch.tensor(0.0, device=device)    
+    
+    # 检查 bank 是否 ready（包含 warm-up 检查）
+    if anomaly_bank is not None and anomaly_bank.ready_for_w_learning(current_step_ratio):
+        anchors = anomaly_bank.get_anchors(device)
+        return compute_suspicious_loss_with_margin(
+            decoder_hs, proto_suspicious, proto_abnormal, anchors,
+            is_anomaly, temp, top_r, w_abnormal_margin
+        )
+    
+    # 尝试当前 batch
+    current_batch_anchors = []
+    for b in range(B):
+        if is_anomaly[b] and matched_indices is not None:
+            src_q, _ = matched_indices[b]
+            if src_q.numel() > 0:
+                for idx in src_q.cpu().tolist():
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0]
+                    idx = int(idx)
+                    if idx < Q:
+                        current_batch_anchors.append(decoder_hs[b, idx])
+    
+    if len(current_batch_anchors) > 0:
+        anchors = torch.stack(current_batch_anchors, dim=0)
+        return compute_suspicious_loss_with_margin(
+            decoder_hs, proto_suspicious, proto_abnormal, anchors.detach(),
+            is_anomaly, temp, top_r, w_abnormal_margin
+        )
+    
+    # 回退到统计方法
+    if fallback_to_statistics:
+        return compute_suspicious_loss_by_statistics_v2(
+            decoder_hs, proto_suspicious, proto_abnormal,
+            is_anomaly, temp, top_r, w_abnormal_margin
+        )
+    
+    return torch.tensor(0.0, device=device)
+
+
+def compute_suspicious_loss_by_statistics_v2(
+    decoder_hs: torch.Tensor,
+    proto_suspicious: torch.Tensor,
+    proto_abnormal: torch.Tensor,
+    is_anomaly: List[bool],
+    temp: float = 0.2,
+    top_r: int = 5,
+    w_abnormal_margin: float = 0.3,
+):
+    """【v2.2】统计版 + margin 约束"""
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    proto_s = F.normalize(proto_suspicious, dim=-1)
+    proto_a = F.normalize(proto_abnormal, dim=-1)
+    
+    loss_align = torch.tensor(0.0, device=device)
+    loss_margin = torch.tensor(0.0, device=device)
+    count = 0
+    
+    for b in range(B):
+        if not is_anomaly[b]:
+            mean_hs = hs_norm[b].mean(dim=0)
+            dist_to_mean = (hs_norm[b] - mean_hs).norm(dim=-1)
+            
+            r = min(top_r, Q)
+            _, suspicious_idx = dist_to_mean.topk(r)
+            
+            sim_to_w = (hs_norm[b] @ proto_s[b]) / temp
+            
+            for idx in suspicious_idx:
+                loss_align = loss_align - F.logsigmoid(sim_to_w[idx])
+                count += 1
+        
+        # margin 约束
+        sim_w_abnormal = (proto_s[b] @ proto_a[b])
+        loss_margin = loss_margin + F.relu(sim_w_abnormal + w_abnormal_margin)
+    
+    if count > 0:
+        loss_align = loss_align / count
+    loss_margin = loss_margin / B
+    
+    return loss_align + 0.5 * loss_margin
+
+
+# =============================================================================
+# 修改 3: 收集函数增强（支持正交化）
+# =============================================================================
+
+def collect_anomaly_features_to_bank_v2(
+    decoder_hs: torch.Tensor,
+    matched_indices: List[tuple],
+    is_anomaly: List[bool],
+    anomaly_bank,  # AnomalyFeatureBankV2
+    proto_normal: Optional[torch.Tensor],  # 【新增】用于正交化
+    current_step_ratio: float,             # 【新增】当前进度
+):
+    """
+    【v2.2 增强】收集异常特征到 bank
+    
+    新增：
+    1. 更新 normal prototype 缓存
+    2. 传递当前进度（用于 warm-up 检查）
+    """
+    B, Q, D = decoder_hs.shape
+    
+    # 更新 normal prototype 缓存
+    if proto_normal is not None:
+        anomaly_bank.update_normal_proto(proto_normal)
+    
+    features_to_store = []
+    for b in range(B):
+        if is_anomaly[b] and matched_indices is not None:
+            src_q, _ = matched_indices[b]
+            if src_q.numel() > 0:
+                for idx in src_q.cpu().tolist():
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0]
+                    idx = int(idx)
+                    if idx < Q:
+                        features_to_store.append(decoder_hs[b, idx].detach())
+    
+    if len(features_to_store) > 0:
+        features = torch.stack(features_to_store, dim=0)
+        anomaly_bank.enqueue(features, current_step_ratio)
+
+# =============================================================================
+# 修复 1: Image-Level Align Loss（二分类形式）
+# =============================================================================
+
+def align_loss_binary_classification(
+    proto_normal: torch.Tensor,     # (B, D) - 来自 V
+    proto_abnormal: torch.Tensor,   # (B, D) - 来自 W（可以是 mean 或选定的）
+    visual_embed: torch.Tensor,     # (B, D) - pooled visual embedding
+    is_anomaly: List[bool],         # (B,)
+    temp: float = 0.25,
+    label_smoothing: float = 0.1,   # 标签平滑，增加稳定性
+):
+    """
+    【修复版】Image-Level Align Loss - 二分类形式
+    
+    核心思想（与 Query-Align 一致）：
+    - logits = [sim_to_normal, sim_to_abnormal]
+    - 异常图 label=1（应该接近 abnormal）
+    - 正常图 label=0（应该接近 normal）
+    
+    这是最稳定的对齐方式，不会出现"把相似度压扁"的问题。
+    
+    Args:
+        proto_normal: 正常原型 (B, D)
+        proto_abnormal: 异常原型 (B, D)  
+        visual_embed: 视觉嵌入 (B, D)
+        is_anomaly: 是否异常的标签
+        temp: 温度参数
+        label_smoothing: 标签平滑系数
+    
+    Returns:
+        loss: 标量损失
+    """
+    B, D = visual_embed.shape
+    device = visual_embed.device
+    
+    # 归一化
+    v_norm = F.normalize(visual_embed, dim=-1)  # (B, D)
+    p_n = F.normalize(proto_normal, dim=-1)     # (B, D)
+    p_a = F.normalize(proto_abnormal, dim=-1)   # (B, D)
+    
+    # 计算相似度
+    sim_to_normal = (v_norm * p_n).sum(dim=-1) / temp    # (B,)
+    sim_to_abnormal = (v_norm * p_a).sum(dim=-1) / temp  # (B,)
+    
+    # 构建 logits: (B, 2) - [normal_score, abnormal_score]
+    logits = torch.stack([sim_to_normal, sim_to_abnormal], dim=-1)  # (B, 2)
+    
+    # 构建 targets: 异常图=1，正常图=0
+    targets = torch.tensor(
+        [1 if is_anomaly[b] else 0 for b in range(B)],
+        dtype=torch.long, device=device
+    )
+    
+    # Cross entropy with label smoothing
+    loss = F.cross_entropy(logits, targets, label_smoothing=label_smoothing)
+    
+    return loss
+
+
+def align_loss_binary_classification_with_margin(
+    proto_normal: torch.Tensor,     # (B, D)
+    proto_abnormal: torch.Tensor,   # (B, D)
+    visual_embed: torch.Tensor,     # (B, D)
+    is_anomaly: List[bool],
+    temp: float = 0.25,
+    margin: float = 0.1,            # 相对 margin
+    label_smoothing: float = 0.1,
+):
+    """
+    【增强版】带相对 margin 的二分类对齐损失
+    
+    额外添加：希望正确类别的相似度比错误类别高出 margin
+    即 sim_pos - sim_neg >= margin
+    """
+    B, D = visual_embed.shape
+    device = visual_embed.device
+    
+    v_norm = F.normalize(visual_embed, dim=-1)
+    p_n = F.normalize(proto_normal, dim=-1)
+    p_a = F.normalize(proto_abnormal, dim=-1)
+    
+    sim_to_normal = (v_norm * p_n).sum(dim=-1) / temp
+    sim_to_abnormal = (v_norm * p_a).sum(dim=-1) / temp
+    
+    # 基础二分类 loss
+    logits = torch.stack([sim_to_normal, sim_to_abnormal], dim=-1)
+    targets = torch.tensor(
+        [1 if is_anomaly[b] else 0 for b in range(B)],
+        dtype=torch.long, device=device
+    )
+    loss_ce = F.cross_entropy(logits, targets, label_smoothing=label_smoothing)
+    
+    # 相对 margin loss: max(0, margin - (sim_pos - sim_neg))
+    loss_margin = torch.tensor(0.0, device=device)
+    for b in range(B):
+        if is_anomaly[b]:
+            # 异常图: sim_abnormal 应该 > sim_normal + margin
+            diff = sim_to_abnormal[b] - sim_to_normal[b]
+        else:
+            # 正常图: sim_normal 应该 > sim_abnormal + margin
+            diff = sim_to_normal[b] - sim_to_abnormal[b]
+        
+        loss_margin = loss_margin + F.relu(margin - diff)
+    
+    loss_margin = loss_margin / B
+    
+    # 组合（margin 权重较小）
+    return loss_ce + 0.2 * loss_margin
+
+
+# =============================================================================
+# 修复 2: Anomaly Feature Memory Bank
+# =============================================================================
+
+class AnomalyFeatureBank:
+    """
+    干净的异常特征 Memory Bank
+    
+    设计原则：
+    1. 只存储来自异常图 matched queries 的特征（真实异常区域）
+    2. 只有当 bank 填充足够后才开启 w 学习
+    3. 使用 FIFO 策略更新，保持特征新鲜度
+    
+    用途：
+    - 为 w 向量的学习提供稳定的异常 anchor
+    - 避免"鸡生蛋"问题（不依赖 W 是否学好）
+    """
+    
+    def __init__(
+        self, 
+        max_size: int = 2048,       # 最大存储数量
+        dim: int = 256,             # 特征维度
+        min_fill_ratio: float = 0.5, # 最小填充比例才开启 w 学习
+    ):
+        self.max_size = max_size
+        self.dim = dim
+        self.min_fill_ratio = min_fill_ratio
+        
+        # CPU 上存储，避免占用 GPU 显存
+        self.bank = torch.zeros(max_size, dim)
+        self.ptr = 0
+        self.total_enqueued = 0
+        self.is_ready = False
+        
+    def enqueue(self, features: torch.Tensor):
+        """
+        存入新的异常特征
+        
+        Args:
+            features: (N, D) 来自 matched queries 的特征
+        """
+        if features.numel() == 0:
+            return
+            
+        features = F.normalize(features.detach().cpu(), dim=-1)
+        batch_size = features.shape[0]
+        
+        # 处理超出容量的情况
+        if batch_size >= self.max_size:
+            # 直接用最新的填满
+            self.bank = features[-self.max_size:]
+            self.ptr = 0
+            self.is_ready = True
+            self.total_enqueued += batch_size
+            return
+        
+        # 正常入队
+        end_ptr = self.ptr + batch_size
+        
+        if end_ptr <= self.max_size:
+            self.bank[self.ptr:end_ptr] = features
+            self.ptr = end_ptr
+        else:
+            # 环形覆盖
+            first_part = self.max_size - self.ptr
+            second_part = batch_size - first_part
+            self.bank[self.ptr:self.max_size] = features[:first_part]
+            self.bank[0:second_part] = features[first_part:]
+            self.ptr = second_part
+            self.is_ready = True  # 环绕一次说明已填满
+        
+        self.total_enqueued += batch_size
+        
+        # 检查是否达到最小填充比例
+        fill_count = min(self.total_enqueued, self.max_size)
+        fill_ratio = fill_count / self.max_size
+        
+        if fill_ratio >= self.min_fill_ratio and not self.is_ready:
+            self.is_ready = True
+            print(f"[AnomalyBank] Ready! Filled {fill_count}/{self.max_size} "
+                  f"({fill_ratio:.1%}), total enqueued: {self.total_enqueued}")
+    
+    def get_anchors(self, device: torch.device) -> Optional[torch.Tensor]:
+        """
+        获取所有有效的异常 anchor
+        
+        Returns:
+            (N, D) tensor or None if empty
+        """
+        if self.total_enqueued == 0:
+            return None
+        
+        valid_count = min(self.total_enqueued, self.max_size)
+        
+        if self.is_ready or valid_count == self.max_size:
+            return self.bank.to(device)
+        else:
+            # 还没填满，只返回已填充的部分
+            return self.bank[:valid_count].to(device)
+    
+    def ready_for_w_learning(self) -> bool:
+        """检查是否可以开始 w 学习"""
+        return self.is_ready
+    
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        valid_count = min(self.total_enqueued, self.max_size)
+        return {
+            "total_enqueued": self.total_enqueued,
+            "valid_count": valid_count,
+            "max_size": self.max_size,
+            "fill_ratio": valid_count / self.max_size,
+            "is_ready": self.is_ready,
+            "ptr": self.ptr,
+        }
+
+
+# =============================================================================
+# 修复 3: Suspicious Loss with Memory Bank
+# =============================================================================
+
+def compute_suspicious_loss_with_bank(
+    decoder_hs: torch.Tensor,         # (B, Q, D)
+    proto_suspicious: torch.Tensor,   # (B, D) - w 的 prototype
+    anomaly_anchors: torch.Tensor,    # (N, D) - 来自 Memory Bank
+    is_anomaly: List[bool],
+    temp: float = 0.2,
+    top_r: int = 5,
+):
+    """
+    【Memory Bank 版】w 向量的 Suspicious Alignment Loss
+    
+    核心改进：
+    - 使用 Memory Bank 中的真实异常特征作为 anchor
+    - 在正常图中找与这些 anchor 最相似的 queries
+    - 让这些 queries 与 w 对齐（吸收 hard negatives）
+    
+    这样 w 的学习不依赖于 W 是否学好，信号更准确。
+    
+    Args:
+        decoder_hs: decoder 输出的 query 特征 (B, Q, D)
+        proto_suspicious: w 的 prototype (B, D)
+        anomaly_anchors: 来自 bank 的异常特征 (N, D)
+        is_anomaly: batch 中每个样本是否异常
+        temp: 温度参数
+        top_r: 每张正常图选择多少个疑似异常 query
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    if anomaly_anchors is None or anomaly_anchors.shape[0] == 0:
+        return torch.tensor(0.0, device=device)
+    
+    # 归一化
+    hs_norm = F.normalize(decoder_hs, dim=-1)           # (B, Q, D)
+    proto_s = F.normalize(proto_suspicious, dim=-1)    # (B, D)
+    anchors_norm = F.normalize(anomaly_anchors, dim=-1) # (N, D)
+    
+    loss = torch.tensor(0.0, device=device)
+    count = 0
+    
+    for b in range(B):
+        if not is_anomaly[b]:
+            # 只在正常图上学习 w
+            
+            # Step 1: 计算每个 query 与所有 anomaly anchors 的相似度
+            sim_to_anchors = hs_norm[b] @ anchors_norm.t()  # (Q, N)
+            
+            # Step 2: 取每个 query 的最大相似度（最像某个异常的程度）
+            max_sim_to_anomaly, _ = sim_to_anchors.max(dim=1)  # (Q,)
+            
+            # Step 3: 选择最像异常的 top-r queries
+            r = min(top_r, Q)
+            _, suspicious_idx = max_sim_to_anomaly.topk(r)
+            
+            # Step 4: 让这些 queries 与 proto_suspicious (w) 对齐
+            sim_to_w = (hs_norm[b] @ proto_s[b]) / temp  # (Q,)
+            
+            for idx in suspicious_idx:
+                # 希望这些"像异常的 query"与 w 相似
+                loss = loss - F.logsigmoid(sim_to_w[idx])
+                count += 1
+    
+    if count > 0:
+        loss = loss / count
+    
+    return loss
+
+
+def compute_suspicious_loss_hybrid(
+    decoder_hs: torch.Tensor,         # (B, Q, D)
+    proto_suspicious: torch.Tensor,   # (B, D)
+    anomaly_bank: Optional[AnomalyFeatureBank],
+    matched_indices: List[tuple],     # 每张图的 matched indices
+    is_anomaly: List[bool],
+    temp: float = 0.2,
+    top_r: int = 5,
+    fallback_to_statistics: bool = True,
+):
+    """
+    【混合版】Suspicious Loss
+    
+    策略：
+    1. 优先使用 Memory Bank（如果 ready）
+    2. 如果 bank 未 ready 且 fallback=True，使用当前 batch 的异常特征
+    3. 如果都没有，使用统计离群点
+    
+    Args:
+        decoder_hs: (B, Q, D)
+        proto_suspicious: (B, D)
+        anomaly_bank: Memory Bank 实例（可为 None）
+        matched_indices: 当前 batch 的 matched indices
+        is_anomaly: batch 标签
+        temp: 温度
+        top_r: top-r queries
+        fallback_to_statistics: 是否在无 anchor 时使用统计方法
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    # 尝试获取 bank anchors
+    if anomaly_bank is not None and anomaly_bank.ready_for_w_learning():
+        anchors = anomaly_bank.get_anchors(device)
+        return compute_suspicious_loss_with_bank(
+            decoder_hs, proto_suspicious, anchors, is_anomaly, temp, top_r
+        )
+    
+    # Bank 未 ready，尝试使用当前 batch 的异常特征
+    current_batch_anchors = []
+    for b in range(B):
+        if is_anomaly[b] and matched_indices is not None:
+            src_q, _ = matched_indices[b]
+            if src_q.numel() > 0:
+                for idx in src_q.cpu().tolist():
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0]
+                    idx = int(idx)
+                    if idx < Q:
+                        current_batch_anchors.append(decoder_hs[b, idx])
+    
+    if len(current_batch_anchors) > 0:
+        anchors = torch.stack(current_batch_anchors, dim=0)  # (N, D)
+        return compute_suspicious_loss_with_bank(
+            decoder_hs, proto_suspicious, anchors.detach(), is_anomaly, temp, top_r
+        )
+    
+    # 回退到统计方法
+    if fallback_to_statistics:
+        return compute_suspicious_loss_by_statistics(
+            decoder_hs, proto_suspicious, is_anomaly, temp, top_r
+        )
+    
+    return torch.tensor(0.0, device=device)
+
+
+def compute_suspicious_loss_by_statistics(
+    decoder_hs: torch.Tensor,       # (B, Q, D)
+    proto_suspicious: torch.Tensor, # (B, D)
+    is_anomaly: List[bool],
+    temp: float = 0.2,
+    top_r: int = 5,
+):
+    """
+    【统计版】使用离群点检测找疑似异常
+    
+    思路：与该图的 query 均值距离最远的 = 最异常
+    完全不依赖任何学习的特征，训练初期就能用。
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    proto_s = F.normalize(proto_suspicious, dim=-1)
+    
+    loss = torch.tensor(0.0, device=device)
+    count = 0
+    
+    for b in range(B):
+        if not is_anomaly[b]:
+            # 计算均值
+            mean_hs = hs_norm[b].mean(dim=0)  # (D,)
+            
+            # 计算每个 query 与均值的距离
+            dist_to_mean = (hs_norm[b] - mean_hs).norm(dim=-1)  # (Q,)
+            
+            # 距离最远的 = 最"异常"
+            r = min(top_r, Q)
+            _, suspicious_idx = dist_to_mean.topk(r)
+            
+            # 对齐到 w
+            sim_to_w = (hs_norm[b] @ proto_s[b]) / temp
+            
+            for idx in suspicious_idx:
+                loss = loss - F.logsigmoid(sim_to_w[idx])
+                count += 1
+    
+    if count > 0:
+        loss = loss / count
+    
+    return loss
+
+
+# =============================================================================
+# 辅助函数：收集异常特征到 Bank
+# =============================================================================
+
+def collect_anomaly_features_to_bank(
+    decoder_hs: torch.Tensor,         # (B, Q, D)
+    matched_indices: List[tuple],     # 每张图的 (src_q, tgt_q)
+    is_anomaly: List[bool],
+    anomaly_bank: AnomalyFeatureBank,
+):
+    """
+    将当前 batch 的异常特征存入 Memory Bank
+    
+    在训练循环中每个 step 调用，不管 bank 是否 ready
+    """
+    B, Q, D = decoder_hs.shape
+    
+    features_to_store = []
+    
+    for b in range(B):
+        if is_anomaly[b] and matched_indices is not None:
+            src_q, _ = matched_indices[b]
+            if src_q.numel() > 0:
+                for idx in src_q.cpu().tolist():
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0]
+                    idx = int(idx)
+                    if idx < Q:
+                        features_to_store.append(decoder_hs[b, idx].detach())
+    
+    if len(features_to_store) > 0:
+        features = torch.stack(features_to_store, dim=0)
+        anomaly_bank.enqueue(features)
+
+def compute_suspicious_alignment_loss(
+    decoder_hs: torch.Tensor,       # (B, Q, D)
+    proto_suspicious: torch.Tensor, # (B, D) suspicious prototype (来自 w)
+    proto_normal: torch.Tensor,     # (B, D) normal prototype (来自 V)
+    proto_abnormal: torch.Tensor,   # (B, D) abnormal prototype (来自 W)
+    is_anomaly: list,
+    temp: float = 0.2,
+    top_r: int = 5,
+):
+    """
+    【新增】w 向量的专属 loss
+    
+    作用：让 w 学习 normal 图中"疑似异常"的 query 模式
+    - 选择 normal 图里 sim_to_abnormal 最大的 top-r queries
+    - 把它们对齐到 w（让 w 专门吸收这些"伪异常"模式）
+    
+    只在 normal 图上更新 w
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    proto_s = F.normalize(proto_suspicious, dim=-1)
+    proto_a = F.normalize(proto_abnormal, dim=-1)
+    
+    loss = torch.tensor(0.0, device=device)
+    count = 0
+    
+    for b in range(B):
+        if not is_anomaly[b]:
+            # 只在 normal 图上更新 w
+            
+            # 计算与 abnormal 的相似度
+            sim_abnormal = (hs_norm[b] @ proto_a[b]) / temp  # (Q,)
+            
+            # 选择 sim_to_abnormal 最高的 top-r queries
+            r = min(top_r, Q)
+            _, top_idx = sim_abnormal.topk(r)
+            
+            # 计算与 suspicious prototype 的相似度
+            sim_suspicious = (hs_norm[b] @ proto_s[b]) / temp  # (Q,)
+            
+            # 让这些 queries 与 suspicious 更相似（拉近）
+            # 使用 InfoNCE 风格的 loss
+            for idx in top_idx:
+                # 希望 sim_suspicious[idx] 高
+                # 用简单的负对数来实现
+                loss = loss - F.logsigmoid(sim_suspicious[idx])
+            
+            count += r
+    
+    if count > 0:
+        loss = loss / count
+    
+    return loss
+
+def query_text_alignment_loss_with_gradient_gating(
+    decoder_hs: torch.Tensor,           # (B, Q, D)
+    proto_normal: torch.Tensor,         # (B, D) normal prototype (来自 V)
+    proto_abnormal_all: torch.Tensor,   # (B, K, D) K 个独立的 abnormal prototypes (来自 W_k)
+    indices: list,
+    gt_masks: torch.Tensor,
+    pred_masks: torch.Tensor,
+    is_anomaly: list,
+    temp: float = 0.2,
+    iou_threshold: float = 0.1,
+    top_k_normal: int = 5,
+    aggregation: str = "max",           # "max" 或 "logsumexp"
+    use_gradient_gating: bool = True,   # 是否启用梯度路由
+):
+    """
+    【完整版】支持 K 个独立 abnormal prototypes + 梯度路由 的 Query-Align Loss
+    
+    关键特性：
+    1. K 个 abnormal prototypes 独立使用，不取平均
+    2. 使用 max 或 logsumexp 聚合 sim_abnormal
+    3. 梯度路由：V 只从 normal 学，W 只从 abnormal 学
+    """
+    B, Q, D = decoder_hs.shape
+    K = proto_abnormal_all.shape[1] if proto_abnormal_all.dim() == 3 else 1
+    device = decoder_hs.device
+    
+    hs_norm = F.normalize(decoder_hs, dim=-1)  # (B, Q, D)
+    proto_n = F.normalize(proto_normal, dim=-1)  # (B, D)
+    
+    # 处理 abnormal prototypes
+    if proto_abnormal_all.dim() == 2:
+        # (B, D) -> (B, 1, D)
+        proto_a_all = F.normalize(proto_abnormal_all.unsqueeze(1), dim=-1)
+        K = 1
+    else:
+        proto_a_all = F.normalize(proto_abnormal_all, dim=-1)  # (B, K, D)
+    
+    loss = torch.tensor(0.0, device=device)
+    total_weight = 0.0
+    
+    for b in range(B):
+        # =====================================================================
+        # 梯度路由 (Gradient Gating)
+        # =====================================================================
+        if use_gradient_gating:
+            if is_anomaly[b]:
+                # 异常图：W 学习，V 不学习（detach V）
+                proto_n_b = proto_n[b].detach()  # V 不回传梯度
+                proto_a_all_b = proto_a_all[b]   # W 正常学习
+            else:
+                # 正常图：V 学习，W 不学习（detach W）
+                proto_n_b = proto_n[b]           # V 正常学习
+                proto_a_all_b = proto_a_all[b].detach()  # W 不回传梯度
+        else:
+            proto_n_b = proto_n[b]
+            proto_a_all_b = proto_a_all[b]
+        
+        # 计算与 normal 的相似度
+        sim_normal = (hs_norm[b] @ proto_n_b) / temp  # (Q,)
+        
+        # 计算与每个 abnormal prototype 的相似度
+        sim_abnormal_all = (hs_norm[b] @ proto_a_all_b.t()) / temp  # (Q, K)
+        
+        # =====================================================================
+        # 聚合 K 个 abnormal 相似度
+        # =====================================================================
+        if aggregation == "max":
+            sim_abnormal, best_k = sim_abnormal_all.max(dim=1)  # (Q,)
+        elif aggregation == "logsumexp":
+            sim_abnormal = torch.logsumexp(sim_abnormal_all, dim=1)  # (Q,)
+        else:
+            sim_abnormal = sim_abnormal_all.mean(dim=1)  # fallback to mean
+        
+        if is_anomaly[b]:
+            # ===== 异常图：matched queries 应该对齐到 abnormal =====
+            src_q, _ = indices[b]
+            
+            if src_q.numel() > 0:
+                # 计算 IoU 权重（如果需要）
+                ious = None
+                if pred_masks is not None and gt_masks is not None:
+                    pred_b = pred_masks[b]  # (Q, H, W)
+                    gt_b = gt_masks[b]  # (H, W)
+                    
+                    if pred_b.shape[-2:] != gt_b.shape[-2:]:
+                        gt_b = F.interpolate(
+                            gt_b.unsqueeze(0).unsqueeze(0).float(),
+                            size=pred_b.shape[-2:], mode='nearest'
+                        ).squeeze(0).squeeze(0)
+                    
+                    pred_binary = (pred_b.sigmoid() > 0.5).float()
+                    gt_binary = (gt_b > 0.5).float()
+                    
+                    intersection = (pred_binary * gt_binary.unsqueeze(0)).sum(dim=(1, 2))
+                    union = pred_binary.sum(dim=(1, 2)) + gt_binary.sum() - intersection
+                    ious = intersection / (union + 1e-6)  # (Q,)
+                
+                # 使用所有 matched queries
+                for idx in src_q.cpu().tolist():
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0]
+                    idx = int(idx)
+                    
+                    if idx < Q:
+                        # IoU 权重
+                        if ious is not None:
+                            iou_val = ious[idx].item()
+                            if iou_val < iou_threshold:
+                                continue
+                            weight = max(iou_val, 0.3)
+                        else:
+                            weight = 1.0
+                        
+                        # 二分类: [normal, abnormal_aggregated]
+                        logits = torch.stack([sim_normal[idx], sim_abnormal[idx]])
+                        target = torch.tensor([1], device=device)  # 应该是 abnormal
+                        loss_q = F.cross_entropy(logits.unsqueeze(0), target)
+                        
+                        loss = loss + weight * loss_q
+                        total_weight += weight
+        else:
+            # ===== 正常图：hard negative queries 应该对齐到 normal =====
+            # 选择与 abnormal 最相似的 queries（它们最需要被纠正）
+            k = min(top_k_normal, Q)
+            _, top_idx = sim_abnormal.topk(k)
+            
+            for idx in top_idx:
+                logits = torch.stack([sim_normal[idx], sim_abnormal[idx]])
+                target = torch.tensor([0], device=device)  # 应该是 normal
+                loss_q = F.cross_entropy(logits.unsqueeze(0), target)
+                loss = loss + loss_q
+            
+            total_weight += k
+    
+    if total_weight > 0:
+        loss = loss / total_weight
+    
+    return loss
+
+def query_text_alignment_loss_binary_v4(
+    decoder_hs: torch.Tensor,       # (B, Q, D)
+    proto_normal: torch.Tensor,     # (B, D)
+    proto_abnormal_all: torch.Tensor,  # (B, K, D) K 个独立的 abnormal prototypes
+    indices: list,
+    gt_masks: torch.Tensor,
+    pred_masks: torch.Tensor,
+    is_anomaly: list,
+    specie_names: list = None,      # 用于映射 query 到具体的 W_k
+    temp: float = 0.2,
+    iou_threshold: float = 0.1,
+    top_k_normal: int = 5,
+):
+    """
+    【进阶版】支持多个 abnormal prototypes 的 Query-Align Loss
+    
+    思路：
+    - 如果有 specie_names，可以尝试将 query 对齐到对应的 W_k
+    - 否则，找与 query 最相似的 W_k
+    """
+    B, Q, D = decoder_hs.shape
+    K = proto_abnormal_all.shape[1]
+    device = decoder_hs.device
+    
+    hs_norm = F.normalize(decoder_hs, dim=-1)
+    proto_n = F.normalize(proto_normal, dim=-1)
+    proto_a_all = F.normalize(proto_abnormal_all, dim=-1)  # (B, K, D)
+    
+    loss = torch.tensor(0.0, device=device)
+    total_weight = 0.0
+    
+    for b in range(B):
+        # 计算与 normal 的相似度
+        sim_normal = (hs_norm[b] @ proto_n[b]) / temp  # (Q,)
+        
+        # 计算与每个 abnormal prototype 的相似度
+        sim_abnormal_all = (hs_norm[b] @ proto_a_all[b].t()) / temp  # (Q, K)
+        
+        if is_anomaly[b]:
+            src_q, _ = indices[b]
+            
+            if src_q.numel() > 0:
+                for idx in src_q.cpu().tolist():
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0]
+                    idx = int(idx)
+                    
+                    if idx < Q:
+                        # 方案 A: 使用最相似的 W_k
+                        best_k = sim_abnormal_all[idx].argmax().item()
+                        sim_abnormal = sim_abnormal_all[idx, best_k]
+                        
+                        # 二分类: [normal, abnormal_best_k]
+                        logits = torch.stack([sim_normal[idx], sim_abnormal])
+                        target = torch.tensor([1], device=device)  # 应该是 abnormal
+                        loss_q = F.cross_entropy(logits.unsqueeze(0), target)
+                        
+                        loss = loss + loss_q
+                        total_weight += 1.0
+        else:
+            # 正常图: 选择 hard negatives
+            sim_abnormal_max = sim_abnormal_all.max(dim=1)[0]  # (Q,) 每个 query 与最相似的 W_k
+            k = min(top_k_normal, Q)
+            _, top_idx = sim_abnormal_max.topk(k)
+            
+            for idx in top_idx:
+                logits = torch.stack([sim_normal[idx], sim_abnormal_max[idx]])
+                target = torch.tensor([0], device=device)  # 应该是 normal
+                loss_q = F.cross_entropy(logits.unsqueeze(0), target)
+                loss = loss + loss_q
+            
+            total_weight += k
+    
+    if total_weight > 0:
+        loss = loss / total_weight
+    
+    return loss
+
+def query_text_alignment_loss_binary_v3(
+    decoder_hs: torch.Tensor,       # (B, Q, D) decoder 输出的 query 特征
+    proto_normal: torch.Tensor,     # (B, D) normal prototype
+    proto_abnormal: torch.Tensor,   # (B, D) 或 (B, K, D) abnormal prototype(s)
+    indices: list,                  # matcher 输出
+    gt_masks: torch.Tensor,         # (B, H, W) GT masks
+    pred_masks: torch.Tensor,       # (B, Q, H, W) 预测的masks
+    is_anomaly: list,               # 每张图是否是异常
+    temp: float = 0.2,
+    iou_threshold: float = 0.1,     # IoU阈值
+    top_k_normal: int = 5,
+    use_all_matched: bool = True,   # 使用所有matched queries
+    use_iou_weight: bool = True,    # 使用IoU作为权重
+):
+    """
+    【修复版V3】二分类 Query-Text Alignment Loss
+    
+    核心修复：
+    1. 使用所有matched queries，而非只用第一个
+    2. 使用IoU作为权重（高IoU的query贡献更大）
+    3. 正常图权重改为1.0（随机基线回到log(2)≈0.69）
+    4. 支持多个abnormal prototypes
+    
+    Args:
+        decoder_hs: (B, Q, D) query 特征
+        proto_normal: (B, D) normal 原型
+        proto_abnormal: (B, D) 或 (B, K, D) abnormal 原型
+        indices: matcher 输出的匹配索引
+        gt_masks: (B, H, W) GT 分割掩码
+        pred_masks: (B, Q, H, W) 预测的masks
+        is_anomaly: 每张图是否是异常
+        temp: 温度参数
+        iou_threshold: IoU阈值，低于此值不参与训练
+        top_k_normal: 正常图中选择的 hard negative 数量
+        use_all_matched: 是否使用所有matched queries
+        use_iou_weight: 是否使用IoU作为权重
+    
+    Returns:
+        loss: 标量损失
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    # 归一化
+    hs_norm = F.normalize(decoder_hs, dim=-1)  # (B, Q, D)
+    proto_n = F.normalize(proto_normal, dim=-1)  # (B, D)
+    
+    # 处理多个abnormal prototypes
+    if proto_abnormal.dim() == 3:
+        # (B, K, D) -> (B, D) 取平均
+        proto_a = F.normalize(proto_abnormal.mean(dim=1), dim=-1)
+    else:
+        proto_a = F.normalize(proto_abnormal, dim=-1)
+    
+    loss = torch.tensor(0.0, device=device)
+    total_weight = 0.0
+    
+    for b in range(B):
+        # 计算每个 query 与两个原型的相似度
+        sim_normal = (hs_norm[b] @ proto_n[b]) / temp  # (Q,)
+        sim_abnormal = (hs_norm[b] @ proto_a[b]) / temp  # (Q,)
+        
+        # 拼接为二分类 logits: [normal, abnormal]
+        logits = torch.stack([sim_normal, sim_abnormal], dim=-1)  # (Q, 2)
+        
+        if is_anomaly[b]:
+            # ===== 异常图：matched queries 应该对齐到 abnormal =====
+            src_q, tgt_q = indices[b]
+            
+            if src_q.numel() > 0:
+                # 计算IoU（如果需要）
+                ious = None
+                if use_iou_weight and pred_masks is not None and gt_masks is not None:
+                    pred_b = pred_masks[b]  # (Q, H, W)
+                    gt_b = gt_masks[b]  # (H, W)
+                    
+                    # 确保尺寸匹配
+                    if pred_b.shape[-2:] != gt_b.shape[-2:]:
+                        gt_b = F.interpolate(
+                            gt_b.unsqueeze(0).unsqueeze(0).float(),
+                            size=pred_b.shape[-2:], mode='nearest'
+                        ).squeeze(0).squeeze(0)
+                    
+                    # 计算IoU
+                    pred_binary = (pred_b.sigmoid() > 0.5).float()
+                    gt_binary = (gt_b > 0.5).float()
+                    
+                    intersection = (pred_binary * gt_binary.unsqueeze(0)).sum(dim=(1, 2))
+                    union = pred_binary.sum(dim=(1, 2)) + gt_binary.sum() - intersection
+                    ious = intersection / (union + 1e-6)  # (Q,)
+                
+                # 【修复】使用所有matched queries
+                if use_all_matched:
+                    matched_indices = src_q.cpu().tolist()
+                else:
+                    matched_indices = [int(src_q[0].item())]
+                
+                for idx in matched_indices:
+                    if isinstance(idx, (list, tuple)):
+                        idx = idx[0] if len(idx) > 0 else 0
+                    idx = int(idx)
+                    
+                    if idx < Q:
+                        # 计算权重
+                        if ious is not None:
+                            iou_val = ious[idx].item()
+                            if iou_val < iou_threshold:
+                                continue  # 跳过低IoU的query
+                            weight = max(iou_val, 0.3)  # 至少0.3权重
+                        else:
+                            weight = 1.0
+                        
+                        # Cross-entropy loss
+                        target = torch.tensor([1], device=device)
+                        loss_q = F.cross_entropy(logits[idx:idx+1], target)
+                        
+                        loss = loss + weight * loss_q
+                        total_weight += weight
+        else:
+            # ===== 正常图：高响应 query 应该对齐到 normal =====
+            k = min(top_k_normal, Q)
+            _, top_idx = sim_abnormal.topk(k)
+            
+            # 这些 query 应该被拉向 normal (class 0)
+            targets = torch.zeros(k, dtype=torch.long, device=device)
+            loss_b = F.cross_entropy(logits[top_idx], targets)
+            
+            # 【修复】权重改为1.0，不再是0.5
+            loss = loss + loss_b
+            total_weight += 1.0
+    
+    if total_weight > 0:
+        loss = loss / total_weight
+    
+    return loss
+
+def image_level_presence_loss(
+    pred_logits: torch.Tensor,      # (B, Q, 1) 或 (B, Q) query级别的logits
+    is_anomaly: list,               # 每张图是否是异常
+    aggregation: str = "max",        # "max", "mean", "logsumexp"
+    use_focal: bool = True,
+    focal_alpha: float = 0.5,
+    focal_gamma: float = 2.0,
+):
+    """
+    【修复版】图像级别的 Presence Loss
+    
+    核心修复：
+    - 从Query级别 (B, Q) 聚合到图像级别 (B,)
+    - 问："这张图是否有异常？"
+    - 理论下限：log(2) ≈ 0.69
+    
+    Args:
+        pred_logits: (B, Q, 1) 或 (B, Q) query级别的logits
+        is_anomaly: 每张图是否是异常
+        aggregation: 聚合方法
+            - "max": 最异常的query决定整张图
+            - "mean": 平均所有query
+            - "logsumexp": soft max（可微分）
+        use_focal: 是否使用Focal Loss
+        focal_alpha: Focal Loss的alpha参数
+        focal_gamma: Focal Loss的gamma参数
+    
+    Returns:
+        loss: 标量损失
+        acc: 准确率
+    """
+    device = pred_logits.device
+    
+    # 确保是 (B, Q) 形状
+    if pred_logits.dim() == 3:
+        pred_logits = pred_logits.squeeze(-1)
+    
+    # 聚合到图像级别
+    if aggregation == "max":
+        image_logits = pred_logits.max(dim=1)[0]  # (B,)
+    elif aggregation == "mean":
+        image_logits = pred_logits.mean(dim=1)  # (B,)
+    elif aggregation == "logsumexp":
+        image_logits = torch.logsumexp(pred_logits, dim=1)  # (B,)
+    else:
+        image_logits = pred_logits.max(dim=1)[0]
+    
+    # 构建图像级标签
+    targets = torch.tensor(is_anomaly, dtype=torch.float32, device=device)
+    
+    if use_focal:
+        # Focal Loss
+        p = torch.sigmoid(image_logits)
+        ce_loss = F.binary_cross_entropy_with_logits(image_logits, targets, reduction='none')
+        
+        p_t = p * targets + (1 - p) * (1 - targets)
+        focal_weight = (1 - p_t) ** focal_gamma
+        
+        alpha_t = focal_alpha * targets + (1 - focal_alpha) * (1 - targets)
+        
+        loss = (alpha_t * focal_weight * ce_loss).mean()
+    else:
+        loss = F.binary_cross_entropy_with_logits(image_logits, targets)
+    
+    # 计算准确率
+    with torch.no_grad():
+        preds = (torch.sigmoid(image_logits) > 0.5).float()
+        acc = (preds == targets).float().mean()
+    
+    return loss, acc
+
+def compute_compound_losses(model, outputs, labels, args):
+    """计算Compound Prompt Learner的辅助损失"""
+    losses = {}
+    
+    prompt_learner = model.prompt_learner
+    if hasattr(model, 'module'):  # DDP情况
+        prompt_learner = model.module.prompt_learner
+    
+    # 检查是否是compound类型
+    pl_type = getattr(model, 'prompt_learner_type', None)
+    if hasattr(model, 'module'):
+        pl_type = getattr(model.module, 'prompt_learner_type', None)
+    
+    if pl_type != "compound":
+        return losses
+    
+    # 1. 正交约束损失（优先使用 prototype 级别）
+    if hasattr(prompt_learner, 'compute_orthogonal_loss_prototype_level'):
+        losses['orthogonal_loss'] = prompt_learner.compute_orthogonal_loss_prototype_level()
+    elif hasattr(prompt_learner, 'compute_orthogonal_loss'):
+        losses['orthogonal_loss'] = prompt_learner.compute_orthogonal_loss()
+    
+    # 2. 先验损失（L2 正则，V3 不需要参数）
+    if hasattr(prompt_learner, 'compute_prior_loss'):
+        losses['prior_loss'] = prompt_learner.compute_prior_loss()
+    
+    # 3. 对比损失（Normal/Abnormal分离，V3 不需要参数）
+    if hasattr(prompt_learner, 'compute_contrast_loss'):
+        losses['contrast_loss'] = prompt_learner.compute_contrast_loss()
+    
+    return losses
+
 # ==================== 新增：模型架构打印 ====================
 def _print_model_tree(model, name="model", filter_key="", file_handle=None, also_stdout=True):
     """
@@ -793,6 +2121,86 @@ def query_text_alignment_loss(
             loss = loss + F.cross_entropy(all_sim.unsqueeze(0), target)
         
         valid_count += 1
+    
+    if valid_count > 0:
+        loss = loss / valid_count
+    
+    return loss
+
+
+def query_text_alignment_loss_binary(
+    decoder_hs: torch.Tensor,       # (B, Q, D) decoder 输出的 query 特征
+    proto_normal: torch.Tensor,     # (B, D) normal prototype
+    proto_abnormal: torch.Tensor,   # (B, D) abnormal prototype  
+    indices: list,                  # matcher 输出
+    gt_masks: torch.Tensor,         # (B, H, W) GT masks
+    is_anomaly: list,               # 每张图是否是异常
+    temp: float = 0.2,
+    top_k_normal: int = 5,          # 正常图中选择的 query 数量
+):
+    """
+    二分类版本的 Query-Text Alignment Loss
+    
+    核心思想：
+    - 每个 query 判断是应该对齐到 normal 还是 abnormal
+    - 使用 GT mask 生成软标签（query 与异常区域的 IoU）
+    - 理论下限是 log(2) ≈ 0.69，远低于原来的 log(400) ≈ 6.0
+    
+    Args:
+        decoder_hs: (B, Q, D) query 特征
+        proto_normal: (B, D) normal 原型
+        proto_abnormal: (B, D) abnormal 原型
+        indices: matcher 输出的匹配索引
+        gt_masks: (B, H, W) GT 分割掩码
+        is_anomaly: 每张图是否是异常
+        temp: 温度参数
+        top_k_normal: 正常图中选择的 query 数量
+    
+    Returns:
+        loss: 标量损失
+    """
+    B, Q, D = decoder_hs.shape
+    device = decoder_hs.device
+    
+    # 归一化
+    hs_norm = F.normalize(decoder_hs, dim=-1)  # (B, Q, D)
+    proto_n = F.normalize(proto_normal, dim=-1)  # (B, D)
+    proto_a = F.normalize(proto_abnormal, dim=-1)  # (B, D)
+    
+    loss = torch.tensor(0.0, device=device)
+    valid_count = 0
+    
+    for b in range(B):
+        # 计算每个 query 与两个原型的相似度
+        sim_normal = (hs_norm[b] @ proto_n[b]) / temp  # (Q,)
+        sim_abnormal = (hs_norm[b] @ proto_a[b]) / temp  # (Q,)
+        
+        # 拼接为二分类 logits: [normal, abnormal]
+        logits = torch.stack([sim_normal, sim_abnormal], dim=-1)  # (Q, 2)
+        
+        if is_anomaly[b]:
+            # ===== 异常图：matched query 应该对齐到 abnormal =====
+            src_q, tgt_q = indices[b]
+            
+            if src_q.numel() > 0:
+                matched_idx = int(src_q[0].item())
+                if matched_idx < Q:
+                    # matched query 应该对齐到 abnormal (class 1)
+                    target = torch.tensor([1], device=device)
+                    loss_b = F.cross_entropy(logits[matched_idx:matched_idx+1], target)
+                    loss = loss + loss_b
+                    valid_count += 1
+        else:
+            # ===== 正常图：高响应 query 应该对齐到 normal =====
+            # 选择与 abnormal 相似度最高的 query（它们最需要被纠正）
+            k = min(top_k_normal, Q)
+            _, top_idx = sim_abnormal.topk(k)
+            
+            # 这些 query 应该被拉向 normal (class 0)
+            targets = torch.zeros(k, dtype=torch.long, device=device)
+            loss_b = F.cross_entropy(logits[top_idx], targets)
+            loss = loss + 0.5 * loss_b  # 正常图权重降低
+            valid_count += 1
     
     if valid_count > 0:
         loss = loss / valid_count
@@ -1753,6 +3161,7 @@ def main(args: argparse.Namespace):
             enable_lora=not args.disable_lora,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
+            lora_layer_ids=args.lora_layer_ids,
             freeze_vision=args.freeze_vision,
             freeze_text=args.freeze_text,
             enable_parallel_lora=args.enable_parallel_lora,
@@ -1769,6 +3178,14 @@ def main(args: argparse.Namespace):
             use_keywords=args.use_keywords,
             cocoop_vis_dim=args.cocoop_vis_dim,
             cocoop_reduction=args.cocoop_reduction,
+            # ===== Compound Prompt Learning =====
+            compound_mode=getattr(args, "compound_mode", "cocoop"),
+            compound_n_ctx=getattr(args, "compound_n_ctx", 4),
+            compound_n_ctx_offset=getattr(args, "compound_n_ctx_offset", 2),
+            compound_num_abnormal=getattr(args, "compound_num_abnormal", 10),
+            compound_enable_dap=getattr(args, "compound_enable_dap", False),
+            compound_dap_top_k=getattr(args, "compound_dap_top_k", 10),
+            compound_meta_reduction=getattr(args, "compound_meta_reduction", 16),
             # ===== 多尺度特征 & Stages消融 =====
             num_feature_levels=getattr(args, "num_feature_levels", 1),
             selected_levels=_parse_selected_levels(args),
@@ -1797,6 +3214,7 @@ def main(args: argparse.Namespace):
             enable_lora=not args.disable_lora,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
+            lora_layer_ids=args.lora_layer_ids,
             freeze_vision=args.freeze_vision,
             freeze_text=args.freeze_text,
             device=device,
@@ -2025,6 +3443,18 @@ def main(args: argparse.Namespace):
     model.train()
     best_loss = float("inf")
     global_optim_step = 0  # 优化器更新计数（用于调度器）
+
+    anomaly_bank = AnomalyFeatureBankV2(
+        max_size=2048,
+        dim=256,
+        min_fill_ratio=0.5,
+        warm_up_ratio=getattr(args, 'bank_warm_up_ratio', 0.3),
+        orthogonalize=getattr(args, 'bank_orthogonalize', True),
+    )
+    print(f"[INFO] Initialized AnomalyFeatureBankV2: "
+          f"max_size=2048, warm_up={anomaly_bank.warm_up_ratio}, "
+          f"orthogonalize={anomaly_bank.orthogonalize}")
+    print(f"[INFO] Initialized AnomalyFeatureBank: max_size=2048, min_fill=50%")
     
     for epoch in range(args.epochs):
         if args.distributed:
@@ -2691,48 +4121,39 @@ def main(args: argparse.Namespace):
 
                 # loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
-                # Presence BCE loss (requires presence_head=True in model_builder)
-                # pred_logits 已被准备成 (B, Q, 1) 形式 earlier; we squeeze trailing dim.
+                # ===== 【修复】图像级别的 Presence Loss =====
                 if pred_logits is not None:
-                    # convert to shape (B, Q) for BCEWithLogits (logits)
-                    # pred_logits currently is (B, Q, 1) according to normalize_presence_logits
+                    # pred_logits: (B, Q, 1) 或 (B, Q)
                     presence_logit = pred_logits
                     if presence_logit.dim() == 3 and presence_logit.shape[-1] == 1:
                         presence_logit = presence_logit.squeeze(-1)  # (B, Q)
-                    # safety: if still has extra dims, reshape/pad
-                    if presence_logit.dim() != 2:
-                        # try to force into (B,Q)
-                        presence_logit = presence_logit.reshape(B, Q)
-
-                    # build presence target matrix (B, Q)
-                    presence_targets = torch.zeros_like(presence_logit, dtype=torch.float32, device=device)
-
-                    # get indices per image using our helper (already computed into 'indices' local alias)
-                    indices_per_image = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=images.shape[0], device=device)
-
-                    # Defensive assignment: filter out-of-range indices and print diagnostics
-                    Q_dim = presence_targets.shape[1]
-                    for b in range(images.shape[0]):
-                        src_q, _ = indices_per_image[b]
-                        if src_q.numel() > 0:
-                            # ensure dtype long and on same device
-                            src_q = src_q.to(device).long()
-
-                            # detect invalid indices
-                            invalid_mask = (src_q < 0) | (src_q >= Q_dim)
-                            if invalid_mask.any():
-                                print(f"[WARN] presence_targets: found {invalid_mask.sum().item()} invalid src indices for image {b}. "
-                                      f"Q={Q_dim}, src_q_invalid={src_q[invalid_mask].cpu().tolist()}")
-
-                                # drop invalid indices before assignment
-                                src_q = src_q[~invalid_mask]
-
-                            if src_q.numel() > 0:
-                                presence_targets[b, src_q] = 1.0
-
-                    loss_presence = F.binary_cross_entropy_with_logits(presence_logit, presence_targets)
+                    
+                    # 【修复】聚合到图像级别
+                    image_presence_logit = presence_logit.max(dim=1)[0]  # (B,)
+                    
+                    # 图像级标签
+                    presence_targets_image = torch.tensor(is_anomaly, dtype=torch.float32, device=device)
+                    
+                    # Focal Loss (更好处理类别不平衡)
+                    p = torch.sigmoid(image_presence_logit)
+                    ce_loss = F.binary_cross_entropy_with_logits(
+                        image_presence_logit, presence_targets_image, reduction='none'
+                    )
+                    p_t = p * presence_targets_image + (1 - p) * (1 - presence_targets_image)
+                    focal_weight = (1 - p_t) ** 2.0  # gamma=2.0
+                    alpha_t = 0.5 * presence_targets_image + 0.5 * (1 - presence_targets_image)
+                    
+                    loss_presence = (alpha_t * focal_weight * ce_loss).mean()
+                    
+                    # 计算准确率用于logging
+                    with torch.no_grad():
+                        presence_preds = (p > 0.5).float()
+                        presence_acc = (presence_preds == presence_targets_image).float().mean()
+                        if step % 100 == 0:
+                            print(f"[Presence] Image-level: loss={loss_presence.item():.4f}, "
+                                  f"acc={presence_acc.item():.2%}, "
+                                  f"n_anomaly={sum(is_anomaly)}/{len(is_anomaly)}")
                 else:
-                    # fallback (shouldn't happen because we normalized earlier), keep zero
                     loss_presence = torch.tensor(0.0, device=device)
 
                 # -------------------------
@@ -2779,22 +4200,56 @@ def main(args: argparse.Namespace):
                 query_align_loss = torch.tensor(0.0, device=device)
                 
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
-                    # ===== Step 1: 获取 prompt prototype (SOWA风格) =====
-                    prompt_seq = out.get("prompt_seq", None)
-                    if prompt_seq is None:
-                        try:
-                            prompt_seq, _ = model_core.prompt_learner(prompt_lists, device=device)
-                        except Exception as e:
-                            print("[WARN] cannot obtain prompt_seq from model_core.prompt_learner:", e)
-                            prompt_seq = None
+                    # ===== Step 1: 获取 prompt prototype =====
+                    # 【修复】优先使用结构化原型 (compound prompt 输出)
+                    text_features_structured = out.get("text_features_structured", None)
+                    
+                    if text_features_structured is not None:
+                        # 【修复】处理字典格式
+                        if isinstance(text_features_structured, dict):
+                            prompt_proto_normal = text_features_structured['normal']       # (B, D)
+                            prompt_proto_abnormal_all = text_features_structured['abnormal_all']  # (B, K, D)
+                            prompt_proto_abnormal = text_features_structured['abnormal_mean']     # (B, D)
+                            num_abnormal = text_features_structured['num_abnormal']
+                            
+                            # 【v2.1 新增】获取 w 的原型
+                            proto_suspicious = text_features_structured.get('proto_suspicious', None)  # (B, D)
+                            
+                            prompt_proto = prompt_proto_abnormal  # 保持 align_loss 兼容
+                            
+                            if step % 500 == 0:
+                                print(f"[ALIGN] Using structured prototypes: "
+                                      f"normal={prompt_proto_normal.shape}, "
+                                      f"abnormal_all={prompt_proto_abnormal_all.shape}, "
+                                      f"K={num_abnormal}, "
+                                      f"proto_suspicious={'Yes' if proto_suspicious is not None else 'No'}")
+                        else:
+                            # 兼容旧格式 (B, 2, D)
+                            prompt_proto_normal = text_features_structured[:, 0, :]
+                            prompt_proto_abnormal = text_features_structured[:, 1, :]
+                            prompt_proto_abnormal_all = None
+                            prompt_proto = prompt_proto_abnormal
+                            proto_suspicious = None  # 【v2.1】旧格式不支持
+                    else:
+                        # 回退到原来的方式
+                        prompt_seq = out.get("prompt_seq", None)
+                        if prompt_seq is None:
+                            try:
+                                prompt_seq, _ = model_core.prompt_learner(prompt_lists, device=device)
+                            except Exception as e:
+                                print("[WARN] cannot obtain prompt_seq from model_core.prompt_learner:", e)
+                                prompt_seq = None
 
-                    # 使用SOWA风格的pooling获取prompt_proto
-                    prompt_proto = pool_prompt_features_sowa_style(
-                        prompt_seq=prompt_seq,
-                        prompt_lists=prompt_lists,
-                        is_anomaly=is_anomaly,
-                        device=device
-                    )
+                        # 使用SOWA风格的pooling获取prompt_proto
+                        prompt_proto = pool_prompt_features_sowa_style(
+                            prompt_seq=prompt_seq,
+                            prompt_lists=prompt_lists,
+                            is_anomaly=is_anomaly,
+                            device=device
+                        )
+                        prompt_proto_normal = None
+                        prompt_proto_abnormal = prompt_proto
+                        proto_suspicious = None  # 【v2.1】回退模式不支持
 
                     # ===== Step 2: 获取 visual embedding（区分异常/正常）=====
                     # 优先级：FiLo patch_tokens > decoder_features
@@ -2881,16 +4336,30 @@ def main(args: argparse.Namespace):
                                   f"n_samples={n_samples} n_unique_groups={n_unique_groups} "
                                   f"has_multi_positive={n_unique_groups < n_samples}")
                         
-                        # 使用带 margin 的 supervised contrastive loss
-                        align_margin = getattr(args, 'align_margin', 0.3)  # 降低默认 margin
-                        align_loss = align_loss_with_background_margin(
-                            prompt_proto=prompt_proto,
-                            visual_embed=visual_embed,
-                            is_background=is_background,
-                            group_labels=group_labels,
-                            temp=args.align_temp,
-                            margin=align_margin
-                        )
+                        # ===== 【v2.1 修复】使用二分类形式的 align loss =====
+                        # 确保有 normal 和 abnormal 两个原型
+                        if prompt_proto_normal is not None and prompt_proto_abnormal is not None:
+                            align_loss = align_loss_binary_classification(
+                                proto_normal=prompt_proto_normal,
+                                proto_abnormal=prompt_proto_abnormal,
+                                visual_embed=visual_embed,
+                                is_anomaly=is_anomaly,
+                                temp=args.align_temp,
+                                label_smoothing=0.1,
+                            )
+                        else:
+                            # 回退到原来的方法（不应该发生）
+                            align_loss = align_loss_with_background_margin(
+                                prompt_proto=prompt_proto,
+                                visual_embed=visual_embed,
+                                is_background=is_background,
+                                group_labels=group_labels,
+                                temp=args.align_temp,
+                                margin=align_margin
+                            )
+                        
+                        if step % 100 == 0:
+                            print(f"[ALIGN-v2.1] binary_classification loss={align_loss.item():.4f}")
                         
                         # ===== Step 5: Query-level alignment（v2改进版）=====
                         # current_lambda_query_align 已在 batch 循环开始时初始化（两阶段调度或固定值）
@@ -2907,10 +4376,7 @@ def main(args: argparse.Namespace):
                                         decoder_hs = decoder_hs.permute(1, 0, 2).contiguous()
                                 
                                 if use_query_align_v2:
-                                    # ===== 使用v2版本（三个关键修复）=====
-                                    # 注意：当前系统只有异常prompt，没有单独的normal prompt
-                                    # 所以 prompt_proto_normal 设为 None，使用简化的 margin loss
-                                    prompt_proto_normal = None  # 不使用，改用直接惩罚
+                                    # ===== 【修复】使用二分类版本（如果有结构化原型）=====
                                     
                                     # 获取pred_masks
                                     pred_masks_for_qa = out.get("pred_masks", None)
@@ -2934,27 +4400,48 @@ def main(args: argparse.Namespace):
                                             gt_masks_list.append(torch.zeros(target_size, device=device))
                                     gt_masks_for_qa = torch.stack(gt_masks_list, dim=0)  # (B, H, W)
                                     
-                                    # 计算当前步数比例（使用全局step，不是epoch内step）
-                                    total_steps = len(dataloader) * args.epochs
-                                    global_step_for_qa = epoch * len(dataloader) + step
-                                    current_step_ratio = global_step_for_qa / total_steps
-                                    
-                                    query_align_loss = query_text_alignment_loss_v2(
-                                        decoder_hs=decoder_hs,
-                                        prompt_proto=prompt_proto,
-                                        prompt_proto_normal=prompt_proto_normal,
-                                        indices=indices,
-                                        pred_masks=pred_masks_for_qa,
-                                        gt_masks=gt_masks_for_qa,
-                                        is_anomaly=is_anomaly,
-                                        temp=getattr(args, 'query_align_temp', 0.2),
-                                        top_k=getattr(args, 'query_align_top_k', 64),
-                                        use_soft_target=getattr(args, 'query_align_soft_target', True),
-                                        include_normal=getattr(args, 'query_align_include_normal', True),
-                                        normal_margin=getattr(args, 'query_align_normal_margin', 0.3),
-                                        use_full_softmax_ratio=getattr(args, 'query_align_full_softmax_ratio', 0.2),
-                                        current_step_ratio=current_step_ratio,
-                                    )
+                                    # 【修复】根据是否有结构化原型选择不同的 loss 函数
+                                    if text_features_structured is not None and prompt_proto_normal is not None:
+                                        # 【完整版】使用 K 个独立 abnormal prototypes + 梯度路由
+                                        # 优先使用 abnormal_all（K 个独立的）
+                                        proto_abnormal_for_qa = prompt_proto_abnormal_all if prompt_proto_abnormal_all is not None else prompt_proto_abnormal
+                                        
+                                        query_align_loss = query_text_alignment_loss_with_gradient_gating(
+                                            decoder_hs=decoder_hs,
+                                            proto_normal=prompt_proto_normal,
+                                            proto_abnormal_all=proto_abnormal_for_qa,
+                                            indices=indices,
+                                            gt_masks=gt_masks_for_qa,
+                                            pred_masks=pred_masks_for_qa,
+                                            is_anomaly=is_anomaly,
+                                            temp=getattr(args, 'query_align_temp', 0.2),
+                                            iou_threshold=getattr(args, 'query_align_iou_threshold', 0.1),
+                                            top_k_normal=getattr(args, 'query_align_top_k_normal', 5),
+                                            aggregation="max",          # 使用 max 聚合
+                                            use_gradient_gating=True,   # 启用梯度路由
+                                        )
+                                    else:
+                                        # 回退到v2版本
+                                        total_steps = len(dataloader) * args.epochs
+                                        global_step_for_qa = epoch * len(dataloader) + step
+                                        current_step_ratio = global_step_for_qa / total_steps
+                                        
+                                        query_align_loss = query_text_alignment_loss_v2(
+                                            decoder_hs=decoder_hs,
+                                            prompt_proto=prompt_proto,
+                                            prompt_proto_normal=None,
+                                            indices=indices,
+                                            pred_masks=pred_masks_for_qa,
+                                            gt_masks=gt_masks_for_qa,
+                                            is_anomaly=is_anomaly,
+                                            temp=getattr(args, 'query_align_temp', 0.2),
+                                            top_k=getattr(args, 'query_align_top_k', 64),
+                                            use_soft_target=getattr(args, 'query_align_soft_target', True),
+                                            include_normal=getattr(args, 'query_align_include_normal', True),
+                                            normal_margin=getattr(args, 'query_align_normal_margin', 0.3),
+                                            use_full_softmax_ratio=getattr(args, 'query_align_full_softmax_ratio', 0.2),
+                                            current_step_ratio=current_step_ratio,
+                                        )
                                 else:
                                     # 使用原始v1版本
                                     query_align_loss = query_text_alignment_loss(
@@ -2964,9 +4451,72 @@ def main(args: argparse.Namespace):
                                         temp=getattr(args, 'query_align_temp', 0.2),
                                         top_k=getattr(args, 'query_align_top_k', 64)
                                     )
+
+                                # ===== 【v2.1 新增】收集异常特征到 Memory Bank =====
+                                indices_for_bank = out.get("indices", None)
+                                if indices_for_bank is not None and decoder_hs is not None:
+                                    # 计算当前进度
+                                    total_steps = len(dataloader) * args.epochs
+                                    current_step = epoch * len(dataloader) + step
+                                    current_step_ratio = current_step / total_steps
+
+                                    collect_anomaly_features_to_bank_v2(
+                                        decoder_hs=decoder_hs,
+                                        matched_indices=indices_for_bank,
+                                        is_anomaly=is_anomaly,
+                                        anomaly_bank=anomaly_bank,
+                                        proto_normal=prompt_proto_normal,
+                                        current_step_ratio=current_step_ratio,
+                                    )                                  
                         else:
                              query_align_loss = torch.tensor(0.0, device=device)
 
+                        # 【新增】w 向量的专属 loss（只在 normal 图上更新）
+                        loss_suspicious = torch.tensor(0.0, device=device)
+                        lambda_suspicious = getattr(args, 'lambda_suspicious', 0.1)
+
+                        # ===== 【v2.1 修复】使用 Memory Bank 的 suspicious loss =====
+                        if lambda_suspicious > 0 and proto_suspicious is not None:
+                            indices_for_suspicious = out.get("indices", None)
+                            
+                            # 计算当前进度（如果上面没有计算）
+                            total_steps = len(dataloader) * args.epochs
+                            current_step = epoch * len(dataloader) + step
+                            current_step_ratio = current_step / total_steps
+                            
+                            # 检查是否禁用 w 学习
+                            if not getattr(args, 'disable_w_learning', False):
+                                loss_suspicious = compute_suspicious_loss_hybrid_v2(
+                                    decoder_hs=decoder_hs,
+                                    proto_suspicious=proto_suspicious,
+                                    proto_abnormal=prompt_proto_abnormal,
+                                    anomaly_bank=None if getattr(args, 'disable_bank', False) else anomaly_bank,
+                                    matched_indices=indices_for_suspicious,
+                                    is_anomaly=is_anomaly,
+                                    current_step_ratio=current_step_ratio,
+                                    temp=getattr(args, 'query_align_temp', 0.2),
+                                    top_r=5,
+                                    w_abnormal_margin=getattr(args, 'w_abnormal_margin', 0.3),
+                                )
+                                
+                                if step % 100 == 0:
+                                    bank_stats = anomaly_bank.get_stats()
+                                    print(f"[SUSPICIOUS-v2.2] loss={loss_suspicious.item():.4f}, "
+                                          f"bank_ready={bank_stats['is_ready']}, "
+                                          f"bank_fill={bank_stats['fill_ratio']:.1%}, "
+                                          f"warm_up_passed={current_step_ratio >= bank_stats['warm_up_ratio']}")
+                            else:
+                                loss_suspicious = torch.tensor(0.0, device=device)
+                            
+                            if step % 100 == 0:
+                                bank_stats = anomaly_bank.get_stats()
+                                print(f"[SUSPICIOUS-v2.1] loss={loss_suspicious.item():.4f}, "
+                                      f"bank_ready={bank_stats['is_ready']}, "
+                                      f"bank_fill={bank_stats['fill_ratio']:.1%}")
+                        else:
+                            loss_suspicious = torch.tensor(0.0, device=device)
+                        
+                            
                         # ===== Diagnostics (每 log_freq 步打印一次) =====
                         if (step % getattr(args, "log_freq", 100)) == 0:
                             p_norm = F.normalize(prompt_proto, dim=1)
@@ -3132,26 +4682,26 @@ def main(args: argparse.Namespace):
                                 
                                 stats_text = f"""Epoch {epoch+1} Statistics
                                 
-Alignment Loss:
-  align_loss: {align_loss.item():.4f}
-  query_align: {query_align_loss.item():.4f}
+                                    Alignment Loss:
+                                      align_loss: {align_loss.item():.4f}
+                                      query_align: {query_align_loss.item():.4f}
 
-Similarity Stats:
-  pos_sim (same group): {pos_sim_val:.4f}
-  neg_sim (diff group): {neg_sim_val:.4f}
-  separation: {pos_sim_val - neg_sim_val:.4f}
+                                    Similarity Stats:
+                                      pos_sim (same group): {pos_sim_val:.4f}
+                                      neg_sim (diff group): {neg_sim_val:.4f}
+                                      separation: {pos_sim_val - neg_sim_val:.4f}
 
-Sample Distribution (batch):
-  Normal: {n_bg_val}
-  Anomaly: {n_anom_val}
-  Total: {B}
+                                    Sample Distribution (batch):
+                                      Normal: {n_bg_val}
+                                      Anomaly: {n_anom_val}
+                                      Total: {B}
 
-Class Distribution (sampled):
-{class_dist_str}
+                                    Class Distribution (sampled):
+                                    {class_dist_str}
 
-Prompt-Visual Sim:
-  Mean: {diag_sim.mean():.4f}
-  Std: {diag_sim.std():.4f}"""
+                                    Prompt-Visual Sim:
+                                      Mean: {diag_sim.mean():.4f}
+                                      Std: {diag_sim.std():.4f}"""
                                 
                                 ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=9,
                                         verticalalignment='top', fontfamily='monospace',
@@ -3191,12 +4741,43 @@ Prompt-Visual Sim:
                                 (torch.exp(-log_var_iou)   * loss_iou   + log_var_iou)
                     total_loss = loss_main + args.presence_weight * loss_presence + \
                                  args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
-                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion
+                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion + \
+                                 lambda_suspicious * loss_suspicious  # 【新增】
                 else:
                     total_loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
                     total_loss = total_loss + args.presence_weight * loss_presence + \
                                  args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
-                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion
+                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion + \
+                                 lambda_suspicious * loss_suspicious  # 【新增】
+
+                # ===== Compound Prompt Learner 损失 =====
+                loss_orthogonal = torch.tensor(0.0, device=device)
+                loss_prior = torch.tensor(0.0, device=device)
+                loss_contrast = torch.tensor(0.0, device=device)
+                
+                if args.prompt_learner_type == "compound":
+                    # 获取labels tensor
+                    labels_tensor = torch.tensor(
+                        [1 if a else 0 for a in is_anomaly], 
+                        device=device
+                    )
+                    compound_losses = compute_compound_losses(model, out, labels_tensor, args)
+                    
+                    lambda_orth = getattr(args, 'lambda_orthogonal', 0.1)
+                    lambda_prior_val = getattr(args, 'lambda_prior', 0.1)
+                    lambda_contrast_val = getattr(args, 'lambda_contrast', 0.05)
+                    
+                    if 'orthogonal_loss' in compound_losses:
+                        loss_orthogonal = compound_losses['orthogonal_loss']
+                        total_loss = total_loss + lambda_orth * loss_orthogonal
+                    
+                    if 'prior_loss' in compound_losses:
+                        loss_prior = compound_losses['prior_loss']
+                        total_loss = total_loss + lambda_prior_val * loss_prior
+                    
+                    if 'contrast_loss' in compound_losses:
+                        loss_contrast = compound_losses['contrast_loss']
+                        total_loss = total_loss + lambda_contrast_val * loss_contrast
 
                 loss = total_loss
 
@@ -3315,6 +4896,8 @@ Prompt-Visual Sim:
                 writer.add_scalar("loss/align", align_loss.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
+            if is_main_process and writer is not None:
+                writer.add_scalar("loss/suspicious alignment", loss_suspicious.item(), global_step)            
 
             if is_main_process and writer is not None:
                 writer.add_scalar("debug/src_q_nonempty_ratio", nonempty_ratio, global_step)
@@ -3420,9 +5003,13 @@ if __name__ == "__main__":
     parser.add_argument("--loss_alpha", type=float, default=5.0, help="Weight for focal loss.")
     parser.add_argument("--loss_beta", type=float, default=1.0, help="Weight for dice loss.")
     parser.add_argument("--loss_gamma", type=float, default=1.0, help="Weight for IoU regression loss.")
+    parser.add_argument("--lambda_suspicious", type=float, default=0.1,
+                    help="Weight for suspicious alignment loss")
     parser.add_argument("--disable_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=float, default=None)
+    parser.add_argument("--lora_layer_ids", nargs="*", type=int, default=None,
+                        help="Which SAM3 encoder blocks to apply LoRA to (e.g., --lora_layer_ids 0 2 4). Default: all blocks.")
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
     
@@ -3515,7 +5102,7 @@ if __name__ == "__main__":
     
     # ==================== CoOp/CoCoOp 提示学习参数 ====================
     parser.add_argument("--prompt_learner_type", type=str, default="perclass",
-                        choices=["averaged", "static", "perclass", "coop", "cocoop"],
+                        choices=["averaged", "static", "perclass", "coop", "cocoop", "compound"],
                         help="提示学习器类型")
     parser.add_argument("--n_ctx", type=int, default=4,
                         help="可学习上下文向量数量")
@@ -3530,7 +5117,28 @@ if __name__ == "__main__":
                         help="CoCoOp Meta-Net输入维度")
     parser.add_argument("--cocoop_reduction", type=int, default=16,
                         help="CoCoOp Meta-Net瓶颈缩减因子")
-    
+    # ==================== Compound Prompt Learning ====================
+    parser.add_argument("--compound_mode", type=str, default="cocoop",
+                        choices=["coop", "cocoop"],
+                        help="Compound: 模式选择 (coop=静态, cocoop=Meta-Net条件化)")
+    parser.add_argument("--compound_n_ctx", type=int, default=4,
+                        help="Compound: 共享上下文向量数量")
+    parser.add_argument("--compound_n_ctx_offset", type=int, default=2,
+                        help="Compound: 正常/异常偏移向量数量")
+    parser.add_argument("--compound_num_abnormal", type=int, default=10,
+                        help="Compound: 异常prompt数量")
+    parser.add_argument("--compound_enable_dap", action="store_true",
+                        help="Compound: 启用数据依赖异常先验")
+    parser.add_argument("--compound_dap_top_k", type=int, default=10,
+                        help="Compound: DAP top-k")
+    parser.add_argument("--compound_meta_reduction", type=int, default=16,
+                        help="Compound: Meta-Net瓶颈缩减因子（仅cocoop模式）")
+    parser.add_argument("--lambda_orthogonal", type=float, default=0.1,
+                        help="Compound: 正交约束损失权重")
+    parser.add_argument("--lambda_prior", type=float, default=0.1,
+                        help="Compound: DAP先验损失权重")
+    parser.add_argument("--lambda_contrast", type=float, default=0.05,
+                        help="Compound: Normal/Abnormal对比损失权重")
     # 数据集prompt模式
     parser.add_argument("--prompt_mode", type=str, default="simple",
                         choices=["simple", "full"],
@@ -3604,6 +5212,18 @@ if __name__ == "__main__":
                         help="Path to save backbone dump txt (relative ok).")
     parser.add_argument("--print_backbone_no_stdout", action="store_true",
                         help="Do not print to stdout when dumping to txt.")
+    
+    # v2.2 零样本优化参数
+    parser.add_argument('--bank_warm_up_ratio', type=float, default=0.3,
+                        help='Memory Bank warm-up ratio (default: 0.3, 前30%不启用)')
+    parser.add_argument('--bank_orthogonalize', action='store_true', default=True,
+                        help='是否对 bank 中的特征进行正交化')
+    parser.add_argument('--w_abnormal_margin', type=float, default=0.3,
+                        help='w 与 abnormal 之间的 margin (default: 0.3)')
+    parser.add_argument('--disable_bank', action='store_true', default=False,
+                        help='【消融】禁用 bank，只使用统计 fallback')
+    parser.add_argument('--disable_w_learning', action='store_true', default=False,
+                        help='【消融】禁用 w 学习 (lambda_suspicious=0)')
 
     args = parser.parse_args()
     main(args)

@@ -9,6 +9,7 @@ model_components.py
 """
 
 import math
+import re
 from collections import OrderedDict
 from typing import List, Optional, Sequence, Tuple
 
@@ -78,17 +79,44 @@ def apply_lora_to_sam(
     target_substrings: Sequence[str] = ("qkv",),
     rank: int = 16,
     alpha: Optional[float] = None,
+    layer_ids: Optional[Sequence[int]] = None,
+    _prefix: str = "",
 ) -> List[str]:
-    """Replace Linear layers containing target substrings with LoRA-wrapped versions."""
+    """Replace Linear layers containing target substrings with LoRA-wrapped versions.
+
+    Notes:
+    - By default, wraps *all* matching Linear layers (e.g. qkv).
+    - If `layer_ids` is provided, only wraps layers whose module path contains `blocks.{id}.`
+      (works for SAM3-style ViT/Transformer trunks that name blocks this way).
+    """
     wrapped: List[str] = []
+    layer_id_set = set(layer_ids) if layer_ids is not None else None
+
     for name, child in list(module.named_children()):
+        full_name = f"{_prefix}.{name}" if _prefix else name
+
+        # recurse first
         wrapped.extend(
-            apply_lora_to_sam(child, target_substrings=target_substrings, rank=rank, alpha=alpha)
+            apply_lora_to_sam(
+                child,
+                target_substrings=target_substrings,
+                rank=rank,
+                alpha=alpha,
+                layer_ids=layer_ids,
+                _prefix=full_name,
+            )
         )
+
         if isinstance(child, nn.Linear) and any(s in name for s in target_substrings):
+            if layer_id_set is not None:
+                m = re.search(r"(?:^|\.)blocks\.(\d+)(?:\.|$)", full_name)
+                if m is None or int(m.group(1)) not in layer_id_set:
+                    continue
+
             lora = LoRALinear(child, rank=rank, alpha=alpha)
             setattr(module, name, lora)
-            wrapped.append(name)
+            wrapped.append(full_name)
+
     return wrapped
 
 
