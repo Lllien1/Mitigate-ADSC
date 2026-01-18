@@ -80,13 +80,22 @@ def few_shot_subsample_entries(entries, shots_per_specie=5, seed=42, verbose=Tru
             for (c, specie, anom), indices in groups.items():
                 if c == cls and anom == 1:
                     per_specie_defect[specie] += min(shots_per_specie, len(indices))
+            normal_pool = [i for (c, s), idx in normal_groups.items() if c == cls for i in idx]
+            if not normal_pool:
+                if verbose:
+                    print(f"  {cls}/good: 0 -> 0")
+                continue
+            remaining = list(normal_pool)
             for specie, need in sorted(per_specie_defect.items()):
-                normal_idx = normal_groups.get((cls, specie), [])
-                if normal_idx:
-                    n = min(int(need), len(normal_idx))
-                    sampled_indices.extend(random.sample(normal_idx, n))
-                    if verbose:
-                        print(f"  {cls}/{specie}/good: {len(normal_idx)} -> {n}")
+                if not remaining:
+                    break
+                n = min(int(need), len(remaining))
+                chosen = random.sample(remaining, n)
+                sampled_indices.extend(chosen)
+                remaining_set = set(chosen)
+                remaining = [x for x in remaining if x not in remaining_set]
+                if verbose:
+                    print(f"  {cls}/{specie}/good(pool): {len(normal_pool)} -> {n}")
     
     result = [entries[i] for i in sorted(sampled_indices)]
     if verbose:
@@ -2963,6 +2972,12 @@ def build_dataloaders(
             verbose=True,
             balance_good_by_specie=bool(few_shot_balance_good_by_specie),
         )
+        labels_fs = [int(getattr(e, "anomaly", 0)) for e in ds.entries]
+        has_norm_fs = any(l == 0 for l in labels_fs)
+        has_anom_fs = any(l == 1 for l in labels_fs)
+        if not (has_norm_fs and has_anom_fs):
+            print(f"[WARN] Few-shot subset is imbalanced: has_normal={has_norm_fs}, has_anomaly={has_anom_fs}. "
+                  f"min_normals_per_batch may not work as expected.")
         print(
             f"[INFO] Few-shot subsampling enabled: {few_shot_per_specie} samples/specie, "
             f"{orig_n} -> {len(ds.entries)} entries"
@@ -3298,6 +3313,8 @@ def main(args: argparse.Namespace):
             compound_dap_spurious_filter=getattr(args, "compound_dap_spurious_filter", False),
             compound_dap_spurious_alpha=getattr(args, "compound_dap_spurious_alpha", 1.0),
             compound_disable_w=getattr(args, "compound_disable_w", False),
+            use_sam3_text_prompt=getattr(args, "use_sam3_text_prompt", False),
+            trace_dump=getattr(args, "trace_dump", False),
             # ===== 多尺度特征 & Stages消融 =====
             num_feature_levels=getattr(args, "num_feature_levels", 1),
             selected_levels=_parse_selected_levels(args),
@@ -6137,6 +6154,10 @@ if __name__ == "__main__":
                         help="Debug: 打印compound prompt相关参数的梯度范数")
     parser.add_argument("--debug_dump_features", action="store_true",
                         help="Debug: 保存一小份text/msad特征到npz用于新旧版本对比")
+    parser.add_argument("--use_sam3_text_prompt", action="store_true", default=False,
+                        help="使用SAM3官方language_backbone编码文本prompt（替代自研prompt_learner，用于兼容性对照）")
+    parser.add_argument("--trace_dump", action="store_true", default=False,
+                        help="在model输出中附带trace_info（prompt统计、FPN层数等），用于对照tracing")
     parser.add_argument("--lambda_orthogonal", type=float, default=0.1,
                         help="Compound: 正交约束损失权重")
     parser.add_argument("--lambda_prior", type=float, default=0.1,

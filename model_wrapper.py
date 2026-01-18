@@ -235,7 +235,7 @@ class FineTuneSAM3(nn.Module):
         hs = hs.permute(0, 2, 1, 3).contiguous()
 
         seg_out = self.segmentation_head(
-            backbone_feats=vis_feats,
+            backbone_feats=all_fpn_feats,
             obj_queries=hs,
             image_ids=torch.arange(bs, device=self.device),
             encoder_hidden_states=memory["memory"],
@@ -327,6 +327,8 @@ class FineTuneSAM3Official(nn.Module):
         self.compound_abnormal_order = str(kwargs.get("compound_abnormal_order", "v_then_wk")).lower()
         self.compound_dap_spurious_filter = bool(kwargs.get("compound_dap_spurious_filter", False))
         self.compound_dap_spurious_alpha = float(kwargs.get("compound_dap_spurious_alpha", 1.0))
+        self.use_sam3_text_prompt = bool(kwargs.get("use_sam3_text_prompt", False))
+        self.trace_dump = bool(kwargs.get("trace_dump", False))
         self.compound_disable_w = bool(kwargs.get("compound_disable_w", False))
         self.msad_return_similarity_logits = bool(kwargs.get("msad_return_similarity_logits", False))
 
@@ -646,11 +648,22 @@ class FineTuneSAM3Official(nn.Module):
         if self.enable_spurious_gating:
             sp_map, sp_presence, eta = self._compute_spurious_eta(vis_feats[0])
 
-        # compound prompt (eta only modulates w)
+        # compound prompt (eta only modulates w) or official text prompt path
         compound_dap_weights = None
         text_features_structured = None
+        trace_info = None
 
-        if self.prompt_learner_type == "compound":
+        if self.use_sam3_text_prompt:
+            captions = []
+            for pl in prompt_lists:
+                if isinstance(pl, list) and len(pl) > 0:
+                    captions.append(str(pl[0]))
+                else:
+                    captions.append("object")
+            text_out = self.backbone.forward_text(captions, device=self.device)
+            prompt_seq = text_out["language_features"]
+            prompt_mask = text_out["language_mask"]
+        if (not self.use_sam3_text_prompt) and self.prompt_learner_type == "compound":
             # vis_global + patch_features for DAP
             vis_global = vis_feats[0].mean(dim=[2, 3])  # (B, C)
 
@@ -741,6 +754,23 @@ class FineTuneSAM3Official(nn.Module):
                 device=self.device,
             )
 
+        if self.trace_dump:
+            with torch.no_grad():
+                p = prompt_seq
+                p_stats = {
+                    "shape": tuple(p.shape) if isinstance(p, torch.Tensor) else None,
+                    "mean": float(p.detach().float().mean().item()) if isinstance(p, torch.Tensor) else None,
+                    "std": float(p.detach().float().std().item()) if isinstance(p, torch.Tensor) else None,
+                }
+                trace_info = {
+                    "fpn_levels": int(len(all_fpn_feats)) if isinstance(all_fpn_feats, list) else None,
+                    "pos_levels": int(len(all_pos_enc)) if isinstance(all_pos_enc, list) else None,
+                    "encoder_levels_used": int(len(vis_feats)) if isinstance(vis_feats, list) else None,
+                    "seg_head_levels": int(len(all_fpn_feats)) if isinstance(all_fpn_feats, list) else None,
+                    "use_sam3_text_prompt": bool(self.use_sam3_text_prompt),
+                    "prompt_stats": p_stats,
+                }
+
         if self.enable_msad and self.msad is not None:
             feats = list(all_fpn_feats)
             avail_lv = len(feats)
@@ -830,6 +860,8 @@ class FineTuneSAM3Official(nn.Module):
             "prompt_seq": prompt_seq,
             "compound_dap_weights": compound_dap_weights,
         }
+        if trace_info is not None:
+            out["trace_info"] = trace_info
 
         # decoder features (for your losses)
         decoder_feat = None

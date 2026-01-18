@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Dict, Union
 import math
 
+from prompt_tokenization import build_compound_template_texts, tokenize_ve, encode_ve_with_optional_inputs_embeds
+
 
 class PatchMetaNet(nn.Module):
     """
@@ -277,16 +279,15 @@ class CompoundPromptLearnerV3(nn.Module):
                 class_names = ["object"] * B
             eff_nw = 0 if self.disable_w else int(self.n_w)
             ctx_len = max(self.n_V + eff_nw, self.n_V + self.n_W)
-            placeholder = " ".join(["X"] * ctx_len)
-            texts = []
-            for i in range(B):
-                cls = str(class_names[i])
-                texts.append(f"{placeholder} normal {cls}.")
-                for _k in range(K):
-                    texts.append(f"{placeholder} {str(abnormal_word)} {cls}.")
-
-            tokenized = self.text_encoder.tokenizer(texts, context_length=self.text_encoder.context_length).to(device)
-            base_embeds = self.text_encoder.encoder.token_embedding(tokenized).to(device)
+            texts = build_compound_template_texts(
+                class_names=[str(x) for x in class_names],
+                num_abnormal=int(K),
+                ctx_len=int(ctx_len),
+                abnormal_word=str(abnormal_word),
+            )
+            tok = tokenize_ve(self.text_encoder, texts, device=device)
+            tokenized = tok.tokenized
+            base_embeds = tok.base_embeds
 
             V_tok = self.V.to(device)
             w_tok = self.w.to(device)
@@ -338,8 +339,10 @@ class CompoundPromptLearnerV3(nn.Module):
 
             inputs_embeds = torch.cat([prefix, ctx_embeds, ctx_tail], dim=1)
 
-            text_attention_mask, text_memory_resized, _ = self.text_encoder.encode_with_inputs_embeds(
+            text_attention_mask, text_memory_resized = encode_ve_with_optional_inputs_embeds(
+                self.text_encoder,
                 tokenized=tokenized,
+                base_embeds=base_embeds,
                 inputs_embeds=inputs_embeds,
                 device=device,
             )
