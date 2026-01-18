@@ -26,14 +26,73 @@ from sam3.train.loss.loss_fns import dice_loss as sam_dice_loss
 from torch.cuda.amp import autocast, GradScaler
 
 from dataset import MVTecMetaDataset
-from model_wrapper import FineTuneSAM3, FineTuneSAM3Official
+from model_wrapper import FineTuneSAM3Official
 
 import numpy as np
 from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
 import matplotlib.pyplot as plt
+
+from collections import defaultdict
 
 import json
 import io
+
+def few_shot_subsample_entries(entries, shots_per_specie=5, seed=42, verbose=True, balance_good_by_specie: bool = False):
+    """Few-Shot 采样"""
+    import random
+    random.seed(seed)
+    
+    groups = defaultdict(list)
+    for idx, entry in enumerate(entries):
+        key = (entry.cls_name, entry.specie_name, int(entry.anomaly))
+        groups[key].append(idx)
+    
+    if verbose:
+        print(f"\n[Few-Shot] {shots_per_specie}-shot, 原始: {len(entries)}")
+    
+    sampled_indices = []
+    class_defect_counts = defaultdict(int)
+    normal_groups = {}
+    
+    # 采样缺陷
+    for (cls, specie, anom), indices in sorted(groups.items()):
+        if anom == 0:
+            normal_groups[(cls, specie)] = indices
+        else:
+            n = min(shots_per_specie, len(indices))
+            sampled_indices.extend(random.sample(indices, n))
+            class_defect_counts[cls] += n
+            if verbose:
+                print(f"  {cls}/{specie}: {len(indices)} -> {n}")
+    
+    # 采样 normal（匹配缺陷数）
+    for cls, defect_n in sorted(class_defect_counts.items()):
+        if not balance_good_by_specie:
+            normal_idx = [i for (c, s), idx in normal_groups.items() if c == cls for i in idx]
+            if normal_idx:
+                n = min(defect_n, len(normal_idx))
+                sampled_indices.extend(random.sample(normal_idx, n))
+                if verbose:
+                    print(f"  {cls}/good: {len(normal_idx)} -> {n}")
+        else:
+            per_specie_defect = defaultdict(int)
+            for (c, specie, anom), indices in groups.items():
+                if c == cls and anom == 1:
+                    per_specie_defect[specie] += min(shots_per_specie, len(indices))
+            for specie, need in sorted(per_specie_defect.items()):
+                normal_idx = normal_groups.get((cls, specie), [])
+                if normal_idx:
+                    n = min(int(need), len(normal_idx))
+                    sampled_indices.extend(random.sample(normal_idx, n))
+                    if verbose:
+                        print(f"  {cls}/{specie}/good: {len(normal_idx)} -> {n}")
+    
+    result = [entries[i] for i in sorted(sampled_indices)]
+    if verbose:
+        n_anom = sum(1 for e in result if e.anomaly == 1)
+        print(f"[Few-Shot] 结果: {len(result)} (缺陷:{n_anom}, 正常:{len(result)-n_anom})\n")
+    return result
 
 # =============================================================================
 # 修改 1: AnomalyFeatureBank 增强版（支持正交化去冗余）
@@ -2874,6 +2933,8 @@ def build_dataloaders(
     min_normals_per_batch: int = 0,
     # CoOp/CoCoOp prompt mode
     prompt_mode: str = "simple",
+    few_shot_per_specie: int = 0,
+    few_shot_balance_good_by_specie: bool = False,
 ):
     ds = MVTecMetaDataset(
         root=root,
@@ -2890,6 +2951,22 @@ def build_dataloaders(
         save_dir=splits_save_dir,  # pass the run-specific folder as dataset.save_dir
         prompt_mode=prompt_mode,
     )
+
+    # --- optional few-shot subsampling per specie ---
+    if few_shot_per_specie and few_shot_per_specie > 0 and mode in ("train", "train_all"):
+        # 这里使用你上面定义好的 few_shot_subsample_entries
+        orig_n = len(ds.entries)
+        ds.entries = few_shot_subsample_entries(
+            entries=ds.entries,
+            shots_per_specie=few_shot_per_specie,
+            seed=specie_split_seed,
+            verbose=True,
+            balance_good_by_specie=bool(few_shot_balance_good_by_specie),
+        )
+        print(
+            f"[INFO] Few-shot subsampling enabled: {few_shot_per_specie} samples/specie, "
+            f"{orig_n} -> {len(ds.entries)} entries"
+        )
 
 
     # NOTE: if balance True we try to do weighted sampling.
@@ -2966,6 +3043,29 @@ def build_dataloaders(
             pin_memory=True,
         )
     return dataloader
+
+
+def _summarize_entries_for_debug(entries):
+    stats = {
+        "total": int(len(entries)),
+        "anomaly": int(sum(1 for e in entries if int(getattr(e, "anomaly", 0)) == 1)),
+        "normal": int(sum(1 for e in entries if int(getattr(e, "anomaly", 0)) == 0)),
+        "by_class": {},
+    }
+    by = defaultdict(lambda: defaultdict(lambda: {"anomaly": 0, "normal": 0, "total": 0}))
+    for e in entries:
+        cls = str(getattr(e, "cls_name", ""))
+        sp = str(getattr(e, "specie_name", ""))
+        an = int(getattr(e, "anomaly", 0))
+        rec = by[cls][sp]
+        rec["total"] += 1
+        if an == 1:
+            rec["anomaly"] += 1
+        else:
+            rec["normal"] += 1
+    for cls in sorted(by.keys()):
+        stats["by_class"][cls] = {sp: dict(by[cls][sp]) for sp in sorted(by[cls].keys())}
+    return stats
 
 
 
@@ -3167,6 +3267,9 @@ def main(args: argparse.Namespace):
             enable_parallel_lora=args.enable_parallel_lora,
             parallel_lora_rank=args.parallel_lora_rank,
             parallel_lora_alpha=args.parallel_lora_alpha,
+            parallel_lora_target=args.parallel_lora_target,
+            parallel_lora_layer_ids=args.parallel_lora_layer_ids,
+            enable_out_adapter_lora=args.enable_out_adapter_lora,
             device=device,
             class_list=args.class_list,
             num_templates=getattr(args, "num_templates", 4),
@@ -3181,11 +3284,20 @@ def main(args: argparse.Namespace):
             # ===== Compound Prompt Learning =====
             compound_mode=getattr(args, "compound_mode", "cocoop"),
             compound_n_ctx=getattr(args, "compound_n_ctx", 4),
-            compound_n_ctx_offset=getattr(args, "compound_n_ctx_offset", 2),
+            compound_n_ctx_offset=getattr(args, "compound_n_ctx_offset", 4),
             compound_num_abnormal=getattr(args, "compound_num_abnormal", 10),
             compound_enable_dap=getattr(args, "compound_enable_dap", False),
             compound_dap_top_k=getattr(args, "compound_dap_top_k", 10),
             compound_meta_reduction=getattr(args, "compound_meta_reduction", 16),
+            compound_dap_use_multilevel=getattr(args, "compound_dap_use_multilevel", False),
+            compound_dap_num_levels=getattr(args, "compound_dap_num_levels", 0),
+            compound_use_text_encoder=getattr(args, "compound_use_text_encoder", False),
+            compound_abnormal_word=getattr(args, "compound_abnormal_word", "anomaly"),
+            compound_pooling=getattr(args, "compound_pooling", "ctx_only"),
+            compound_abnormal_order=getattr(args, "compound_abnormal_order", "v_then_wk"),
+            compound_dap_spurious_filter=getattr(args, "compound_dap_spurious_filter", False),
+            compound_dap_spurious_alpha=getattr(args, "compound_dap_spurious_alpha", 1.0),
+            compound_disable_w=getattr(args, "compound_disable_w", False),
             # ===== 多尺度特征 & Stages消融 =====
             num_feature_levels=getattr(args, "num_feature_levels", 1),
             selected_levels=_parse_selected_levels(args),
@@ -3199,14 +3311,33 @@ def main(args: argparse.Namespace):
             filo_k_cov=getattr(args, "filo_k_cov", 4),
             filo_image_size=getattr(args, "filo_image_size", 518),
             filo_use_alternating=getattr(args, "filo_use_alternating", True),
-            # ===== 方案B: FiLo到Decoder回灌 =====
+            # # ===== 方案B: FiLo到Decoder回灌 =====
             filo_to_decoder=getattr(args, "filo_to_decoder", False),
             filo_decoder_mode=getattr(args, "filo_decoder_mode", "memory"),
             filo_decoder_tokens=getattr(args, "filo_decoder_tokens", 64),
+            # ===== MSAD模块 =====
+            enable_msad=getattr(args, "enable_msad", False),
+            msad_use_shape_attention=getattr(args, "msad_use_shape_attention", True),
+            msad_learnable_level_weights=getattr(args, "msad_learnable_level_weights", True),
+            msad_learnable_temperature=getattr(args, "msad_learnable_temperature", True),
+            msad_temperature=getattr(args, "msad_temperature", 100.0),
+            msad_output_size=getattr(args, "msad_output_size", 518),
+            msad_num_levels=getattr(args, "msad_num_levels", None),
+            msad_return_similarity_logits=getattr(args, "msad_return_similarity_logits", False),
+            msad_use_vision_adapter=getattr(args, "msad_use_vision_adapter", False),
+            msad_vision_adapter_reduction=getattr(args, "msad_vision_adapter_reduction", 2),
+            msad_vision_adapter_shared=(getattr(args, "msad_vision_adapter_shared", True) and (not getattr(args, "msad_vision_adapter_not_shared", False))),
+            # ===== Spurious Gating =====
+            enable_spurious_gating=(getattr(args, "enable_spurious_gating", True) and (not getattr(args, "disable_spurious_gating", False))),
+            spurious_sim_temp=getattr(args, "spurious_sim_temp", 0.07),
+            spurious_topk_ratio=getattr(args, "spurious_topk_ratio", 0.02),
+            spurious_score_threshold=getattr(args, "spurious_score_threshold", 0.20),
+            spurious_kappa=getattr(args, "spurious_kappa", 8.0),
+            spurious_quality_threshold=getattr(args, "spurious_quality_threshold", 0.03),
             # ===== 方案C: 置信度融合头 =====
             enable_conf_fusion_head=getattr(args, "enable_conf_fusion_head", False),
             conf_fusion_hidden_dim=getattr(args, "conf_fusion_hidden_dim", 64),
-            enable_multiscale_output=getattr(args, "enable_multiscale_vis", False),
+            enable_multiscale_output=bool(getattr(args, "enable_multiscale_vis", False) or getattr(args, "align_multilevel", False)),
         )
     else:
         model = FineTuneSAM3(
@@ -3271,10 +3402,12 @@ def main(args: argparse.Namespace):
     # 无论是否分布式，model_core 指向实际的 underlying module（方便后续直接访问 prompt_learner 等属性）
     model_core = model.module if hasattr(model, "module") else model
 
-    if args.sam3_ckpt and os.path.exists(args.sam3_ckpt):
+    if args.sam3_ckpt and os.path.exists(args.sam3_ckpt) and (not bool(getattr(args, "use_official", False)) or bool(getattr(args, "force_secondary_sam3_load", False))):
         load_sam3_checkpoint(model, args.sam3_ckpt)
+    elif args.sam3_ckpt and os.path.exists(args.sam3_ckpt) and bool(getattr(args, "use_official", False)):
+        print("[INFO] Skip secondary SAM3 ckpt load (official model already loaded checkpoint_path). Use --force_secondary_sam3_load to override.")
 
-    # --- create run_name and save/log dirs early so dataset can save splits into same folder ---
+    # --- create run_name and save/log dirs early so dataset can save splits ---
     run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_dir = os.path.join(args.save_dir, run_name)  # this folder will host ckpt and specie_splits_*.json
     log_dir = os.path.join(args.log_dir, run_name)
@@ -3286,9 +3419,16 @@ def main(args: argparse.Namespace):
     else:
         writer = None
 
+    r2_corr_state = {"n": 0, "mean_x": 0.0, "mean_y": 0.0, "C": 0.0, "M2x": 0.0, "M2y": 0.0}
+
+    meta_path_for_dataset = args.meta_path or os.path.join(args.data_root, "meta.json")
+    splits_dir = getattr(args, "splits_save_dir", None)
+    if splits_dir is not None:
+        os.makedirs(splits_dir, exist_ok=True)
+
     dataloader = build_dataloaders(
         root=args.data_root,
-        meta_path=args.meta_path or os.path.join(args.data_root, "meta.json"),
+        meta_path=meta_path_for_dataset,
         mode=args.mode,
         k_shot=args.k_shot,
         obj_name=args.obj_name,
@@ -3302,21 +3442,47 @@ def main(args: argparse.Namespace):
         train_from_test=args.train_from_test,
         specie_split_ratio=args.specie_split_ratio,
         specie_split_seed=args.specie_split_seed,
-        splits_save_dir=save_dir,   # pass run-specific save_dir to dataset
+        splits_save_dir=splits_dir or save_dir,
         min_normals_per_batch=getattr(args, 'min_normals_per_batch', 0),
         prompt_mode=args.prompt_mode,
+        few_shot_per_specie=args.few_shot_per_specie,
+        few_shot_balance_good_by_specie=bool(getattr(args, "few_shot_balance_good_by_specie", False)),
     )
+
+    if is_main_process and hasattr(dataloader, "dataset") and hasattr(dataloader.dataset, "entries"):
+        try:
+            stats = _summarize_entries_for_debug(dataloader.dataset.entries)
+            with open(os.path.join(save_dir, "dataset_stats.json"), "w", encoding="utf-8") as f:
+                json.dump(stats, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] Wrote dataset_stats.json: total={stats['total']} anomaly={stats['anomaly']} normal={stats['normal']}")
+        except Exception as e:
+            print(f"[WARN] Failed to write dataset_stats.json: {e}")
 
 
 
     # Freeze everything except LoRA/prompt params
     for n, p in model.named_parameters():
         nl = n.lower()
-        if ("lora" in nl) or ("out_adapter" in nl) or ("prompt_learner" in nl) or ("prompt" in nl) \
-           or ("segmentation_head" in nl) or ("meta_net" in nl):
+        if ("lora" in nl) or ("out_adapter" in nl) or ("prompt_learner" in nl) \
+           or ("meta_net" in nl) or ("msad" in nl):
+            p.requires_grad = True
+        elif getattr(args, "train_seg_head", False) and nl.startswith("segmentation_head"):
             p.requires_grad = True
         else:
             p.requires_grad = False
+
+    if bool(getattr(args, "compound_disable_w", False)) and hasattr(model, "prompt_learner"):
+        pl = getattr(model, "prompt_learner", None)
+        if hasattr(pl, "w") and isinstance(getattr(pl, "w"), torch.nn.Parameter):
+            pl.w.requires_grad = False
+
+    if str(getattr(args, "train_objective", "seg")).lower() == "rank":
+        for n, p in model.named_parameters():
+            nl = n.lower()
+            if ("prompt_learner" in nl) or ("msad" in nl) or ("meta_net" in nl):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
 
     # === 新增：Decoder 解冻/LoRA 配置 ===
     # 获取实际的 model_core（处理 DDP 包装的情况）
@@ -3350,6 +3516,13 @@ def main(args: argparse.Namespace):
         nl = n.lower()
         if ("prompt" in nl) or ("template" in nl) or ("kweight" in nl) or ("lora" in nl):
             print(f"  {n}: requires_grad={p.requires_grad}, shape={tuple(p.shape)}")
+
+    if getattr(args, "enable_msad", False):
+        print("[INFO] MSAD params (name, requires_grad, shape):")
+        for n, p in model.named_parameters():
+            nl = n.lower()
+            if "msad" in nl:
+                print(f"  {n}: requires_grad={p.requires_grad}, shape={tuple(p.shape)}")
 
 
     # ---------------------------
@@ -3385,6 +3558,15 @@ def main(args: argparse.Namespace):
         param_groups.append({"params": learnable_log_vars, "lr": args.lr_main, "weight_decay": 0.0})
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+
+    if getattr(args, "enable_msad", False):
+        msad_ids = {id(p) for n, p in model.named_parameters() if ("msad" in n.lower()) and p.requires_grad}
+        opt_ids = set()
+        for pg in optimizer.param_groups:
+            for p in pg.get("params", []):
+                opt_ids.add(id(p))
+        msad_in_opt = len(msad_ids.intersection(opt_ids))
+        print(f"[INFO] MSAD params in optimizer: {msad_in_opt}/{len(msad_ids)}")
 
     # 新增：AMP 的 GradScaler（只在 CUDA 下启用）
     scaler = GradScaler(
@@ -3443,6 +3625,7 @@ def main(args: argparse.Namespace):
     model.train()
     best_loss = float("inf")
     global_optim_step = 0  # 优化器更新计数（用于调度器）
+    stop_training = False
 
     anomaly_bank = AnomalyFeatureBankV2(
         max_size=2048,
@@ -3471,6 +3654,12 @@ def main(args: argparse.Namespace):
         
         for step, batch in enumerate(pbar):
             images, masks, prompt_lists, is_anomaly, class_names, specie_names = batch
+
+            # 【新增】类别无关设计
+            if getattr(args, 'class_agnostic', False):
+                agnostic_name = getattr(args, 'agnostic_name', 'object')
+                class_names = [agnostic_name] * len(class_names)
+
             images = images.to(device)
             masks = masks.to(device)
             
@@ -3486,6 +3675,22 @@ def main(args: argparse.Namespace):
                 pred_masks = out["pred_masks"]
                 if pred_masks is None:
                     raise RuntimeError("Segmentation head did not return pred_masks.")
+
+                if bool(getattr(args, "debug_dump_features", False)) and step == 0:
+                    dump = {}
+                    tfs = out.get("text_features_structured", None)
+                    if isinstance(tfs, dict):
+                        for k, v in tfs.items():
+                            if isinstance(v, torch.Tensor):
+                                dump[f"tfs.{k}"] = v.detach().float().cpu().numpy()
+                    for k in ("eta_spurious", "msad_anomaly_score"):
+                        v = out.get(k, None)
+                        if isinstance(v, torch.Tensor):
+                            dump[k] = v.detach().float().cpu().numpy()
+                    dump["is_anomaly"] = is_anomaly.detach().cpu().numpy() if isinstance(is_anomaly, torch.Tensor) else np.array(is_anomaly)
+                    dump["class_names"] = np.array(list(class_names))
+                    dump["prompt_lists0"] = np.array(prompt_lists[0] if isinstance(prompt_lists, list) and len(prompt_lists) > 0 else [])
+                    np.savez_compressed(os.path.join(save_dir, f"debug_features_step{step}.npz"), **dump)
 
                 # If model returns multi-layer masks, take last layer
                 if pred_masks.dim() == 5:
@@ -3764,19 +3969,21 @@ def main(args: argparse.Namespace):
                 
                     # prompt prototype and pooled visual feat for align
                     try:
-                        prompt_seq, prompt_mask = model_core.prompt_learner(prompt_lists, device=device)
-                        # prompt_seq 可有不同 layout：(S,B,D) 或 (B,D) 等，统一成 (B,D)
-                        prompt_last = prompt_seq[-1]
-                        if prompt_last.dim() == 3:  # (S, B, D)
-                            prompt_proto = prompt_last[-1]  # (B, D)
-                        elif prompt_last.dim() == 2:
-                            if prompt_last.shape[0] == images.shape[0]:
-                                prompt_proto = prompt_last  # (B, D)
-                            else:
-                                prompt_proto = prompt_last.transpose(0, 1) if prompt_last.shape[1] == images.shape[0] else prompt_last.reshape(images.shape[0], -1)
+                        tfs = out.get("text_features_structured", None)
+                        if isinstance(tfs, dict) and ("normal" in tfs):
+                            prompt_proto = tfs["normal"]
                         else:
-                            prompt_proto = prompt_last.reshape(images.shape[0], -1)[:, : (prompt_last.numel() // images.shape[0])]
-                        print("DBG prompt_proto shape/mean/std:", prompt_proto.shape, float(prompt_proto.mean().item()), float(prompt_proto.std().item()))
+                            res = model_core.prompt_learner(prompt_lists, device=device)
+                            if isinstance(res, (tuple, list)) and len(res) >= 2 and torch.is_tensor(res[0]) and res[0].dim() == 4:
+                                prefixes = res[0]
+                                proto = prefixes.mean(dim=2)
+                                prompt_proto = proto[:, 0]
+                            elif torch.is_tensor(res):
+                                prompt_proto = res.mean(dim=0) if res.dim() == 3 else res
+                            else:
+                                prompt_proto = None
+                        if prompt_proto is not None:
+                            print("DBG prompt_proto shape/mean/std:", prompt_proto.shape, float(prompt_proto.mean().item()), float(prompt_proto.std().item()))
                     except Exception as e:
                         print("DBG prompt_learner error:", e)
                         prompt_proto = None
@@ -4119,6 +4326,285 @@ def main(args: argparse.Namespace):
                         if step % 50 == 0:
                             print(f"[FiLo Loss] focal={float(loss_filo_focal):.4f} dice={float(loss_filo_dice):.4f} total={float(loss_filo):.4f}")
 
+                # -------------------------
+                # MSAD Anomaly Map Loss (如果启用MSAD)
+                # 使用Focal + Dice Loss监督MSAD的anomaly_score拟合GT mask
+                # -------------------------
+                loss_msad = torch.tensor(0.0, device=device)
+                lambda_msad = getattr(args, 'lambda_msad', 0.0)
+                loss_msad_img = torch.tensor(0.0, device=device)
+                lambda_msad_img = float(getattr(args, "lambda_msad_img", 0.0) or 0.0)
+                
+                if lambda_msad > 0.0:
+                    msad_map = out.get("msad_aggregated_map", None)
+                    msad_score = out.get("msad_anomaly_score", None)
+
+                    use_2ch = str(getattr(args, "train_objective", "seg")).lower() == "rank"
+                    if use_2ch and isinstance(msad_map, torch.Tensor):
+                        gt_mask = masks
+                        if gt_mask.dim() == 4:
+                            gt_mask = gt_mask.squeeze(1)
+                        if msad_map.shape[-2:] != gt_mask.shape[-2:]:
+                            gt_mask_resized = F.interpolate(
+                                gt_mask.unsqueeze(1).float(),
+                                size=msad_map.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False,
+                            ).squeeze(1)
+                        else:
+                            gt_mask_resized = gt_mask.float()
+
+                        with torch.amp.autocast('cuda', enabled=False):
+                            gt_f32 = gt_mask_resized.float()
+                            p_norm = msad_map[:, 0].float().clamp(1e-6, 1.0 - 1e-6)
+                            p_abn = msad_map[:, 1].float().clamp(1e-6, 1.0 - 1e-6)
+
+                            tgt_norm = (1.0 - gt_f32).clamp(0.0, 1.0)
+                            tgt_abn = gt_f32.clamp(0.0, 1.0)
+
+                            pt_abn = torch.where(tgt_abn > 0.5, p_abn, 1.0 - p_abn)
+                            pt_norm = torch.where(tgt_norm > 0.5, p_norm, 1.0 - p_norm)
+                            fw_abn = (1.0 - pt_abn).pow(2.0)
+                            fw_norm = (1.0 - pt_norm).pow(2.0)
+
+                            bce_abn = F.binary_cross_entropy(p_abn, tgt_abn, reduction="none")
+                            bce_norm = F.binary_cross_entropy(p_norm, tgt_norm, reduction="none")
+                            loss_msad_focal = (fw_abn * bce_abn).mean() + (fw_norm * bce_norm).mean()
+
+                            inter_abn = (p_abn * tgt_abn).sum(dim=(1, 2))
+                            union_abn = p_abn.sum(dim=(1, 2)) + tgt_abn.sum(dim=(1, 2))
+                            dice_abn = (2.0 * inter_abn + 1e-6) / (union_abn + 1e-6)
+
+                            inter_norm = (p_norm * tgt_norm).sum(dim=(1, 2))
+                            union_norm = p_norm.sum(dim=(1, 2)) + tgt_norm.sum(dim=(1, 2))
+                            dice_norm = (2.0 * inter_norm + 1e-6) / (union_norm + 1e-6)
+
+                            loss_msad_dice = (1.0 - dice_abn).mean() + (1.0 - dice_norm).mean()
+
+                        loss_msad = 0.5 * loss_msad_focal + 0.5 * loss_msad_dice
+                        if step % 50 == 0:
+                            print(f"[MSAD Loss-2ch] focal={loss_msad_focal.detach().item():.4f} dice={loss_msad_dice.detach().item():.4f} total={loss_msad.detach().item():.4f}")
+
+                    elif msad_score is not None:
+                        gt_mask = masks
+                        if gt_mask.dim() == 4:
+                            gt_mask = gt_mask.squeeze(1)
+                        if msad_score.shape[-2:] != gt_mask.shape[-2:]:
+                            gt_mask_resized = F.interpolate(
+                                gt_mask.unsqueeze(1).float(),
+                                size=msad_score.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False,
+                            ).squeeze(1)
+                        else:
+                            gt_mask_resized = gt_mask.float()
+
+                        with torch.amp.autocast('cuda', enabled=False):
+                            msad_score_f32 = msad_score.float()
+                            gt_mask_f32 = gt_mask_resized.float()
+                            msad_score_clamped = msad_score_f32.clamp(1e-6, 1 - 1e-6)
+                            pt = torch.where(gt_mask_f32 > 0.5, msad_score_clamped, 1 - msad_score_clamped)
+                            focal_weight = (1 - pt).pow(2.0)
+                            bce = F.binary_cross_entropy(msad_score_clamped, gt_mask_f32, reduction='none')
+                            loss_msad_focal = (focal_weight * bce).mean()
+
+                            intersection = (msad_score_clamped * gt_mask_f32).sum(dim=(1, 2))
+                            union = msad_score_clamped.sum(dim=(1, 2)) + gt_mask_f32.sum(dim=(1, 2))
+                            dice = (2 * intersection + 1e-6) / (union + 1e-6)
+                            loss_msad_dice = (1 - dice).mean()
+
+                        loss_msad = 0.5 * loss_msad_focal + 0.5 * loss_msad_dice
+                        if step % 50 == 0:
+                            print(f"[MSAD Loss] focal={loss_msad_focal.detach().item():.4f} dice={loss_msad_dice.detach().item():.4f} total={loss_msad.detach().item():.4f}")
+
+                if lambda_msad_img > 0.0:
+                    msad_score = out.get("msad_anomaly_score", None)
+                    if msad_score is not None:
+                        with torch.amp.autocast('cuda', enabled=False):
+                            s = msad_score.float().clamp(1e-6, 1.0 - 1e-6)
+                            pool = str(getattr(args, "msad_img_pool", "q95")).lower()
+                            if pool == "max":
+                                img_score = s.flatten(1).max(dim=1).values
+                            elif pool == "mean":
+                                img_score = s.flatten(1).mean(dim=1)
+                            elif pool == "topk_mean":
+                                flat = s.flatten(1)
+                                k = max(1, int(round(float(getattr(args, "msad_img_topk_ratio", 0.02)) * flat.shape[1])))
+                                img_score = flat.topk(k=k, dim=1).values.mean(dim=1)
+                            else:
+                                img_score = torch.quantile(s.flatten(1), 0.95, dim=1)
+
+                            targets = torch.tensor(is_anomaly, dtype=torch.float32, device=device)
+                            loss_msad_img = F.binary_cross_entropy(img_score, targets)
+                            if step % 50 == 0:
+                                print(f"[MSAD ImgLoss] pool={pool} loss={float(loss_msad_img):.4f} score_mean={float(img_score.mean()):.4f}")
+
+                # -------------------------
+                # MSAD Pixel-wise Margin Constraints (如果启用)
+                # defect像素: logit(abn-norm) >= m_defect
+                # spurious像素(GT=0且spurious_map top-p): logit(abn-norm) <= -m_spurious
+                # -------------------------
+                loss_msad_margin = torch.tensor(0.0, device=device)
+                lambda_msad_margin = float(getattr(args, "lambda_msad_margin", 0.0) or 0.0)
+                if lambda_msad_margin > 0.0:
+                    msad_map = out.get("msad_aggregated_map", None)
+                    msad_score = out.get("msad_anomaly_score", None)
+                    sp_map = out.get("spurious_map", None)
+                    if (msad_map is not None or msad_score is not None):
+                        gt_mask = masks
+                        if gt_mask.dim() == 4:
+                            gt_mask = gt_mask.squeeze(1)
+                        with torch.amp.autocast('cuda', enabled=False):
+                            if msad_map is not None:
+                                p_norm = msad_map[:, 0].float()
+                                p_abn = msad_map[:, 1].float()
+                            else:
+                                p_abn = msad_score.float()
+                                p_norm = (1.0 - p_abn).float()
+
+                            if p_abn.shape[-2:] != gt_mask.shape[-2:]:
+                                gt_mask_f32 = F.interpolate(
+                                    gt_mask.unsqueeze(1).float(),
+                                    size=p_abn.shape[-2:],
+                                    mode='bilinear',
+                                    align_corners=False,
+                                ).squeeze(1)
+                            else:
+                                gt_mask_f32 = gt_mask.float()
+
+                            sp_map_f32 = None
+                            if isinstance(sp_map, torch.Tensor):
+                                if sp_map.shape[-2:] != p_abn.shape[-2:]:
+                                    sp_map_f32 = F.interpolate(
+                                        sp_map.unsqueeze(1).float(),
+                                        size=p_abn.shape[-2:],
+                                        mode='bilinear',
+                                        align_corners=False,
+                                    ).squeeze(1)
+                                else:
+                                    sp_map_f32 = sp_map.float()
+
+                            eps = 1e-6
+                            p_norm = p_norm.clamp(eps, 1.0 - eps)
+                            p_abn = p_abn.clamp(eps, 1.0 - eps)
+                            logit = torch.log(p_abn) - torch.log(p_norm)
+
+                            defect_mask = gt_mask_f32 > 0.5
+                            progress = float(epoch * len(dataloader) + step) / float(max(1, args.epochs * len(dataloader) - 1))
+                            warm = float(getattr(args, "r2_warmup_ratio", 0.1))
+                            ramp = float(getattr(args, "r2_spurious_ramp_ratio", 0.2))
+                            w_spu = 0.0 if progress <= warm else min(1.0, (progress - warm) / max(1e-6, ramp))
+                            top_p = float(getattr(args, "spurious_top_p", 0.02) or 0.0)
+                            spurious_mask = torch.zeros_like(defect_mask)
+                            if top_p > 0.0 and sp_map_f32 is not None:
+                                B, H, W = sp_map_f32.shape
+                                k = int(max(1, min(H * W, round(top_p * H * W))))
+                                flat = sp_map_f32.view(B, -1)
+                                topk_vals, _ = torch.topk(flat, k=k, dim=1, largest=True, sorted=True)
+                                thr = topk_vals[:, -1].view(B, 1, 1)
+                                spurious_mask = (sp_map_f32 >= thr) & (gt_mask_f32 <= 0.5)
+                            if bool(getattr(args, "spurious_margin_require_quality", True)) and top_p > 0.0 and sp_map_f32 is not None:
+                                qthr = float(getattr(args, "spurious_quality_threshold", 0.03))
+                                peak = float((topk_vals.mean() - flat.mean()).detach().item())
+                                if peak < qthr:
+                                    spurious_mask = torch.zeros_like(spurious_mask)
+                                    w_spu = 0.0
+                            if sp_map_f32 is None:
+                                w_spu = 0.0
+
+                            m_def = float(getattr(args, "msad_margin_defect", 0.3))
+                            m_spu = float(getattr(args, "msad_margin_spurious", 0.3))
+
+                            l_def = torch.relu(m_def - logit)
+                            l_spu = torch.relu(m_spu + logit)
+
+                            loss_def = l_def[defect_mask].mean() if defect_mask.any() else torch.tensor(0.0, device=device)
+                            loss_spu = l_spu[spurious_mask].mean() if spurious_mask.any() else torch.tensor(0.0, device=device)
+                            loss_msad_margin = loss_def + float(w_spu) * loss_spu
+
+                            if step % 50 == 0:
+                                print(f"[MSAD Margin] defect={float(loss_def):.4f} spurious={float(loss_spu):.4f} w_spu={float(w_spu):.2f} total={float(loss_msad_margin):.4f}")
+
+                # -------------------------
+                # R2-2: MSAD Similarity(Logits) Level Margin Constraints (可选)
+                # 直接约束softmax前 similarity logits: z = logits_abn - logits_norm
+                # -------------------------
+                loss_msad_sim_margin = torch.tensor(0.0, device=device)
+                lambda_msad_sim_margin = float(getattr(args, "lambda_msad_sim_margin", 0.0) or 0.0)
+                if lambda_msad_sim_margin > 0.0:
+                    sim_logits = out.get("msad_aggregated_logits_map", None)
+                    if str(getattr(args, "msad_sim_margin_source", "agg")).lower() != "agg":
+                        maps = out.get("msad_similarity_logits_maps", None)
+                        if isinstance(maps, list) and len(maps) > 0:
+                            sim_logits = maps[0]
+                    sp_map = out.get("spurious_map", None)
+                    if isinstance(sim_logits, torch.Tensor):
+                        gt_mask = masks
+                        if gt_mask.dim() == 4:
+                            gt_mask = gt_mask.squeeze(1)
+                        with torch.amp.autocast('cuda', enabled=False):
+                            logits_norm = sim_logits[:, 0].float()
+                            logits_abn = sim_logits[:, 1].float()
+                            if logits_abn.shape[-2:] != gt_mask.shape[-2:]:
+                                gt_mask_f32 = F.interpolate(
+                                    gt_mask.unsqueeze(1).float(),
+                                    size=logits_abn.shape[-2:],
+                                    mode='bilinear',
+                                    align_corners=False,
+                                ).squeeze(1)
+                            else:
+                                gt_mask_f32 = gt_mask.float()
+
+                            sp_map_f32 = None
+                            if isinstance(sp_map, torch.Tensor):
+                                if sp_map.shape[-2:] != logits_abn.shape[-2:]:
+                                    sp_map_f32 = F.interpolate(
+                                        sp_map.unsqueeze(1).float(),
+                                        size=logits_abn.shape[-2:],
+                                        mode='bilinear',
+                                        align_corners=False,
+                                    ).squeeze(1)
+                                else:
+                                    sp_map_f32 = sp_map.float()
+
+                            z = logits_abn - logits_norm
+                            defect_mask = gt_mask_f32 > 0.5
+
+                            progress = float(epoch * len(dataloader) + step) / float(max(1, args.epochs * len(dataloader) - 1))
+                            warm = float(getattr(args, "r2_warmup_ratio", 0.1))
+                            ramp = float(getattr(args, "r2_spurious_ramp_ratio", 0.2))
+                            w_spu = 0.0 if progress <= warm else min(1.0, (progress - warm) / max(1e-6, ramp))
+
+                            top_p = float(getattr(args, "spurious_top_p", 0.02) or 0.0)
+                            spurious_mask = torch.zeros_like(defect_mask)
+                            if top_p > 0.0 and sp_map_f32 is not None:
+                                B, H, W = sp_map_f32.shape
+                                k = int(max(1, min(H * W, round(top_p * H * W))))
+                                flat = sp_map_f32.view(B, -1)
+                                topk_vals, _ = torch.topk(flat, k=k, dim=1, largest=True, sorted=True)
+                                thr = topk_vals[:, -1].view(B, 1, 1)
+                                spurious_mask = (sp_map_f32 >= thr) & (gt_mask_f32 <= 0.5)
+
+                            if bool(getattr(args, "spurious_margin_require_quality", True)) and sp_map_f32 is not None:
+                                qthr = float(getattr(args, "spurious_quality_threshold", 0.03))
+                                peak = float((topk_vals.mean() - flat.mean()).detach().item()) if top_p > 0.0 else 0.0
+                                if peak < qthr:
+                                    spurious_mask = torch.zeros_like(spurious_mask)
+                                    w_spu = 0.0
+                            if sp_map_f32 is None:
+                                w_spu = 0.0
+
+                            m_def = float(getattr(args, "msad_sim_margin_defect", 0.3))
+                            m_spu = float(getattr(args, "msad_sim_margin_spurious", 0.3))
+                            l_def = torch.relu(m_def - z)
+                            l_spu = torch.relu(m_spu + z)
+                            loss_def = l_def[defect_mask].mean() if defect_mask.any() else torch.tensor(0.0, device=device)
+                            loss_spu = l_spu[spurious_mask].mean() if spurious_mask.any() else torch.tensor(0.0, device=device)
+                            loss_msad_sim_margin = loss_def + float(w_spu) * loss_spu
+
+                            if step % 50 == 0:
+                                print(f"[MSAD SimMargin] defect={float(loss_def):.4f} spurious={float(loss_spu):.4f} w_spu={float(w_spu):.2f} total={float(loss_msad_sim_margin):.4f}")
+
                 # loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
                 # ===== 【修复】图像级别的 Presence Loss =====
@@ -4257,64 +4743,108 @@ def main(args: argparse.Namespace):
                     # 尝试使用FiLo的patch_tokens（最优先）
                     filo_qkv = out.get("filo_patch_tokens_qkv", [])
                     filo_vv = out.get("filo_patch_tokens_vv", [])
+                    use_multilevel_align = bool(getattr(args, "align_multilevel", False))
+                    max_levels = int(getattr(args, "align_multilevel_max_levels", 0) or 0)
+                    visual_embed_levels = []
+                    is_background = None
                     
                     if len(filo_qkv) > 0 or len(filo_vv) > 0:
                         # 合并所有FiLo patch tokens
                         all_filo_tokens = filo_qkv + filo_vv
+                        if max_levels > 0:
+                            all_filo_tokens = all_filo_tokens[:max_levels]
+
+                        if use_multilevel_align and len(all_filo_tokens) > 1:
+                            for tok in all_filo_tokens:
+                                ve, ib = compute_filo_aligned_features(
+                                    patch_tokens=tok,
+                                    masks=masks,
+                                    is_anomaly=is_anomaly,
+                                    device=device
+                                )
+                                if ve is not None:
+                                    visual_embed_levels.append(ve)
+                                    if is_background is None:
+                                        is_background = ib
+                        else:
+                            filo_feat = all_filo_tokens[0]
+                            visual_embed, is_background = compute_filo_aligned_features(
+                                patch_tokens=filo_feat,
+                                masks=masks,
+                                is_anomaly=is_anomaly,
+                                device=device
+                            )
+                            if visual_embed is not None:
+                                visual_embed_levels = [visual_embed]
                         
-                        # 取第一层的tokens用于align（或者可以合并多层）
-                        # patch_tokens: (B, N, 768)
-                        filo_feat = all_filo_tokens[0]  # 使用第一层
-                        
-                        # 使用mask-guided pooling计算aligned_features
-                        visual_embed, is_background = compute_filo_aligned_features(
-                            patch_tokens=filo_feat,
-                            masks=masks,
-                            is_anomaly=is_anomaly,
-                            device=device
-                        )
-                        
-                        if step % 100 == 0:
-                            print(f"[ALIGN] Using FiLo patch_tokens: shape={filo_feat.shape}, "
-                                  f"visual_embed={visual_embed.shape if visual_embed is not None else None}")
+                        if step % 100 == 0 and len(visual_embed_levels) > 0:
+                            print(f"[ALIGN] Using FiLo patch_tokens: n_levels={len(visual_embed_levels)} "
+                                  f"shape0={tuple((filo_qkv + filo_vv)[0].shape)} "
+                                  f"embed0={tuple(visual_embed_levels[0].shape)}")
                     
                     else:
                         # 回退到 decoder 特征
-                        decoder_feat = out.get("decoder_features", None)
-                        if decoder_feat is None:
-                            decoder_feat = out.get("decoder_hs", None)
-                            if decoder_feat is not None and decoder_feat.dim() == 4:
-                                decoder_feat = decoder_feat[-1]
-                            # 确保 decoder_feat 是 (B, Q, D) 格式
-                            if decoder_feat is not None and decoder_feat.dim() == 3:
-                                if decoder_feat.shape[0] == Q and decoder_feat.shape[1] == B:
-                                    decoder_feat = decoder_feat.permute(1, 0, 2).contiguous()
-                        
-                        # 使用改进的函数：区分异常/正常样本
-                        visual_embed, is_background = compute_visual_embedding_with_background(
-                            decoder_features=decoder_feat,
-                            masks=masks,
-                            is_anomaly=is_anomaly,  # 从 batch 数据中获取
-                            device=device
-                        )
+                        ms = out.get("multiscale_features", None)
+                        used_feats = None
+                        if isinstance(ms, dict):
+                            used_feats = ms.get("used_features", None)
+                        if use_multilevel_align and isinstance(used_feats, list) and len(used_feats) > 0:
+                            feats_lv = used_feats
+                            if max_levels > 0:
+                                feats_lv = feats_lv[:max_levels]
+                            for f in feats_lv:
+                                ve, ib = compute_visual_embedding_with_background(
+                                    decoder_features=f,
+                                    masks=masks,
+                                    is_anomaly=is_anomaly,
+                                    device=device
+                                )
+                                if ve is not None:
+                                    visual_embed_levels.append(ve)
+                                    if is_background is None:
+                                        is_background = ib
+                        else:
+                            decoder_feat = out.get("decoder_features", None)
+                            if decoder_feat is None:
+                                decoder_feat = out.get("decoder_hs", None)
+                                if decoder_feat is not None and decoder_feat.dim() == 4:
+                                    decoder_feat = decoder_feat[-1]
+                                if decoder_feat is not None and decoder_feat.dim() == 3:
+                                    if decoder_feat.shape[0] == Q and decoder_feat.shape[1] == B:
+                                        decoder_feat = decoder_feat.permute(1, 0, 2).contiguous()
+                            
+                            visual_embed, is_background = compute_visual_embedding_with_background(
+                                decoder_features=decoder_feat,
+                                masks=masks,
+                                is_anomaly=is_anomaly,
+                                device=device
+                            )
+                            if visual_embed is not None:
+                                visual_embed_levels = [visual_embed]
                     
-                    if visual_embed is None:
-                        visual_embed = torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)
+                    if len(visual_embed_levels) == 0:
+                        visual_embed_levels = [torch.zeros((B, prompt_proto.shape[1] if prompt_proto is not None else 128), device=device)]
                         is_background = torch.zeros(B, dtype=torch.bool, device=device)
+                    visual_embed = visual_embed_levels[0]
 
                     # ===== Step 3: 维度对齐 =====
                     if prompt_proto is not None:
                         Dp = prompt_proto.shape[1]
-                        Dm = visual_embed.shape[1]
-                        if Dm != Dp:
-                            if not hasattr(model_core, "_align_proj"):
-                                model_core._align_proj = nn.Linear(Dm, Dp).to(device)
-                                optimizer.add_param_group({
-                                    "params": model_core._align_proj.parameters(),
-                                    "lr": args.lr_main,
-                                    "weight_decay": 0.0
-                                })
-                            visual_embed = model_core._align_proj(visual_embed)
+                        aligned_levels = []
+                        for ve in visual_embed_levels:
+                            Dm = ve.shape[1]
+                            if Dm != Dp:
+                                if not hasattr(model_core, "_align_proj"):
+                                    model_core._align_proj = nn.Linear(Dm, Dp).to(device)
+                                    optimizer.add_param_group({
+                                        "params": model_core._align_proj.parameters(),
+                                        "lr": args.lr_main,
+                                        "weight_decay": 0.0
+                                    })
+                                ve = model_core._align_proj(ve)
+                            aligned_levels.append(ve)
+                        visual_embed_levels = aligned_levels
+                        visual_embed = visual_embed_levels[0]
 
                     # ===== Step 4: 计算改进的 align loss =====
                     if prompt_proto is not None:
@@ -4339,14 +4869,29 @@ def main(args: argparse.Namespace):
                         # ===== 【v2.1 修复】使用二分类形式的 align loss =====
                         # 确保有 normal 和 abnormal 两个原型
                         if prompt_proto_normal is not None and prompt_proto_abnormal is not None:
-                            align_loss = align_loss_binary_classification(
-                                proto_normal=prompt_proto_normal,
-                                proto_abnormal=prompt_proto_abnormal,
-                                visual_embed=visual_embed,
-                                is_anomaly=is_anomaly,
-                                temp=args.align_temp,
-                                label_smoothing=0.1,
-                            )
+                            per_level_losses = [
+                                align_loss_binary_classification(
+                                    proto_normal=prompt_proto_normal,
+                                    proto_abnormal=prompt_proto_abnormal,
+                                    visual_embed=ve,
+                                    is_anomaly=is_anomaly,
+                                    temp=args.align_temp,
+                                    label_smoothing=0.1,
+                                )
+                                for ve in (visual_embed_levels if use_multilevel_align else [visual_embed])
+                            ]
+                            if len(per_level_losses) > 1:
+                                w = None
+                                if str(getattr(args, "align_multilevel_weight_source", "uniform")).lower() == "msad":
+                                    msad_mod = getattr(model_core, "msad", None)
+                                    lw = getattr(getattr(msad_mod, "aggregator", None), "level_weights", None) if msad_mod is not None else None
+                                    if isinstance(lw, torch.Tensor) and lw.numel() == len(per_level_losses):
+                                        w = torch.softmax(lw.detach().float(), dim=0)
+                                if w is None:
+                                    w = torch.ones(len(per_level_losses), device=device, dtype=torch.float32) / float(len(per_level_losses))
+                                align_loss = sum(per_level_losses[i] * w[i] for i in range(len(per_level_losses)))
+                            else:
+                                align_loss = per_level_losses[0]
                         else:
                             # 回退到原来的方法（不应该发生）
                             align_loss = align_loss_with_background_margin(
@@ -4537,6 +5082,52 @@ def main(args: argparse.Namespace):
                             print(f"[ALIGN] step={step} align_loss={align_loss.item():.6f} "
                                   f"query_align={query_align_loss.item():.6f} "
                                   f"pos_sim={pos_sim:.4f} neg_sim={neg_sim:.4f}")
+                            if prompt_proto_normal is not None and prompt_proto_abnormal is not None:
+                                v0 = F.normalize(visual_embed, dim=1)
+                                pn0 = F.normalize(prompt_proto_normal, dim=1)
+                                pa0 = F.normalize(prompt_proto_abnormal, dim=1)
+                                sim_vn = (v0 * pn0).sum(dim=1) / float(args.align_temp)
+                                sim_va = (v0 * pa0).sum(dim=1) / float(args.align_temp)
+                                anom_mask = torch.as_tensor(is_anomaly, device=device, dtype=torch.bool)
+                                norm_mask = ~anom_mask
+                                normal_margin = (sim_vn[norm_mask] - sim_va[norm_mask]).mean().item() if norm_mask.any() else 0.0
+                                anomaly_margin = (sim_va[anom_mask] - sim_vn[anom_mask]).mean().item() if anom_mask.any() else 0.0
+                                proto_gap = (pn0 * pa0).sum(dim=1).mean().item()
+                                print(f"[ALIGN-MARGIN] proto_gap={proto_gap:.4f} normal_margin={normal_margin:.4f} anomaly_margin={anomaly_margin:.4f}")
+                                if bool(getattr(args, "align_multilevel", False)) and "visual_embed_levels" in locals() and len(visual_embed_levels) > 1:
+                                    nm_list = []
+                                    am_list = []
+                                    for ve in visual_embed_levels:
+                                        v = F.normalize(ve, dim=1)
+                                        sim_vn_l = (v * pn0).sum(dim=1) / float(args.align_temp)
+                                        sim_va_l = (v * pa0).sum(dim=1) / float(args.align_temp)
+                                        nm = (sim_vn_l[norm_mask] - sim_va_l[norm_mask]).mean().item() if norm_mask.any() else 0.0
+                                        am = (sim_va_l[anom_mask] - sim_vn_l[anom_mask]).mean().item() if anom_mask.any() else 0.0
+                                        nm_list.append(round(float(nm), 4))
+                                        am_list.append(round(float(am), 4))
+                                    print(f"[ALIGN-LEVEL-MARGIN] normal_margin={nm_list} anomaly_margin={am_list}")
+                            eta_dbg = out.get("eta_spurious", None)
+                            if isinstance(eta_dbg, torch.Tensor):
+                                print(f"[SPURIOUS] eta mean={eta_dbg.mean().detach().item():.4f} std={eta_dbg.std().detach().item():.4f} "
+                                      f"min={eta_dbg.min().detach().item():.4f} max={eta_dbg.max().detach().item():.4f}")
+                            dap_patches = out.get("compound_dap_weights", None)
+                            if isinstance(dap_patches, torch.Tensor) and dap_patches.dim() == 3:
+                                pmn = getattr(model_core, "prompt_learner", None)
+                                pnet = getattr(pmn, "patch_meta_net", None) if pmn is not None else None
+                                if pnet is not None:
+                                    selected_flat = dap_patches.reshape(dap_patches.shape[0], -1)
+                                    bias = pnet(selected_flat)
+                                    bnorm = bias.norm(dim=1)
+                                    print(f"[DAP] bias_norm mean={bnorm.mean().detach().item():.4f} std={bnorm.std().detach().item():.4f}")
+                            msad_mod = getattr(model_core, "msad", None)
+                            if msad_mod is not None:
+                                temp_p = getattr(getattr(msad_mod, "scorer", None), "temperature", None)
+                                lw_p = getattr(getattr(msad_mod, "aggregator", None), "level_weights", None)
+                                if isinstance(temp_p, torch.Tensor):
+                                    print(f"[MSAD] temperature={temp_p.detach().item():.4f}")
+                                if isinstance(lw_p, torch.Tensor) and lw_p.numel() > 0:
+                                    w = torch.softmax(lw_p.detach().float(), dim=0)
+                                    print(f"[MSAD] level_weights_softmax={w.cpu().numpy().round(4).tolist()}")
                             print(f"[QA-DBG] step_ratio={current_ratio_diag:.3f} use_full_softmax={use_full_sm} "
                                   f"n_anomaly={sum(is_anomaly)} n_normal={len(is_anomaly)-sum(is_anomaly)}")
                             
@@ -4577,7 +5168,22 @@ def main(args: argparse.Namespace):
                                 class_to_color = {cls: cmap(i / max(n_classes - 1, 1)) for i, cls in enumerate(unique_classes)}
                                 colors_sample = [class_to_color[cls] for cls in class_names_sample]
                                 
-                                X = np.concatenate([p_sample, m_sample], axis=0)
+                                extra_vecs = []
+                                extra_names = []
+                                if prompt_proto_normal is not None and prompt_proto_abnormal is not None:
+                                    pn_mean = F.normalize(prompt_proto_normal, dim=1)[sel].mean(dim=0)
+                                    pa_mean = F.normalize(prompt_proto_abnormal, dim=1)[sel].mean(dim=0)
+                                    extra_vecs.extend([pn_mean.detach().cpu().numpy(), pa_mean.detach().cpu().numpy()])
+                                    extra_names.extend(["proto_normal", "proto_abnormal"])
+                                if proto_suspicious is not None:
+                                    ps_mean = F.normalize(proto_suspicious, dim=1)[sel].mean(dim=0)
+                                    extra_vecs.append(ps_mean.detach().cpu().numpy())
+                                    extra_names.append("proto_suspicious")
+                                
+                                if extra_vecs:
+                                    X = np.concatenate([p_sample, m_sample, np.stack(extra_vecs, axis=0)], axis=0)
+                                else:
+                                    X = np.concatenate([p_sample, m_sample], axis=0)
                                 Z = TSNE(n_components=2, perplexity=min(30, ns-1), init='pca', random_state=42).fit_transform(X)
                                 
                                 # 创建多面板图
@@ -4625,6 +5231,19 @@ def main(args: argparse.Namespace):
                                                c=[colors_sample[i]], marker=marker, s=size, 
                                                edgecolors='black', linewidths=0.5, alpha=0.8)
                                 
+                                if extra_vecs:
+                                    base = 2 * ns
+                                    for j, name in enumerate(extra_names):
+                                        if name == "proto_normal":
+                                            c = "cyan"
+                                        elif name == "proto_abnormal":
+                                            c = "magenta"
+                                        else:
+                                            c = "yellow"
+                                        ax2.scatter(Z[base + j, 0], Z[base + j, 1],
+                                                   c=c, marker='D', s=180, alpha=0.9,
+                                                   edgecolors='black', linewidths=0.8)
+                                
                                 # 图例
                                 pv_legend = [
                                     Line2D([0], [0], marker='x', color='gray', markersize=10, label='Prompt', linestyle='None'),
@@ -4633,6 +5252,18 @@ def main(args: argparse.Namespace):
                                     Line2D([0], [0], marker='*', color='w', markerfacecolor='gray', markersize=14, 
                                            label='Visual (Anomaly)', markeredgecolor='black')
                                 ]
+                                if extra_vecs:
+                                    pv_legend.extend([
+                                        Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan', markersize=10,
+                                               label='Proto (Normal)', markeredgecolor='black'),
+                                        Line2D([0], [0], marker='D', color='w', markerfacecolor='magenta', markersize=10,
+                                               label='Proto (Abnormal)', markeredgecolor='black'),
+                                    ])
+                                    if "proto_suspicious" in extra_names:
+                                        pv_legend.append(
+                                            Line2D([0], [0], marker='D', color='w', markerfacecolor='yellow', markersize=10,
+                                                   label='Proto (Suspicious)', markeredgecolor='black')
+                                        )
                                 ax2.legend(handles=pv_legend, loc='upper right', fontsize=9)
                                 ax2.set_title(f"Prompt-Visual Alignment (color=class)", fontsize=12)
                                 ax2.set_xlabel("Dim 1")
@@ -4641,7 +5272,9 @@ def main(args: argparse.Namespace):
                                 # ===== Panel 3: 相似度分布 =====
                                 ax3 = axes[1, 0]
                                 # 计算 prompt-visual 相似度
-                                sim_matrix = (p_norm_tsne @ m_norm_tsne.t()).detach().cpu().numpy()
+                                p_norm_sel = p_norm_tsne[sel]
+                                m_norm_sel = m_norm_tsne[sel]
+                                sim_matrix = (p_norm_sel @ m_norm_sel.t()).detach().cpu().numpy()
                                 diag_sim = np.diag(sim_matrix)  # 同一样本的相似度
                                 
                                 normal_idx = np.where(is_bg_sample)[0]
@@ -4660,12 +5293,27 @@ def main(args: argparse.Namespace):
                                 # ===== Panel 4: 统计信息 =====
                                 ax4 = axes[1, 1]
                                 # 计算统计量
-                                sim_for_stats = (p_norm_tsne @ m_norm_tsne.t()) / float(args.align_temp)
-                                same_grp = (group_labels.unsqueeze(0) == group_labels.unsqueeze(1))
+                                sim_for_stats = (p_norm_sel @ m_norm_sel.t()) / float(args.align_temp)
+                                group_sel = group_labels[sel]
+                                same_grp = (group_sel.unsqueeze(0) == group_sel.unsqueeze(1))
                                 pos_sim_val = sim_for_stats[same_grp].mean().item() if same_grp.sum() > 0 else 0
                                 neg_sim_val = sim_for_stats[~same_grp].mean().item() if (~same_grp).sum() > 0 else 0
                                 n_bg_val = is_background.sum().item()
                                 n_anom_val = (~is_background).sum().item()
+                                proto_gap_val = 0.0
+                                normal_margin_val = 0.0
+                                anomaly_margin_val = 0.0
+                                if prompt_proto_normal is not None and prompt_proto_abnormal is not None:
+                                    v0 = F.normalize(visual_embed, dim=1)[sel]
+                                    pn0 = F.normalize(prompt_proto_normal, dim=1)[sel]
+                                    pa0 = F.normalize(prompt_proto_abnormal, dim=1)[sel]
+                                    sim_vn = (v0 * pn0).sum(dim=1) / float(args.align_temp)
+                                    sim_va = (v0 * pa0).sum(dim=1) / float(args.align_temp)
+                                    anom_mask_s = torch.as_tensor([is_anomaly[i] for i in sel], device=device, dtype=torch.bool)
+                                    norm_mask_s = ~anom_mask_s
+                                    normal_margin_val = (sim_vn[norm_mask_s] - sim_va[norm_mask_s]).mean().item() if norm_mask_s.any() else 0.0
+                                    anomaly_margin_val = (sim_va[anom_mask_s] - sim_vn[anom_mask_s]).mean().item() if anom_mask_s.any() else 0.0
+                                    proto_gap_val = (pn0 * pa0).sum(dim=1).mean().item()
                                 
                                 # 计算类别分布
                                 class_dist = {}
@@ -4690,6 +5338,9 @@ def main(args: argparse.Namespace):
                                       pos_sim (same group): {pos_sim_val:.4f}
                                       neg_sim (diff group): {neg_sim_val:.4f}
                                       separation: {pos_sim_val - neg_sim_val:.4f}
+                                      proto_gap (cos n/a): {proto_gap_val:.4f}
+                                      normal_margin: {normal_margin_val:.4f}
+                                      anomaly_margin: {anomaly_margin_val:.4f}
 
                                     Sample Distribution (batch):
                                       Normal: {n_bg_val}
@@ -4712,12 +5363,91 @@ def main(args: argparse.Namespace):
                                 plt.suptitle(f"t-SNE Visualization - Epoch {epoch+1} (●=Normal, ★=Anomaly)", fontsize=14, fontweight='bold')
                                 plt.tight_layout()
                                 
-                                tsne_out_dir = os.path.join(log_dir, "tsne")
-                                os.makedirs(tsne_out_dir, exist_ok=True)
-                                tsne_save_path = os.path.join(tsne_out_dir, f"tsne_epoch{epoch+1:02d}.png")
-                                plt.savefig(tsne_save_path, dpi=150, bbox_inches='tight')
+                                out_dirs = []
+                                save_to = str(getattr(args, "tsne_save_to", "log_dir")).lower()
+                                if save_to in ("log_dir", "both"):
+                                    out_dirs.append(os.path.join(log_dir, "tsne"))
+                                if save_to in ("save_dir", "both"):
+                                    out_dirs.append(os.path.join(save_dir, "tsne"))
+                                out_dirs = [d for d in dict.fromkeys(out_dirs) if d]
+                                for d in out_dirs:
+                                    os.makedirs(d, exist_ok=True)
+
+                                tsne_save_paths = [os.path.join(d, f"tsne_epoch{epoch+1:02d}.png") for d in out_dirs]
+                                for p in tsne_save_paths:
+                                    plt.savefig(p, dpi=150, bbox_inches="tight")
                                 plt.close()
-                                print(f"[INFO] Saved enhanced t-SNE visualization to {tsne_save_path}")
+                                if tsne_save_paths:
+                                    print(f"[INFO] Saved enhanced t-SNE visualization to {tsne_save_paths[0]}")
+
+                                try:
+                                    Z_visual = Z[ns:2 * ns]
+                                    y = (~is_bg_sample).astype(np.int64)
+                                    k = int(min(5, max(ns - 1, 1)))
+
+                                    sil = float("nan")
+                                    if len(np.unique(y)) >= 2 and ns >= 4 and np.min(np.bincount(y)) >= 2:
+                                        sil = float(silhouette_score(Z_visual, y, metric="euclidean"))
+
+                                    correct = 0
+                                    boundary = 0
+                                    for i in range(ns):
+                                        d = np.sum((Z_visual - Z_visual[i:i+1]) ** 2, axis=1)
+                                        d[i] = np.inf
+                                        nn = np.argsort(d)[:k]
+                                        pred = int(np.round(np.mean(y[nn])))
+                                        if pred == int(y[i]):
+                                            correct += 1
+                                        frac_diff = float(np.mean(y[nn] != y[i]))
+                                        if frac_diff >= 0.34:
+                                            boundary += 1
+                                    knn_acc = float(correct) / float(ns) if ns > 0 else float("nan")
+                                    boundary_ratio = float(boundary) / float(ns) if ns > 0 else float("nan")
+
+                                    metrics = {
+                                        "epoch": int(epoch + 1),
+                                        "ns": int(ns),
+                                        "k": int(k),
+                                        "silhouette_tsne_visual": sil,
+                                        "knn_acc_tsne_visual": knn_acc,
+                                        "boundary_ratio_tsne_visual": boundary_ratio,
+                                    }
+                                except Exception as e:
+                                    metrics = {"epoch": int(epoch + 1), "error": str(e)}
+
+                                dump = {
+                                    "epoch": int(epoch + 1),
+                                    "ns": int(ns),
+                                    "sel": sel.astype(np.int64),
+                                    "Z": Z.astype(np.float32),
+                                    "Z_visual": Z[ns:2 * ns].astype(np.float32),
+                                    "Z_prompt": Z[:ns].astype(np.float32),
+                                    "is_bg": is_bg_sample.astype(np.bool_),
+                                    "is_anomaly": np.asarray(is_anomaly_sample, dtype=np.bool_),
+                                    "class_names": np.asarray(class_names_sample),
+                                    "extra_names": np.asarray(extra_names),
+                                    "diag_sim": diag_sim.astype(np.float32),
+                                    "stats": np.asarray(
+                                        {
+                                            "align_loss": float(align_loss.item()),
+                                            "query_align": float(query_align_loss.item()),
+                                            "pos_sim": float(pos_sim_val),
+                                            "neg_sim": float(neg_sim_val),
+                                            "proto_gap": float(proto_gap_val),
+                                            "normal_margin": float(normal_margin_val),
+                                            "anomaly_margin": float(anomaly_margin_val),
+                                            "prompt_visual_mean": float(diag_sim.mean()),
+                                            "prompt_visual_std": float(diag_sim.std()),
+                                        },
+                                        dtype=object,
+                                    ),
+                                    "metrics": np.asarray(metrics, dtype=object),
+                                }
+                                npz_paths = [os.path.join(d, f"tsne_epoch{epoch+1:02d}.npz") for d in out_dirs]
+                                for p in npz_paths:
+                                    np.savez_compressed(p, **dump)
+                                if npz_paths:
+                                    print(f"[INFO] Saved t-SNE data to {npz_paths[0]}")
                             except Exception as e:
                                 import traceback
                                 print(f"[WARN] TSNE visualization failed: {e}")
@@ -4734,6 +5464,23 @@ def main(args: argparse.Namespace):
                 # 获取lambda_filo和lambda_conf_fusion
                 lambda_filo = getattr(args, 'lambda_filo', 0.0)
                 lambda_conf_fusion = getattr(args, 'lambda_conf_fusion', 0.0)
+                lambda_msad = getattr(args, 'lambda_msad', 0.0)  # 新增
+                lambda_msad_img = getattr(args, 'lambda_msad_img', 0.0)
+                lambda_msad_margin = getattr(args, 'lambda_msad_margin', 0.0)
+                lambda_msad_sim_margin = getattr(args, 'lambda_msad_sim_margin', 0.0)
+                lambda_suspicious = float(getattr(args, "lambda_suspicious", 0.0) or 0.0)
+
+                if str(getattr(args, "train_objective", "seg")).lower() == "rank":
+                    loss_focal = torch.tensor(0.0, device=device)
+                    loss_dice = torch.tensor(0.0, device=device)
+                    loss_iou = torch.tensor(0.0, device=device)
+                    loss_presence = torch.tensor(0.0, device=device)
+                    align_loss = torch.tensor(0.0, device=device)
+                    query_align_loss = torch.tensor(0.0, device=device)
+                    loss_filo = torch.tensor(0.0, device=device)
+                    loss_conf_fusion = torch.tensor(0.0, device=device)
+                    loss_suspicious = torch.tensor(0.0, device=device)
+                    loss_main = torch.tensor(0.0, device=device)
                 
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
                     loss_main = (torch.exp(-log_var_focal) * loss_focal + log_var_focal) + \
@@ -4741,13 +5488,13 @@ def main(args: argparse.Namespace):
                                 (torch.exp(-log_var_iou)   * loss_iou   + log_var_iou)
                     total_loss = loss_main + args.presence_weight * loss_presence + \
                                  args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
-                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion + \
+                                 lambda_filo * loss_filo + lambda_msad * loss_msad + lambda_msad_img * loss_msad_img + lambda_msad_margin * loss_msad_margin + lambda_msad_sim_margin * loss_msad_sim_margin + lambda_conf_fusion * loss_conf_fusion + \
                                  lambda_suspicious * loss_suspicious  # 【新增】
                 else:
                     total_loss = args.loss_alpha * loss_focal + args.loss_beta * loss_dice + args.loss_gamma * loss_iou
                     total_loss = total_loss + args.presence_weight * loss_presence + \
                                  args.lambda_align * align_loss + current_lambda_query_align * query_align_loss + \
-                                 lambda_filo * loss_filo + lambda_conf_fusion * loss_conf_fusion + \
+                                 lambda_filo * loss_filo + lambda_msad * loss_msad + lambda_msad_img * loss_msad_img + lambda_msad_margin * loss_msad_margin + lambda_msad_sim_margin * loss_msad_sim_margin + lambda_conf_fusion * loss_conf_fusion + \
                                  lambda_suspicious * loss_suspicious  # 【新增】
 
                 # ===== Compound Prompt Learner 损失 =====
@@ -4825,6 +5572,22 @@ def main(args: argparse.Namespace):
                     grad_accum.reset()
                     continue
 
+                if bool(getattr(args, "debug_prompt_grads", False)) and (step % getattr(args, "log_freq", 100) == 0):
+                    targets = []
+                    for n, p in model.named_parameters():
+                        if p.grad is None:
+                            continue
+                        nl = n.lower()
+                        if ("prompt_learner." in nl) or ("patch_meta_net" in nl):
+                            targets.append((n, float(p.grad.norm().detach().item())))
+                    if len(targets) > 0:
+                        targets.sort(key=lambda x: x[1], reverse=True)
+                        print("[PROMPT-GRADS] top norms:")
+                        for name, gn in targets[:20]:
+                            print(f"  {name}: {gn:.4e}")
+                    else:
+                        print("[PROMPT-GRADS] no prompt-related grads found (all None)")
+
                 # --- Diagnostic: grad norms for prompt-related params ---
                 grad_finite_check(model, "transformer.decoder")
                 if step == 0:
@@ -4860,6 +5623,10 @@ def main(args: argparse.Namespace):
                     lambda_scheduler.step()
                 
                 global_optim_step += 1
+                if int(getattr(args, "max_train_steps", 0) or 0) > 0 and global_optim_step >= int(getattr(args, "max_train_steps", 0) or 0):
+                    if is_main_process:
+                        print(f"[INFO] Reached max_train_steps={int(getattr(args, 'max_train_steps', 0) or 0)}, stopping.")
+                    stop_training = True
                 
                 grad_accum.reset()
             # ==================== 梯度累积逻辑结束 ====================
@@ -4898,6 +5665,74 @@ def main(args: argparse.Namespace):
                 writer.add_scalar("loss/query_align", query_align_loss.item(), global_step)
             if is_main_process and writer is not None:
                 writer.add_scalar("loss/suspicious alignment", loss_suspicious.item(), global_step)            
+
+            if is_main_process and writer is not None:
+                diag_freq = int(getattr(args, "r2_diag_freq", 50) or 50)
+                if diag_freq > 0 and (global_step % diag_freq) == 0:
+                    eta_dbg = out.get("eta_spurious", None)
+                    msad_score_dbg = out.get("msad_anomaly_score", None)
+                    eta_mean = None
+                    msad_mean = None
+                    if isinstance(eta_dbg, torch.Tensor):
+                        eta_mean = float(eta_dbg.detach().mean().item())
+                        writer.add_scalar("r2/eta_mean", eta_mean, global_step)
+                    if isinstance(msad_score_dbg, torch.Tensor):
+                        msad_mean = float(msad_score_dbg.detach().mean().item())
+                        writer.add_scalar("r2/msad_mean", msad_mean, global_step)
+                    if (eta_mean is not None) and (msad_mean is not None):
+                        s = r2_corr_state
+                        s["n"] += 1
+                        dx = eta_mean - s["mean_x"]
+                        s["mean_x"] += dx / s["n"]
+                        dy = msad_mean - s["mean_y"]
+                        s["mean_y"] += dy / s["n"]
+                        s["C"] += dx * (msad_mean - s["mean_y"])
+                        s["M2x"] += dx * (eta_mean - s["mean_x"])
+                        s["M2y"] += dy * (msad_mean - s["mean_y"])
+                        denom = (s["M2x"] * s["M2y"]) ** 0.5
+                        corr = float(s["C"] / denom) if (s["n"] > 2 and denom > 1e-12) else float("nan")
+                        writer.add_scalar("r2/corr_eta_msad_mean", corr, global_step)
+
+                    msad_map_dbg = out.get("msad_aggregated_map", None)
+                    sp_map_dbg = out.get("spurious_map", None)
+                    if isinstance(msad_map_dbg, torch.Tensor) and isinstance(sp_map_dbg, torch.Tensor):
+                        gt_mask = masks
+                        if gt_mask.dim() == 4:
+                            gt_mask = gt_mask.squeeze(1)
+                        with torch.no_grad():
+                            p_norm = msad_map_dbg[:, 0].float()
+                            p_abn = msad_map_dbg[:, 1].float()
+                            if p_abn.shape[-2:] != gt_mask.shape[-2:]:
+                                gt_mask_f32 = F.interpolate(gt_mask.unsqueeze(1).float(), size=p_abn.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
+                            else:
+                                gt_mask_f32 = gt_mask.float()
+                            if sp_map_dbg.shape[-2:] != p_abn.shape[-2:]:
+                                sp_map_f32 = F.interpolate(sp_map_dbg.unsqueeze(1).float(), size=p_abn.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
+                            else:
+                                sp_map_f32 = sp_map_dbg.float()
+                            eps = 1e-6
+                            logit = (torch.log(p_abn.clamp(eps, 1 - eps)) - torch.log(p_norm.clamp(eps, 1 - eps))).detach()
+                            defect_mask = gt_mask_f32 > 0.5
+                            top_p = float(getattr(args, "spurious_top_p", 0.02) or 0.0)
+                            spurious_mask = torch.zeros_like(defect_mask)
+                            if top_p > 0.0:
+                                B, H, W = sp_map_f32.shape
+                                k = int(max(1, min(H * W, round(top_p * H * W))))
+                                flat = sp_map_f32.view(B, -1)
+                                topk_vals, _ = torch.topk(flat, k=k, dim=1, largest=True, sorted=True)
+                                thr = topk_vals[:, -1].view(B, 1, 1)
+                                spurious_mask = (sp_map_f32 >= thr) & (gt_mask_f32 <= 0.5)
+
+                            def _log_q(prefix, vals):
+                                if vals.numel() == 0:
+                                    return
+                                for q in (0.5, 0.9, 0.99):
+                                    writer.add_scalar(f"r2/{prefix}_p{int(q*100):02d}", float(torch.quantile(vals, q).item()), global_step)
+
+                            if defect_mask.any():
+                                _log_q("logit_defect", logit[defect_mask])
+                            if spurious_mask.any():
+                                _log_q("logit_spurious", logit[spurious_mask])
 
             if is_main_process and writer is not None:
                 writer.add_scalar("debug/src_q_nonempty_ratio", nonempty_ratio, global_step)
@@ -4971,6 +5806,11 @@ def main(args: argparse.Namespace):
 
             running_loss += loss.item()
             running_steps += 1
+            if stop_training:
+                break
+
+        if stop_training:
+            break
 
         if running_steps > 0:
             avg_loss = running_loss / running_steps
@@ -4986,18 +5826,143 @@ def main(args: argparse.Namespace):
     writer.flush()
     writer.close()
 
+def apply_run_profile(args: argparse.Namespace) -> argparse.Namespace:
+    def _set_if_default(name: str, default, value) -> None:
+        if hasattr(args, name) and getattr(args, name) == default:
+            setattr(args, name, value)
+
+    prof = str(getattr(args, "run_profile", "custom")).lower()
+    if getattr(args, "disable_spurious_gating", False):
+        args.enable_spurious_gating = False
+    if prof == "zero_shot":
+        args.train_objective = "rank"
+        args.disable_lora = True
+        args.freeze_vision = True
+        args.freeze_text = True
+        args.unfreeze_decoder = "none"
+        args.train_seg_head = False
+        args.lambda_align = 0.0
+        args.lambda_query_align = 0.0
+        args.enable_two_stage = False
+        args.lambda_suspicious = 0.0
+        if hasattr(args, "disable_bank"):
+            args.disable_bank = True
+        if hasattr(args, "disable_w_learning"):
+            args.disable_w_learning = True
+        args.lambda_msad_margin = 0.0
+        args.lambda_msad_sim_margin = 0.0
+        if hasattr(args, "msad_return_similarity_logits"):
+            args.msad_return_similarity_logits = False
+        args.prompt_learner_type = "compound"
+        args.compound_disable_w = True
+        args.compound_use_text_encoder = True
+        args.compound_abnormal_word = str(getattr(args, "compound_abnormal_word", "anomaly") or "anomaly")
+        args.compound_pooling = str(getattr(args, "compound_pooling", "ctx_only") or "ctx_only")
+        args.enable_msad = True
+        args.msad_use_vision_adapter = True
+        args.enable_spurious_gating = False
+        args.lambda_msad = float(getattr(args, "lambda_msad", 0.3) or 0.3)
+        args.lambda_msad_img = float(getattr(args, "lambda_msad_img", 0.1) or 0.1)
+        if hasattr(args, "msad_img_pool"):
+            args.msad_img_pool = str(getattr(args, "msad_img_pool", "q95") or "q95")
+    elif prof in ("few_shot", "few_shot_full", "few_shot_no_w"):
+        args.train_objective = "seg"
+        args.disable_lora = True
+        args.freeze_vision = True
+        args.freeze_text = True
+        args.unfreeze_decoder = "all" if prof in ("few_shot_full", "few_shot_no_w") else "none"
+        args.train_seg_head = True
+        args.prompt_learner_type = "compound"
+        args.compound_disable_w = True if prof == "few_shot_no_w" else False
+        args.compound_use_text_encoder = True
+        args.compound_abnormal_word = str(getattr(args, "compound_abnormal_word", "anomaly") or "anomaly")
+        args.compound_pooling = str(getattr(args, "compound_pooling", "ctx_only") or "ctx_only")
+        if prof in ("few_shot_full", "few_shot_no_w"):
+            if hasattr(args, "enable_parallel_lora"):
+                args.enable_parallel_lora = True
+            if hasattr(args, "parallel_lora_rank"):
+                args.parallel_lora_rank = int(getattr(args, "parallel_lora_rank", 16) or 16)
+            if hasattr(args, "parallel_lora_alpha") and getattr(args, "parallel_lora_alpha", None) is None:
+                args.parallel_lora_alpha = 64.0
+            if hasattr(args, "parallel_lora_target"):
+                args.parallel_lora_target = str(getattr(args, "parallel_lora_target", "qv_only") or "qv_only")
+            if hasattr(args, "compound_enable_dap"):
+                args.compound_enable_dap = True
+            _set_if_default("lambda_msad_margin", 0.0, 0.3)
+            _set_if_default("lambda_msad_sim_margin", 0.0, 0.3)
+            if hasattr(args, "msad_return_similarity_logits"):
+                args.msad_return_similarity_logits = True
+        _set_if_default("loss_alpha", 5.0, 5.0)
+        _set_if_default("loss_beta", 1.0, 1.0)
+        _set_if_default("loss_gamma", 1.0, 0.5)
+        _set_if_default("presence_weight", 1.0, 0.6)
+        _set_if_default("neg_samples_per_image", 50, 10)
+        _set_if_default("min_normals_per_batch", 2, 4)
+        _set_if_default("lambda_align", 0.1, 0.50)
+        if hasattr(args, "align_multilevel") and bool(getattr(args, "align_multilevel", False)) is False:
+            args.align_multilevel = True
+        _set_if_default("align_multilevel_weight_source", "uniform", "uniform")
+        _set_if_default("align_multilevel_max_levels", 0, 0)
+        _set_if_default("align_temp", 0.1, 0.25)
+        _set_if_default("align_margin", 0.5, 0.25)
+        if hasattr(args, "enable_two_stage") and bool(getattr(args, "enable_two_stage", False)) is False:
+            args.enable_two_stage = True
+        _set_if_default("stage1_ratio", 0.35, 0.4)
+        _set_if_default("stage1_lambda", 0.08, 0.2)
+        _set_if_default("stage2_lambda", 0.20, 0.3)
+        _set_if_default("lambda_transition", "linear", "linear")
+        _set_if_default("transition_ratio", 0.15, 0.4)
+        _set_if_default("query_align_top_k", 64, 128)
+        _set_if_default("query_align_temp", 0.2, 0.2)
+        _set_if_default("lambda_query_align", 0.5, 0.5)
+        _set_if_default("bank_warm_up_ratio", 0.3, 0.6)
+        if hasattr(args, "bank_orthogonalize") and bool(getattr(args, "bank_orthogonalize", False)) is False:
+            args.bank_orthogonalize = True
+        _set_if_default("w_abnormal_margin", 0.3, 0.3)
+        if prof == "few_shot_no_w":
+            args.lambda_suspicious = 0.0
+        else:
+            _set_if_default("lambda_suspicious", 0.1, 0.3)
+        _set_if_default("lambda_msad", 0.0, 0.3)
+        _set_if_default("msad_num_levels", None, 3)
+        if hasattr(args, "msad_use_shape_attention") and bool(getattr(args, "msad_use_shape_attention", True)) is False:
+            args.msad_use_shape_attention = True
+        if (not getattr(args, "disable_spurious_gating", False)) and hasattr(args, "enable_spurious_gating") and bool(getattr(args, "enable_spurious_gating", True)) is False:
+            args.enable_spurious_gating = True
+        _set_if_default("spurious_score_threshold", 0.20, 0.20)
+        if prof == "few_shot_no_w":
+            if hasattr(args, "disable_w_learning"):
+                args.disable_w_learning = True
+            if hasattr(args, "disable_bank"):
+                args.disable_bank = True
+        else:
+            if hasattr(args, "disable_w_learning"):
+                args.disable_w_learning = False
+            if hasattr(args, "disable_bank"):
+                args.disable_bank = False
+        args.enable_msad = True
+    return args
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--run_profile", type=str, default="custom",
+                        choices=["custom", "zero_shot", "few_shot", "few_shot_full", "few_shot_no_w"])
     parser.add_argument("--data_root", type=str, required=True, help="Root of MVTec-AD dataset.")
     parser.add_argument("--meta_path", type=str, default=None, help="Path to meta.json (defaults to <data_root>/meta.json).")
     parser.add_argument("--mode", type=str, default="test", choices=["train", "train_all", "test"], help="Split to load.")
     parser.add_argument("--k_shot", type=int, default=0, help="K-shot for train/train_all.")
+    parser.add_argument("--few_shot_per_specie", type=int, default=0,
+                        help="Few-shot 每个 specie 采样数 (0=禁用, 5=5-shot)")
+    parser.add_argument("--few_shot_balance_good_by_specie", action="store_true", default=False,
+                        help="Few-shot: normal(good) 采样按 specie 对齐 defect 分布")
     parser.add_argument("--obj_name", type=str, default=None, help="Class name for mode=train.")
     parser.add_argument("--aug_rate", type=float, default=0.0, help="Mosaic augmentation probability.")
     parser.add_argument("--bpe_path", type=str, default=None, help="Path to BPE vocab (defaults to sam3/assets/bpe_simple_vocab_16e6.txt.gz).")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--max_train_steps", type=int, default=0,
+                        help="If >0, stop after N optimizer steps (smoke test / quick debug).")
     parser.add_argument("--lr_prompt", type=float, default=5e-4)
     parser.add_argument("--lr_main", type=float, default=5e-5)
     parser.add_argument("--loss_alpha", type=float, default=5.0, help="Weight for focal loss.")
@@ -5012,6 +5977,8 @@ if __name__ == "__main__":
                         help="Which SAM3 encoder blocks to apply LoRA to (e.g., --lora_layer_ids 0 2 4). Default: all blocks.")
     parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--freeze_text", action="store_true")
+    parser.add_argument("--force_secondary_sam3_load", action="store_true", default=False,
+                        help="Force running load_sam3_checkpoint even when --use_official.")
     
     # === Decoder 解冻/LoRA 配置 ===
     parser.add_argument("--unfreeze_decoder", type=str, default="none",
@@ -5023,6 +5990,7 @@ if __name__ == "__main__":
                         help="LoRA rank for decoder (higher = more capacity, more memory)")
     parser.add_argument("--decoder_lora_alpha", type=float, default=16.0,
                         help="LoRA alpha scaling for decoder")
+    
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard base log directory.")
     parser.add_argument("--save_dir", type=str, default="./ckpt", help="Base directory to save checkpoints.")
@@ -5040,6 +6008,13 @@ if __name__ == "__main__":
     parser.add_argument("--enable_parallel_lora", action="store_true", help="Enable parallel LoRA adapters in Attention (official model path)")
     parser.add_argument("--parallel_lora_rank", type=int, default=16, help="Rank for parallel LoRA")
     parser.add_argument("--parallel_lora_alpha", type=float, default=None, help="Alpha scaling for parallel LoRA")
+    parser.add_argument("--parallel_lora_target", type=str, default="qv_only",
+                        choices=["qv_only", "qkv_all"],
+                        help="Parallel LoRA target on attention.qkv")
+    parser.add_argument("--parallel_lora_layer_ids", nargs="*", type=int, default=None,
+                        help="Which SAM3 encoder blocks to apply parallel LoRA to. Default: all blocks.")
+    parser.add_argument("--enable_out_adapter_lora", action="store_true", default=False,
+                        help="(legacy) Enable out_adapter side-branch LoRA in Attention")
     parser.add_argument("--include_test_defects", action="store_true",help="(legacy) include defects from test split when forming dataset")
     parser.add_argument("--train_from_test", action="store_true",help="When set, build training set from MVTec test split defects only, per-specie split")
     parser.add_argument("--specie_split_ratio", type=float, default=0.8,help="Train ratio per specie (e.g. 0.8 => 80% train, 20% test)")
@@ -5049,6 +6024,13 @@ if __name__ == "__main__":
     # === 新增: align loss 相关参数 ===
     parser.add_argument("--use_anomaly_grouping", action="store_true", 
                         help="Use simpler anomaly/normal grouping instead of prompt-based grouping for align loss")
+    parser.add_argument("--align_multilevel", action="store_true",
+                        help="对齐损失使用多层FPN/多层token的逐层聚合")
+    parser.add_argument("--align_multilevel_weight_source", type=str, default="uniform",
+                        choices=["uniform", "msad"],
+                        help="多层对齐加权策略：uniform或使用MSAD的level_weights")
+    parser.add_argument("--align_multilevel_max_levels", type=int, default=0,
+                        help="多层对齐最大层数(0=全部可用层)")
     parser.add_argument("--query_align_top_k", type=int, default=64, 
                         help="Top-k queries to compete in query alignment loss (reduces from Q=900 to top_k)")
     parser.add_argument("--query_align_temp", type=float, default=0.2,
@@ -5071,6 +6053,9 @@ if __name__ == "__main__":
     parser.add_argument("--log_freq", type=int, default=100, help="Logging frequency (steps) for align diagnostics")
     parser.add_argument("--tsne_freq", type=int, default=500, help="TSNE save frequency (steps)")
     parser.add_argument("--tsne_samples", type=int, default=64, help="Number of samples for TSNE projection")
+    parser.add_argument("--tsne_save_to", type=str, default="log_dir",
+                        choices=["log_dir", "save_dir", "both"],
+                        help="t-SNE产物保存位置：log_dir 或 save_dir 或两者都保存")
     
     parser.add_argument("--align_margin", type=float, default=0.5,help="Margin for pushing defect prompts away from background embeddings")
     parser.add_argument("--lambda_query_align", type=float, default=0.5,help="Weight for query-level alignment loss (会被两阶段调度器覆盖)")
@@ -5123,7 +6108,7 @@ if __name__ == "__main__":
                         help="Compound: 模式选择 (coop=静态, cocoop=Meta-Net条件化)")
     parser.add_argument("--compound_n_ctx", type=int, default=4,
                         help="Compound: 共享上下文向量数量")
-    parser.add_argument("--compound_n_ctx_offset", type=int, default=2,
+    parser.add_argument("--compound_n_ctx_offset", type=int, default=4,
                         help="Compound: 正常/异常偏移向量数量")
     parser.add_argument("--compound_num_abnormal", type=int, default=10,
                         help="Compound: 异常prompt数量")
@@ -5133,6 +6118,25 @@ if __name__ == "__main__":
                         help="Compound: DAP top-k")
     parser.add_argument("--compound_meta_reduction", type=int, default=16,
                         help="Compound: Meta-Net瓶颈缩减因子（仅cocoop模式）")
+    parser.add_argument("--compound_dap_use_multilevel", action="store_true",
+                        help="Compound: DAP使用多层FPN特征拼接后的patch集合")
+    parser.add_argument("--compound_dap_num_levels", type=int, default=0,
+                        help="Compound: DAP使用的FPN层数(0=使用全部可用层)")
+    parser.add_argument("--compound_use_text_encoder", action="store_true",
+                        help="Compound: 将learnable ctx注入token embedding并经过SAM3 text encoder编码")
+    parser.add_argument("--compound_abnormal_word", type=str, default="anomaly",
+                        choices=["anomaly", "damaged"],
+                        help="Compound: abnormal模板关键词(训练/测试需保持一致)")
+    parser.add_argument("--compound_pooling", type=str, default="ctx_only",
+                        choices=["ctx_only", "all_tokens"],
+                        help="Compound(use_text_encoder): prompt向量聚合方式(只聚合ctx段或全token均值)")
+    parser.add_argument("--compound_abnormal_order", type=str, default="v_then_wk",
+                        choices=["v_then_wk", "wk_then_v"],
+                        help="Compound: abnormal 前缀token顺序 (V+W_k 或 W_k+V)")
+    parser.add_argument("--debug_prompt_grads", action="store_true",
+                        help="Debug: 打印compound prompt相关参数的梯度范数")
+    parser.add_argument("--debug_dump_features", action="store_true",
+                        help="Debug: 保存一小份text/msad特征到npz用于新旧版本对比")
     parser.add_argument("--lambda_orthogonal", type=float, default=0.1,
                         help="Compound: 正交约束损失权重")
     parser.add_argument("--lambda_prior", type=float, default=0.1,
@@ -5143,6 +6147,14 @@ if __name__ == "__main__":
     parser.add_argument("--prompt_mode", type=str, default="simple",
                         choices=["simple", "full"],
                         help="数据集prompt模式: simple(推荐)只有类别描述, full包含关键词")
+    # 在 argparse 部分添加
+    parser.add_argument("--class_agnostic", action="store_true", default=False,
+                        help="【零样本】使用类别无关设计，将所有类别名替换为通用名")
+    parser.add_argument("--agnostic_name", type=str, default="object",
+                        help="类别无关模式下使用的通用名称 (默认: object)")
+
+    parser.add_argument("--train_seg_head", action="store_true", default=False,
+                        help="仅在显式指定时训练 segmentation_head（默认冻结以保持开放分割能力）")
 
     # ==================== 多尺度特征 & V-V注意力 & FiLo ====================
     parser.add_argument("--num_feature_levels", type=int, default=1,
@@ -5166,6 +6178,7 @@ if __name__ == "__main__":
                         help="FiLo异常图输出尺寸")
     parser.add_argument("--filo_use_alternating", action="store_true", default=True,
                         help="FiLo是否交替分配FPN层 (偶数→Linear, 奇数→Cov)")
+    
     
     # ==================== 方案B: FiLo到Decoder回灌 ====================
     parser.add_argument("--filo_to_decoder", action="store_true",
@@ -5225,5 +6238,94 @@ if __name__ == "__main__":
     parser.add_argument('--disable_w_learning', action='store_true', default=False,
                         help='【消融】禁用 w 学习 (lambda_suspicious=0)')
 
+    parser.add_argument("--train_objective", type=str, default="seg",
+                        choices=["seg", "rank"],
+                        help="训练目标：seg=分割训练；rank=MSAD排序/异常图训练(更接近FiLo/SOWA)")
+    
+    # ==================== MSAD模块参数 (Multi-Shape Anomaly Detection) ====================
+    parser.add_argument("--enable_msad", action="store_true",
+                        help="启用MSAD (Multi-Shape Anomaly Detection) 模块")
+    parser.add_argument("--msad_use_shape_attention", action="store_true", default=True,
+                        help="使用可学习形状注意力 (Learnable Shape Attention)")
+    parser.add_argument("--msad_learnable_level_weights", action="store_true", default=True,
+                        help="使用可学习的层级权重")
+    parser.add_argument("--msad_learnable_temperature", action="store_true", default=True,
+                        help="使用可学习的温度参数")
+    parser.add_argument("--msad_temperature", type=float, default=100.0,
+                        help="异常评分温度参数初始值")
+    parser.add_argument("--msad_output_size", type=int, default=518,
+                        help="MSAD输出异常图尺寸")
+    parser.add_argument("--msad_num_levels", type=int, default=None,
+                        help="MSAD使用的FPN层数（默认4；不足则重复最低层特征）")
+    parser.add_argument("--lambda_msad", type=float, default=0.0,
+                        help="MSAD异常图监督损失权重 (>0启用)")
+    parser.add_argument("--lambda_msad_img", type=float, default=0.0,
+                        help="MSAD图像级排序损失权重 (>0启用)")
+    parser.add_argument("--msad_img_pool", type=str, default="q95",
+                        choices=["max", "q95", "mean", "topk_mean"],
+                        help="MSAD图像级分数池化方式")
+    parser.add_argument("--msad_img_topk_ratio", type=float, default=0.02,
+                        help="msad_img_pool=topk_mean时的topk比例")
+    parser.add_argument("--lambda_msad_margin", type=float, default=0.0,
+                        help="MSAD像素级margin约束损失权重 (>0启用)")
+    parser.add_argument("--lambda_msad_sim_margin", type=float, default=0.0,
+                        help="R2-2: MSAD similarity(logits)层margin损失权重 (>0启用)")
+    parser.add_argument("--msad_sim_margin_defect", type=float, default=0.3,
+                        help="R2-2: 缺陷像素(sim_logits)的最小margin")
+    parser.add_argument("--msad_sim_margin_spurious", type=float, default=0.3,
+                        help="R2-2: spurious像素(sim_logits)的最小margin")
+    parser.add_argument("--msad_sim_margin_source", type=str, default="agg",
+                        choices=["agg", "level0"],
+                        help="R2-2: similarity logits来源(agg=聚合后, level0=最高分辨率层)")
+    parser.add_argument("--msad_return_similarity_logits", action="store_true",
+                        help="训练: 让MSAD返回softmax前similarity logits以支持R2-2")
+    parser.add_argument("--msad_use_vision_adapter", action="store_true", default=False,
+                        help="MSAD: 在FPN特征进入MSAD前加轻量Conv Adapter(残差)以增强跨域对齐")
+    parser.add_argument("--msad_vision_adapter_reduction", type=int, default=2,
+                        help="MSAD vision adapter: reduction ratio")
+    parser.add_argument("--msad_vision_adapter_shared", action="store_true", default=True,
+                        help="MSAD vision adapter: 是否各层共享同一个adapter")
+    parser.add_argument("--msad_vision_adapter_not_shared", action="store_true", default=False,
+                        help="MSAD vision adapter: 各层使用独立adapter（覆盖 msad_vision_adapter_shared）")
+    parser.add_argument("--spurious_margin_require_quality", action="store_true", default=True,
+                        help="R2: 仅当spurious_map足够尖锐时启用spurious侧margin")
+    parser.add_argument("--r2_warmup_ratio", type=float, default=0.1,
+                        help="R2: warmup比例（期间不启用spurious侧margin）")
+    parser.add_argument("--r2_spurious_ramp_ratio", type=float, default=0.2,
+                        help="R2: spurious侧margin线性ramp比例")
+    parser.add_argument("--r2_diag_freq", type=int, default=50,
+                        help="R2: 诊断曲线写入频率(step)")
+    parser.add_argument("--msad_margin_defect", type=float, default=0.3,
+                        help="缺陷像素logit(abn-norm)的最小margin")
+    parser.add_argument("--msad_margin_spurious", type=float, default=0.3,
+                        help="spurious像素logit(norm-abn)的最小margin")
+    parser.add_argument("--spurious_top_p", type=float, default=0.02,
+                        help="从spurious_map选取top-p像素作为spurious集合（仅margin约束用）")
+
+    parser.add_argument("--compound_dap_spurious_filter", action="store_true",
+                        help="DAP: 用spurious_map过滤top-k patch，降低伪异常污染W_k")
+    parser.add_argument("--compound_dap_spurious_alpha", type=float, default=1.0,
+                        help="DAP: spurious加权系数α（score*=max(0,1-α*spurious)）")
+    parser.add_argument("--compound_disable_w", action="store_true",
+                        help="调试：禁用w向量(使normal_ctx仅V，abnormal_ctx为V+W)，更接近FAPrompt结构")
+    
+    # ==================== Spurious Prompt Gating 参数 ====================
+    parser.add_argument("--enable_spurious_gating", action="store_true", default=True,
+                        help="启用 Spurious Prompt Gating (eta调制w向量)")
+    parser.add_argument("--disable_spurious_gating", action="store_true", default=False,
+                        help="显式禁用 Spurious Prompt Gating（优先级高于 enable_spurious_gating）")
+    parser.add_argument("--spurious_sim_temp", type=float, default=0.07,
+                        help="Spurious prompt 相似度温度")
+    parser.add_argument("--spurious_topk_ratio", type=float, default=0.02,
+                        help="Top-k pooling 比例")
+    parser.add_argument("--spurious_score_threshold", type=float, default=0.20,
+                        help="激活阈值")
+    parser.add_argument("--spurious_kappa", type=float, default=8.0,
+                        help="Sigmoid 斜率")
+    parser.add_argument("--spurious_quality_threshold", type=float, default=0.03,
+                        help="Map peakiness 阈值")
+    
+
     args = parser.parse_args()
+    args = apply_run_profile(args)
     main(args)
