@@ -412,10 +412,13 @@ class VisADataset(Dataset):
         image_transform: Optional[Callable] = None,
         mask_transform: Optional[Callable] = None,
         prompt_mode: str = "simple",  # 新增
+        missing_mask_behavior: str = "error",
     ) -> None:
         super().__init__()
         self.root = root
         self.prompt_mode = prompt_mode.lower()
+        self.missing_mask_behavior = str(missing_mask_behavior).lower()
+        self._missing_mask_warned = 0
         
         img_tf, mask_tf = _default_transforms()
         self.image_transform = image_transform or img_tf
@@ -473,10 +476,25 @@ class VisADataset(Dataset):
         
         try:
             img = Image.open(img_path).convert("RGB")
-            
-            if not is_anomaly or mask_path is None or not os.path.exists(mask_path):
+
+            mask_missing = (mask_path is None) or (not os.path.exists(mask_path))
+            if is_anomaly and mask_missing:
+                beh = self.missing_mask_behavior
+                if beh == "error":
+                    raise FileNotFoundError(f"VisA anomaly sample missing mask file: {mask_path}")
+                if beh == "skip":
+                    if self._missing_mask_warned < 50:
+                        print(f"[WARN] VisA missing mask (skip): idx={idx} img={img_path} mask={mask_path}")
+                        self._missing_mask_warned += 1
+                    return self.__getitem__((idx + 1) % len(self.entries))
+                if beh == "flip_to_normal":
+                    if self._missing_mask_warned < 50:
+                        print(f"[WARN] VisA missing mask (flip_to_normal): idx={idx} img={img_path} mask={mask_path}")
+                        self._missing_mask_warned += 1
+                    is_anomaly = False
+
+            if (not is_anomaly) or mask_missing:
                 img_mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8), mode="L")
-                is_anomaly = False
             else:
                 mask_arr = np.array(Image.open(mask_path).convert("L")) > 0
                 img_mask = Image.fromarray(mask_arr.astype(np.uint8) * 255, mode="L")

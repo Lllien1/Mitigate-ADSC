@@ -74,6 +74,43 @@ class LoRALinear(nn.Module):
         return y + lora_update * self.scaling
 
 
+class QKVLoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int = 16, alpha: Optional[float] = None, target: str = "qv_only"):
+        super().__init__()
+        self.base = base
+        self.rank = int(rank)
+        self.alpha = float(alpha or rank)
+        self.scaling = self.alpha / float(self.rank)
+        self.target = str(target).lower()
+
+        if self.base.out_features % 3 != 0:
+            raise ValueError("QKVLoRALinear requires out_features divisible by 3")
+        self.dim = int(self.base.out_features // 3)
+
+        out_dim = int(self.base.out_features) if self.target in ("qkv_all", "all") else int(2 * self.dim)
+        self.lora_A = nn.Parameter(torch.zeros(self.rank, self.base.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_dim, self.rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.base(x)
+        upd = (x @ self.lora_A.t()) @ self.lora_B.t()
+        upd = upd * self.scaling
+        if self.target in ("qkv_all", "all"):
+            return y + upd
+        if upd.shape[-1] != 2 * self.dim:
+            return y
+        z = torch.zeros_like(y)
+        z[..., : self.dim] = upd[..., : self.dim]
+        z[..., 2 * self.dim :] = upd[..., self.dim :]
+        return y + z
+
+
 def apply_lora_to_sam(
     module: nn.Module,
     target_substrings: Sequence[str] = ("qkv",),
@@ -115,6 +152,42 @@ def apply_lora_to_sam(
 
             lora = LoRALinear(child, rank=rank, alpha=alpha)
             setattr(module, name, lora)
+            wrapped.append(full_name)
+
+    return wrapped
+
+
+def apply_qkv_lora_to_sam(
+    module: nn.Module,
+    rank: int = 16,
+    alpha: Optional[float] = None,
+    layer_ids: Optional[Sequence[int]] = None,
+    target: str = "qv_only",
+    _prefix: str = "",
+) -> List[str]:
+    wrapped: List[str] = []
+    layer_id_set = set(layer_ids) if layer_ids is not None else None
+
+    for name, child in list(module.named_children()):
+        full_name = f"{_prefix}.{name}" if _prefix else name
+
+        wrapped.extend(
+            apply_qkv_lora_to_sam(
+                child,
+                rank=rank,
+                alpha=alpha,
+                layer_ids=layer_ids,
+                target=target,
+                _prefix=full_name,
+            )
+        )
+
+        if name == "qkv" and isinstance(child, nn.Linear):
+            if layer_id_set is not None:
+                m = re.search(r"(?:^|\.)blocks\.(\d+)(?:\.|$)", full_name)
+                if m is None or int(m.group(1)) not in layer_id_set:
+                    continue
+            setattr(module, name, QKVLoRALinear(child, rank=rank, alpha=alpha, target=target))
             wrapped.append(full_name)
 
     return wrapped

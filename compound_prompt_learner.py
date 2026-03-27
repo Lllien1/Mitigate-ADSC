@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Dict, Union
 import math
 
+from prompt_tokenization import build_compound_template_texts, tokenize_ve, encode_ve_with_optional_inputs_embeds
+
 
 class PatchMetaNet(nn.Module):
     """
@@ -84,10 +86,13 @@ class CompoundPromptLearnerV3(nn.Module):
         num_abnormal_prompts: int = 10,     # K 个独立的 W
         mode: str = "cocoop",               # "coop" or "cocoop"
         vis_dim: int = 256,                 # 视觉特征维度
-        top_k: int = 10,                    # 选择的 top-k patch 数量
+        top_k: int = 10,
+        enable_dap: bool = False,
+        dap_top_k: Optional[int] = None,                    # 选择的 top-k patch 数量
         meta_net_reduction: int = 16,       # Meta-Net 缩减因子
         freeze_text_encoder: bool = True,
         output_dim: int = 256,              # 输出维度（SAM3 hidden_dim）
+        disable_w: bool = False,
     ):
         super().__init__()
         
@@ -96,9 +101,11 @@ class CompoundPromptLearnerV3(nn.Module):
         self.n_w = n_w
         self.n_W = n_W
         self.num_abnormal_prompts = num_abnormal_prompts  # K
+        self.disable_w = bool(disable_w)
         self.mode = mode
         self.vis_dim = vis_dim
-        self.top_k = top_k
+        self.top_k = int(dap_top_k) if dap_top_k is not None else int(top_k)
+        self.enable_dap = bool(enable_dap)
         self.output_dim = output_dim
         
         # 获取文本编码器的维度
@@ -153,9 +160,6 @@ class CompoundPromptLearnerV3(nn.Module):
             nn.init.zeros_(self.output_proj.bias)
             print(f"[CompoundPromptLearnerV3] Output projection: {self.ctx_dim} -> {self.output_dim}")
         
-        # DAP 相关（可选）
-        self.enable_dap = False
-        
         print(f"[CompoundPromptLearnerV3] Initialized:")
         print(f"  V={n_V} tokens (shared normal basis)")
         print(f"  w={n_w} tokens (suspected anomaly for normal prompt)")
@@ -178,6 +182,8 @@ class CompoundPromptLearnerV3(nn.Module):
         self,
         patch_features: torch.Tensor,
         vis_global: torch.Tensor,
+        spurious_scores: Optional[torch.Tensor] = None,
+        spurious_alpha: float = 1.0,
     ) -> torch.Tensor:
         """
         选择异常分数最高的 top-k 个 patch 特征
@@ -194,6 +200,9 @@ class CompoundPromptLearnerV3(nn.Module):
         # 计算异常分数：与全局特征的差异
         patch_diff = patch_features - vis_global.unsqueeze(1)  # (B, N, C)
         anomaly_scores = patch_diff.norm(dim=-1)  # (B, N)
+        if isinstance(spurious_scores, torch.Tensor) and spurious_scores.shape == anomaly_scores.shape:
+            sp = spurious_scores.to(anomaly_scores.device).clamp(0.0, 1.0)
+            anomaly_scores = anomaly_scores * (1.0 - float(spurious_alpha) * sp).clamp(min=0.0)
         
         # 选择 top-k
         k = min(self.top_k, N)
@@ -211,6 +220,14 @@ class CompoundPromptLearnerV3(nn.Module):
         vis_feats=None,
         patch_features=None,
         device=None,
+        eta=None,
+        class_names=None,
+        abnormal_word: str = "anomaly",
+        use_text_encoder: bool = False,
+        pooling: str = "ctx_only",
+        dap_spurious_scores: Optional[torch.Tensor] = None,
+        dap_spurious_alpha: float = 1.0,
+        abnormal_order: str = "v_then_wk",
     ):
         """
         生成 compound prompts
@@ -235,7 +252,7 @@ class CompoundPromptLearnerV3(nn.Module):
         selected_patches = None
         
         if self.mode == "cocoop" and self.patch_meta_net is not None:
-            if patch_features is not None and vis_feats is not None:
+            if self.enable_dap and patch_features is not None and vis_feats is not None:
                 # 获取全局特征
                 if vis_feats.dim() == 4:
                     vis_global = vis_feats.mean(dim=[2, 3])  # (B, C)
@@ -243,83 +260,179 @@ class CompoundPromptLearnerV3(nn.Module):
                     vis_global = vis_feats.mean(dim=1)
                 
                 # 选择 top-k patch
-                selected_patches = self.select_top_k_patches(patch_features, vis_global)  # (B, k, C)
+                selected_patches = self.select_top_k_patches(
+                    patch_features,
+                    vis_global,
+                    spurious_scores=dap_spurious_scores,
+                    spurious_alpha=dap_spurious_alpha,
+                )  # (B, k, C)
                 
                 # 拼接并通过 Meta-Net
                 selected_flat = selected_patches.view(B, -1)  # (B, k * C)
                 bias = self.patch_meta_net(selected_flat)  # (B, ctx_dim)
                 bias = bias.unsqueeze(1)  # (B, 1, ctx_dim)
         
-        # =====================================================================
-        # 2. 构建 Normal Prompt: P^n = [V] + [w]
-        # =====================================================================
-        V_batch = self.V.unsqueeze(0).expand(B, -1, -1)  # (B, n_V, ctx_dim)
-        w_batch = self.w.unsqueeze(0).expand(B, -1, -1)  # (B, n_w, ctx_dim)
-        
-        normal_prefix = torch.cat([V_batch, w_batch], dim=1)  # (B, n_V + n_w, ctx_dim)
-        
-        # =====================================================================
-        # 3. 构建 K 个独立的 Abnormal Prompts: P^a_k = [V] + [W_k]
-        # =====================================================================
+        if use_text_encoder:
+            if not hasattr(self.text_encoder, "encode_with_inputs_embeds") or not hasattr(self.text_encoder, "encoder") or not hasattr(self.text_encoder, "tokenizer"):
+                raise RuntimeError("CompoundPromptLearnerV3(use_text_encoder=True) requires VETextEncoder with encode_with_inputs_embeds/encoder/tokenizer")
+            if class_names is None:
+                class_names = ["object"] * B
+            eff_nw = 0 if self.disable_w else int(self.n_w)
+            ctx_len = max(self.n_V + eff_nw, self.n_V + self.n_W)
+            texts = build_compound_template_texts(
+                class_names=[str(x) for x in class_names],
+                num_abnormal=int(K),
+                ctx_len=int(ctx_len),
+                abnormal_word=str(abnormal_word),
+            )
+            tok = tokenize_ve(self.text_encoder, texts, device=device)
+            tokenized = tok.tokenized
+            base_embeds = tok.base_embeds
+
+            V_tok = self.V.to(device)
+            w_tok = self.w.to(device)
+            W_tok = self.W.to(device)
+
+            if eta is not None:
+                eta_ = eta.to(device).view(B, 1, 1)
+            else:
+                eta_ = None
+
+            if bias is not None:
+                bias_tok = bias.to(device)
+            else:
+                bias_tok = None
+
+            prefix = base_embeds[:, :1, :]
+            ctx_tail = base_embeds[:, 1 + ctx_len :, :]
+            ctx_base = base_embeds[:, 1 : 1 + ctx_len, :]
+            ctx_embeds = torch.zeros_like(ctx_base)
+
+            for i in range(B):
+                base = i * (1 + K)
+                v_anchor = V_tok.mean(dim=0)
+                v_anchor = v_anchor / (v_anchor.norm() + 1e-6)
+                w_proj = (w_tok @ v_anchor).unsqueeze(1) * v_anchor.unsqueeze(0)
+                w_orth = w_tok - w_proj
+                w_i = w_proj + w_orth
+                if eta_ is not None:
+                    w_i = w_proj + w_orth * (1.0 + eta_[i])
+                if self.disable_w:
+                    norm_used = self.n_V
+                    norm_tail = ctx_base[base, norm_used:ctx_len, :]
+                    ctx_embeds[base] = torch.cat([V_tok, norm_tail], dim=0)
+                else:
+                    norm_used = self.n_V + self.n_w
+                    norm_tail = ctx_base[base, norm_used:ctx_len, :]
+                    ctx_embeds[base] = torch.cat([V_tok, w_i, norm_tail], dim=0)
+                for k in range(K):
+                    idx = base + 1 + k
+                    W_k = W_tok[k]
+                    if bias_tok is not None:
+                        W_k = W_k + bias_tok[i]
+                    ab_used = self.n_V + self.n_W
+                    ab_tail = ctx_base[idx, ab_used:ctx_len, :]
+                    if str(abnormal_order).lower() in ("wk_then_v", "w_then_v", "offset_then_v"):
+                        ctx_embeds[idx] = torch.cat([W_k, V_tok, ab_tail], dim=0)
+                    else:
+                        ctx_embeds[idx] = torch.cat([V_tok, W_k, ab_tail], dim=0)
+
+            inputs_embeds = torch.cat([prefix, ctx_embeds, ctx_tail], dim=1)
+
+            text_attention_mask, text_memory_resized = encode_ve_with_optional_inputs_embeds(
+                self.text_encoder,
+                tokenized=tokenized,
+                base_embeds=base_embeds,
+                inputs_embeds=inputs_embeds,
+                device=device,
+            )
+
+            mem_nld = text_memory_resized.transpose(0, 1)
+            if str(pooling).lower() == "all_tokens":
+                valid = (~text_attention_mask).unsqueeze(-1).to(mem_nld.dtype)
+                denom = valid.sum(dim=1).clamp(min=1.0)
+                pooled = (mem_nld * valid).sum(dim=1) / denom
+            else:
+                ctx_mem = mem_nld[:, 1 : 1 + ctx_len, :]
+                pooled = torch.zeros(ctx_mem.shape[0], ctx_mem.shape[2], device=device, dtype=ctx_mem.dtype)
+                for i in range(B):
+                    base = i * (1 + K)
+                    if self.disable_w:
+                        pooled[base] = ctx_mem[base, : self.n_V, :].mean(dim=0)
+                    else:
+                        pooled[base] = ctx_mem[base, : self.n_V + self.n_w, :].mean(dim=0)
+                    for k in range(K):
+                        idx = base + 1 + k
+                        pooled[idx] = ctx_mem[idx, : self.n_V + self.n_W, :].mean(dim=0)
+
+            pooled = pooled.view(B, 1 + K, -1)
+            all_prefixes = pooled.unsqueeze(2)
+            prompt_mask = torch.zeros(B, 1 + K, 1, dtype=torch.bool, device=device)
+
+            normal_indices = torch.arange(B, device=device, dtype=torch.long) * (1 + K)
+            w_start = 1 + int(self.n_V)
+            if self.disable_w:
+                proto_suspicious = None
+            else:
+                w_end = w_start + int(self.n_w)
+                proto_suspicious = text_memory_resized[w_start:w_end, normal_indices, :].mean(dim=0) if w_end > w_start else None
+
+            return all_prefixes, prompt_mask, selected_patches, proto_suspicious
+
+        V_batch = self.V.unsqueeze(0).expand(B, -1, -1)
+        if self.disable_w:
+            normal_prefix = V_batch
+        else:
+            w_batch = self.w.unsqueeze(0).expand(B, -1, -1)
+            if eta is not None:
+                eta_ = eta.to(w_batch.device).view(B, 1, 1)
+                v_anchor = self.V.mean(dim=0)
+                v_anchor = v_anchor / (v_anchor.norm() + 1e-6)
+                w_proj = (self.w @ v_anchor).unsqueeze(1) * v_anchor.unsqueeze(0)
+                w_orth = self.w - w_proj
+                w_batch = w_proj.unsqueeze(0).expand(B, -1, -1) + w_orth.unsqueeze(0).expand(B, -1, -1) * (1.0 + eta_)
+            normal_prefix = torch.cat([V_batch, w_batch], dim=1)
+
         all_abnormal_prefixes = []
-        
         for k in range(K):
-            W_k = self.W[k]  # (n_W, ctx_dim)
-            W_k_batch = W_k.unsqueeze(0).expand(B, -1, -1)  # (B, n_W, ctx_dim)
-            
-            # 如果有 bias，加到 W_k 上（图像条件化）
+            W_k = self.W[k]
+            W_k_batch = W_k.unsqueeze(0).expand(B, -1, -1)
             if bias is not None:
                 W_k_batch = W_k_batch + bias
-            
-            abnormal_prefix_k = torch.cat([V_batch, W_k_batch], dim=1)  # (B, n_V + n_W, ctx_dim)
+            if str(abnormal_order).lower() in ("wk_then_v", "w_then_v", "offset_then_v"):
+                abnormal_prefix_k = torch.cat([W_k_batch, V_batch], dim=1)
+            else:
+                abnormal_prefix_k = torch.cat([V_batch, W_k_batch], dim=1)
             all_abnormal_prefixes.append(abnormal_prefix_k)
-        
-        # Stack 所有 abnormal prefixes: (B, K, prefix_len, ctx_dim)
+
         abnormal_prefixes_stacked = torch.stack(all_abnormal_prefixes, dim=1)
-        
-        # =====================================================================
-        # 4. 合并 normal + K 个 abnormal
-        # =====================================================================
-        # 注意：normal 和 abnormal 的 prefix_len 可能不同
-        # normal: n_V + n_w
-        # abnormal: n_V + n_W
-        # 需要 padding 到相同长度
-        
-        normal_len = self.n_V + self.n_w
+
+        normal_len = self.n_V if self.disable_w else (self.n_V + self.n_w)
         abnormal_len = self.n_V + self.n_W
         max_len = max(normal_len, abnormal_len)
-        
+
         if normal_len < max_len:
             pad_normal = torch.zeros(B, max_len - normal_len, self.ctx_dim, device=device)
             normal_prefix = torch.cat([normal_prefix, pad_normal], dim=1)
-        
+
         if abnormal_len < max_len:
             pad_abnormal = torch.zeros(B, K, max_len - abnormal_len, self.ctx_dim, device=device)
             abnormal_prefixes_stacked = torch.cat([abnormal_prefixes_stacked, pad_abnormal], dim=2)
-        
-        # (B, 1+K, max_len, ctx_dim)
-        all_prefixes = torch.cat([
-            normal_prefix.unsqueeze(1),
-            abnormal_prefixes_stacked
-        ], dim=1)
-        
-        # 投影到输出维度
+
+        all_prefixes = torch.cat([normal_prefix.unsqueeze(1), abnormal_prefixes_stacked], dim=1)
+
         if self.output_proj is not None:
             original_shape = all_prefixes.shape
             all_prefixes = all_prefixes.reshape(-1, original_shape[-1])
             all_prefixes = self.output_proj(all_prefixes)
             all_prefixes = all_prefixes.view(original_shape[0], original_shape[1], original_shape[2], -1)
-        
-        # =====================================================================
-        # 5. 创建 mask
-        # =====================================================================
+
         prompt_mask = torch.zeros(B, 1 + K, max_len, dtype=torch.bool, device=device)
-        # 标记 padding 位置
         if normal_len < max_len:
             prompt_mask[:, 0, normal_len:] = True
         if abnormal_len < max_len:
             prompt_mask[:, 1:, abnormal_len:] = True
-        
+
         return all_prefixes, prompt_mask, selected_patches
     
     def compute_orthogonal_loss_prototype_level(self) -> torch.Tensor:
